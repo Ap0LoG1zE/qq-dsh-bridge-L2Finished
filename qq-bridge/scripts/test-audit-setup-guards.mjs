@@ -1,11 +1,23 @@
-// Execute both real preset plugins against a captured tools service, without DSH/QQ.
+// Execute the real preset plugin against a captured tools service, without DSH/QQ.
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 let failures = 0;
-for (const preset of ['qq-chat', 'qq-chat-v2']) {
+// 2026-11-13：原来跑的是 qq-chat / qq-chat-v2 两套预设的守卫。
+// 那两套已合并成单一的 qq-chat-agent（三档权限现在共用同一份 preset + 执行期档位判定），
+// 所以这里只跑现存的那一套。
+//
+// ⚠️ 这条断言是**唯一**挡住"绕过桥接直连本地工具"的注册期防线（RULES.md 铁律 L7），
+// 预设改名时如果这里跟着被删掉，等于把安全回归一起删了 —— 所以只改路径，不删断言。
+const presetDirs = fs.readdirSync(path.join(root, 'dsh/agent-presets'), { withFileTypes: true })
+  .filter((e) => e.isDirectory())
+  .map((e) => e.name)
+  .filter((name) => fs.existsSync(path.join(root, 'dsh/agent-presets', name, 'qq-tool-restrict.mjs')));
+assert.ok(presetDirs.length > 0, '至少要有一个带 qq-tool-restrict.mjs 的预设，否则守卫根本没装');
+
+for (const preset of presetDirs) {
   const { apply } = await import(pathToFileURL(path.join(root, 'dsh/agent-presets', preset, 'qq-tool-restrict.mjs')).href);
   let guard;
   const restricted = [];

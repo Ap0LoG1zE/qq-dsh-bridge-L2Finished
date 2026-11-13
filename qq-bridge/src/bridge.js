@@ -13031,11 +13031,26 @@ async function main() {
         recentRows.push(row);
         if (JSON.stringify({ u: unreadRows, r: recentRows }).length > maxChars0) { recentRows.pop(); break; }
       }
+      // 最新一条（未读优先，没有再退到 recent）有多旧。
+      //
+      // 共用会话下模型更要紧这一个数：私聊和群的消息混在一起，"刚刚有人在群里问"
+      // 和"三小时前的旧账"在渲染上长得一模一样，只能靠年龄分。之前这个分支
+      // 直接 return 了不带 newestAgo，于是共用会话（就是当前生产配置）下
+      // 唯一能看的时间线索只剩每条消息自己的 ago —— 而 persona 的【时间感】
+      // 第一句就写着"每轮提示里会给出最新一条消息是多久以前"。
+      //
+      // ⚠️ 这里的 row.message 已是**模型视图**（compactModelMessage 的产物），
+      // 只有 at / ago，裸 time 已被刻意剥掉 —— 所以年龄直接取 ago，不要再去读 time。
+      const sharedNewest = [...unreadRows].reverse().find((row) => row && row.message && !row.message.isSelf)
+        ?? [...recentRows].reverse().find((row) => row && row.message && !row.message.isSelf)
+        ?? null;
+      const sharedNewestAgo = sharedNewest ? String(sharedNewest.message.ago || '') : '';
       return {
         shared: true,
         messages: unreadRows,
         recent: recentRows,
         now: localClockText(Date.now()),
+        ...(sharedNewestAgo ? { newestAgo: sharedNewestAgo } : {}),
         unreadCount: unreadRows.length,
         includedUnreadCount: unreadRows.length,
         partial: false,

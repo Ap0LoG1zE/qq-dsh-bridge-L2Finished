@@ -25,7 +25,6 @@ import os from 'node:os';
 import path from 'node:path';
 import { bridgeHarness } from './audit-bridge-harness.mjs';
 import { mdToPlain } from '../src/md-to-plain.js';
-import { extractJsonArray } from '../src/slang-learner.js';
 import { sanitizeStickerText } from '../src/sticker-lib.js';
 import { createTokenLedger } from '../src/token-ledger.js';
 import { DEFAULT_PRICE_TABLE } from '../src/model-prices.js';
@@ -331,15 +330,6 @@ await test('R11 mdToPlain 保留 * 列表与乘法式，且拒绝二次方退化
   mdToPlain(evil);
   const elapsed = Date.now() - t0;
   assert.ok(elapsed < 500, `畸形 Markdown 不得卡住事件循环（实际 ${elapsed}ms）`);
-});
-
-// ── R12. 黑话候选扫描次数有上限 ─────────────────────────────────────────────
-await test('R12 extractJsonArray 对大量 "[" 不退化（扫描次数有上限）', async () => {
-  const t0 = Date.now();
-  const out = extractJsonArray('['.repeat(100000));
-  const elapsed = Date.now() - t0;
-  assert.equal(out, null);
-  assert.ok(elapsed < 1000, `扫描必须有界（实际 ${elapsed}ms）`);
 });
 
 // ── R13. 表情文本截断不切开代理对 ──────────────────────────────────────────

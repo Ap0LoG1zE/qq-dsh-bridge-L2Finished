@@ -6,7 +6,17 @@
 //     ① 模型看到的时间是裸 epoch（`time:1792294529471`），算不出"这是 38 分钟前"；
 //     ② 提示词里没有一条规则说"旧消息不该按实时对话接"。
 //
-// 本文件验证修复后的契约：at/ago 字段、提示词里的时间感分档、唤醒原因的年龄、���照头的时间。
+// 2026-11-13 调整（重要）：
+//   上面②的规则段现在**只在人格卡里**有一份
+//   （preset 的【时间感：先看消息多旧，再决定怎么开口】）。
+//   桥接侧原来会拼一段【时间感】规则 + 「旧账」警告，已按省 token 的理由删除 ——
+//   同一套规则写两处，改一处忘一处，而且两份措辞迟早漂移（历史上真实发生过）。
+//
+//   所以本文件现在分两半，边界很清楚：
+//     · 桥接的职责：把**数值**给全（at / ago / newestAgo），一个都不许缺；
+//     · 预设的职责：把这些数值翻译成"该不该接话"的判断。
+//   旧版本断言桥接拼出「旧账」「60 分钟以内：正常接」这类**规则文案**，
+//   那等于在客户端复刻服务端规则，两边一不同步就假绿 —— 那些断言已删除。
 import assert from 'node:assert/strict';
 import { bridgeHarness } from './audit-bridge-harness.mjs';
 import { compactModelMessage, compactModelData, describeAge, serializeModelData } from '../src/qq-model-view.js';
@@ -71,10 +81,11 @@ await test('一次序列化共用一个 now：同批消息的 ago 不会跨分�
   assert.equal(compactModelData(data, { now: NOW }).messages[1].ago, '10s');
 });
 
-// ── 2. 唤醒提示：时间感规则 + 具体数字 ─────────────────────────────────────
+// ── 2. 唤醒提示：桥接只提供**数值**，分档规则在人格卡里 ─────────────────────
 async function withBridge(run, config = {}) {
   const h = await bridgeHarness({ config: { socialV2: { sticker: { enabled: false }, ...config } } });
   h.setMode('reserved2');
+  h.setPresets(['standard', 'qq-chat', 'qq-chat-v2', 'qq-chat-owner', 'qq-chat-readonly', 'qq-chat-agent']);
   try { await run(h); } finally { await h.close(); }
 }
 
@@ -90,84 +101,89 @@ const append = (h, text, { ageMs = 0, sender = '小明' } = {}) => {
   return seq;
 };
 
-await test('新消息（几秒前）不触发旧账警告', async () => {
+await test('新消息（几秒前）也给出明确年龄，不能省略', async () => {
   await withBridge(async (h) => {
     append(h, '在吗');
-    const prompt = h.buildWakePromptV2(KEY, 'atMention@seq1');
-    assert.match(prompt, /【时间感/);
-    assert.match(prompt, /最新一条来自「小明」/);
-    assert.doesNotMatch(prompt, /旧账/, '刚发的消息不该被判成旧账');
+    const snapshot = h.buildWakeSnapshotV2(KEY);
+    assert.equal(snapshot.newestAgo, '0s', '刚发的消息同样要有年龄，"没有数值"会被误当成"刚刚"');
+    assert.match(snapshot.now, /^\d{2}:\d{2}$/, '绝对时间也要给，否则跨天时算不出来');
   });
 });
 
-await test('40 分钟前的消息：提示词给出 ago 并明确标记「旧账」', async () => {
+await test('40 分钟前的消息：快照头 newestAgo 必须是 40m', async () => {
   await withBridge(async (h) => {
     append(h, '晚上开黑吗', { ageMs: 40 * MIN });
-    const prompt = h.buildWakePromptV2(KEY, 'atMention@seq1');
-    assert.match(prompt, /40m 之前发的/, '最新一条的年龄要写进提示词');
-    assert.match(prompt, /旧账/, '超过 staleChatMinutes 必须打「旧账」警告');
-    assert.match(prompt, /不要用秒回语气/, '要给出可执行的替代动作');
-    assert.match(prompt, /触发这条是 40m 前发的/, '唤醒原因那条的年龄也要写清楚');
-  });
-});
-
-await test('超过 staleSilentMinutes：规则要求默认不回、直接收尾', async () => {
-  await withBridge(async (h) => {
-    append(h, '有人吗', { ageMs: 5 * 60 * MIN });
-    const prompt = h.buildWakePromptV2(KEY, 'keyword:大肥鱼@seq1');
-    assert.match(prompt, /5h 之前发的/);
-    assert.match(prompt, /默认不回，直接 qq_mark_read 收尾/);
-    assert.match(prompt, /超过 120 分钟/, '默认阈值应写进警告里');
-  });
-});
-
-await test('阈值可由 config 调整（staleChatMinutes / staleSilentMinutes）', async () => {
-  // 默认阈值（10 / 120 分钟）：12 分钟已算旧账
-  await withBridge(async (h) => {
-    append(h, '刚刚那条', { ageMs: 12 * MIN });
-    assert.match(h.buildWakePromptV2(KEY, 'atMention@seq1'), /旧账/);
-  });
-  // 抬高到 60 分钟：12 分钟不该算旧账，分档文本要跟着变
-  await withBridge(async (h) => {
-    append(h, '刚刚那条', { ageMs: 12 * MIN });
-    const prompt = h.buildWakePromptV2(KEY, 'atMention@seq1');
-    assert.doesNotMatch(prompt, /旧账/);
-    assert.match(prompt, /60 分钟以内：正常接/);
-  }, { wake: { staleChatMinutes: 60 } });
-  // silentMinutes 低于 chatMinutes 时必须被抬平：否则中间档会写成自相矛盾的「60～60 分钟」
-  await withBridge(async (h) => {
-    append(h, '刚刚那条', { ageMs: 12 * MIN });
-    const prompt = h.buildWakePromptV2(KEY, 'atMention@seq1');
-    assert.doesNotMatch(prompt, /60～60/);
-    assert.match(prompt, /超过 60 分钟/);
-  }, { wake: { staleChatMinutes: 60, staleSilentMinutes: 15 } });
-});
-
-await test('定时/引导唤醒不背时间感那段（没有可判断的消息时）', async () => {
-  await withBridge(async (h) => {
-    const prompt = h.buildWakePromptV2(KEY, 'bootstrap');
-    assert.doesNotMatch(prompt, /【时间感/, '没有消息时不该注入时间感规则');
-  });
-});
-
-// ── 3. 唤醒快照：now / newestAgo / 每条 at-ago ─────────────────────────────
-await test('快照头部带 now 与 newestAgo，消息体带 at/ago 且不再有裸 time', async () => {
-  await withBridge(async (h) => {
-    append(h, '第一条');
-    append(h, '第二条', { ageMs: 25 * MIN });
     const snapshot = h.buildWakeSnapshotV2(KEY);
-    assert.match(snapshot.now, /^\d{2}:\d{2}$/);
-    assert.equal(snapshot.newestAgo, '25m');
+    assert.equal(snapshot.newestAgo, '40m', '沉睡后被唤醒，"这条已经 40 分钟了"必须一眼可见');
+    // 每条消息自己也要带 at/ago（换一批消息时头部的 newestAgo 会跟着变，
+    // 但模型回看某一条时仍然需要它自己的年龄）。
     for (const message of snapshot.messages) {
       assert.equal(message.time, undefined, '快照里不该再有裸 epoch');
       assert.match(message.at, /^\d{2}:\d{2}$/);
       assert.match(message.ago, /^\d+[smhd]$/);
     }
-    assert.equal(snapshot.messages[1].ago, '25m');
   });
 });
 
-// ── 4. 工具结果也走同一套视图（MCP 与桥接共用 qq-model-view） ───────────────
+await test('几小时前的消息：newestAgo 用小时单位', async () => {
+  await withBridge(async (h) => {
+    append(h, '有人吗', { ageMs: 5 * 60 * MIN });
+    assert.equal(h.buildWakeSnapshotV2(KEY).newestAgo, '5h');
+  });
+});
+
+await test('没有消息时不编造 newestAgo（定时/引导唤醒）', async () => {
+  await withBridge(async (h) => {
+    const snapshot = h.buildWakeSnapshotV2(KEY);
+    if (snapshot) assert.equal(snapshot.newestAgo, undefined, '没有可判断的消息时不该给一个假的年龄');
+  });
+});
+
+await test('共用会话分支也必须带 newestAgo（当前生产就是这套配置）', async () => {
+  // 共用会话（私聊 + 群复用同一个 DSH 会话）走的是 buildWakeSnapshotV2 里
+  // 另一个提前 return 的分支。那个分支曾经漏掉 newestAgo：两个聊天的消息混排时
+  // "刚刚"和"三小时前"在渲染上完全一样，只剩每条自己的 ago 可看，
+  // 而 persona 明确写着"会给出最新一条消息是多久以前"。
+  const P2 = 'private:10001';
+  const G2 = 'group:20001';
+  const h = await bridgeHarness({
+    config: {
+      ownerQQ: 10001,
+      allow: { private: ['10001'], groups: ['20001'] },
+      sessionSharing: { enabled: true, groups: { [P2]: G2 }, preset: '' },
+      socialV2: { sticker: { enabled: false } }
+    }
+  });
+  h.setMode('reserved2');
+  h.setPresets(['standard', 'qq-chat', 'qq-chat-v2', 'qq-chat-owner', 'qq-chat-readonly', 'qq-chat-agent']);
+  try {
+    const st = h.getSocialV2State(G2);
+    const seq = st.lastUnreadSeq + 1;
+    h.appendSocialV2Message(G2, '小明', '群里那条', '群里那条', false, false, `fx-${seq}`, [], '789');
+    const stored = st.unread.find((m) => m.seq === seq);
+    if (stored) stored.time = Date.now() - 40 * MIN;
+    const snapshot = h.buildWakeSnapshotV2(G2);
+    assert.equal(snapshot.shared, true, '前置：确认走的是共用分支');
+    assert.equal(snapshot.newestAgo, '40m', '共用会话同样要给出最新一条有多旧');
+    assert.match(snapshot.now, /^\d{2}:\d{2}$/);
+  } finally {
+    await h.close();
+  }
+});
+
+await test('桥接不再渲染分档规则（规则只在 preset，避免两份措辞漂移）', async () => {
+  // 以前桥接会把 staleChatMinutes / staleSilentMinutes 拼成两档 warning，
+  // 并打出「旧账」「60 分钟以内：正常接」这类字样。现在规则统一在 preset。
+  // 这里钉住"不要又写回来" —— 同一套规则写两处，改一处忘一处是历史事故来源。
+  await withBridge(async (h) => {
+    append(h, '刚刚那条', { ageMs: 12 * MIN });
+    const prompt = h.buildWakePromptV2(KEY, 'atMention@seq1');
+    assert.doesNotMatch(prompt, /【时间感/, '规则段归 preset，桥接不该再拼一份');
+    assert.doesNotMatch(prompt, /旧账/, '旧账警告已移除');
+  }, { wake: { staleChatMinutes: 60 } });
+});
+
+// ── 3. 工具结果也走同一套视图（MCP 与桥接共用 qq-model-view） ───────────────
 await test('serializeModelData 对 messages/newMessages 同时生效（工具结果同口径）', () => {
   const data = { ok: true, unreadCount: 1, messages: [{ seq: 3, text: 'x', time: NOW - 90 * 1000 }], newMessages: [{ seq: 4, text: 'y', time: NOW - 5 * MIN }] };
   const out = JSON.parse(serializeModelData(data, { now: NOW }));
