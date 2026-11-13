@@ -853,7 +853,7 @@ tr:last-child td {
 #sessionList,#pendingList {
   overflow:auto
 }
-.tool-log-table,.slang-scroll {
+.tool-log-table {
   overflow:auto;
   border:1px solid var(--card-border);
   border-radius:10px;
@@ -864,10 +864,7 @@ tr:last-child td {
   min-width:1000px;
   table-layout:fixed
 }
-.slang-scroll table {
-  min-width:900px
-}
-.tool-log-table thead th,.slang-scroll thead th {
+.tool-log-table thead th {
   position:sticky;
   top:0;
   background:var(--surface-hover);
@@ -885,31 +882,6 @@ tr:last-child td {
 .tool-log-cell.expanded {
   white-space:pre-wrap;
   overflow-wrap:anywhere
-}
-.slang-tabs {
-  display:flex;
-  gap:5px;
-  border-bottom:1px solid var(--card-border);
-  margin:22px 0 18px
-}
-.slang-tab {
-  border:0;
-  border-radius:0;
-  background:transparent;
-  padding:10px 18px;
-  color:var(--muted);
-  font-size:13px
-}
-.slang-tab.active {
-  color:var(--accent);
-  border-bottom:2px solid var(--accent);
-  background:transparent
-}
-.slang-panel {
-  display:none
-}
-.slang-panel.active {
-  display:block
 }
 .empty-state {
   padding:38px 20px;
@@ -1305,12 +1277,6 @@ tr:last-child td {
   #pendingList table {
     min-width:420px
   }
-  .slang-tabs {
-    gap:0
-  }
-  .slang-tab {
-    padding:10px 14px
-  }
   .modal {
     padding:22px
   }
@@ -1669,6 +1635,15 @@ button:active:not(:disabled) {
 [data-page]:not([hidden]) {
   animation:pageIn .26s ease both
 }
+/* 永久隐藏某个区块。
+   ⚠️ 不能只靠 hidden 属性：setConsolePage() 里有一句
+       document.querySelectorAll('[data-page]').forEach(el => { el.hidden = el.dataset.page !== page; })
+   每次切页都会**无条件重写** hidden —— 只要该区块的 data-page 等于当前页
+   （运行模式面板是 overview，正好是默认页），它就会把 hidden 改回 false，
+   于是「隐藏」在用户眼里完全没生效。这个 class 用 !important 压住，JS 改不动它。 */
+.is-retired {
+  display:none !important
+}
 @keyframes pageIn {
   from { opacity:0; transform:translateY(7px) }
   to { opacity:1; transform:none }
@@ -1720,7 +1695,142 @@ button:active:not(:disabled) {
   }
 }
 
-/* ================= 令牌与花费 ================= */
+/* ================= 好感度 ================= */
+/* 这一页的可视化目标：一眼看出「谁最近」「谁最亲近」「自己现在在哪个档」。
+   所以不是一张表，而是「档位刻度尺 + 可拖动滑条 + 人物卡片」三件套。 */
+.aff-toolbar { display:flex; flex-wrap:wrap; align-items:center; gap:10px; margin-top:12px }
+.aff-toolbar input[type=text] { flex:1 1 220px; min-width:150px }
+.aff-toolbar select { flex:0 1 240px }
+
+/* 档位刻度尺：四个区间按真实分数边界等比铺开，当前档高亮。
+   四段刻意用**不同色相**（灰 → 蓝 → 玫瑰 → 紫），而不是同一色系拉渐变：
+   同色系在等比例尺下几乎分不出边界（实测过，四个档看起来像一根紫条）。 */
+.aff-scale { position:relative; margin:18px 0 6px; padding-bottom:20px }
+.aff-scale-track { position:relative; display:flex; height:11px; border-radius:6px; overflow:hidden; background:var(--surface-chip-strong); gap:1px }
+.aff-scale-seg { position:relative; height:100%; transition:box-shadow .18s ease,filter .18s ease }
+.aff-scale-seg.s-distant  { background:linear-gradient(180deg,#a6aebc,#8d96a6) }
+.aff-scale-seg.s-neutral  { background:linear-gradient(180deg,#8aa6e4,#6f8dcb) }
+.aff-scale-seg.s-caring   { background:linear-gradient(180deg,#eda2c4,#dd82ad) }
+.aff-scale-seg.s-reliant  { background:linear-gradient(180deg,#ab8cf0,#9370e2) }
+.aff-scale-seg.s-lover    { background:linear-gradient(180deg,#f0608c,#e0376b) }
+.aff-scale-seg.s-beloved  { background:linear-gradient(180deg,#a8e8da,#4fb3a4) }
+.aff-scale-seg.on { box-shadow:0 0 0 2px var(--accent),inset 0 0 10px #ffffff66; z-index:2 }
+.aff-scale-ticks { position:relative; margin-top:7px; height:16px }
+.aff-scale-tick { position:absolute; top:0; transform:translateX(-50%); font-size:10px; color:var(--muted-soft); white-space:nowrap }
+.aff-scale-tick:first-child { transform:translateX(0) }
+.aff-scale-tick:last-child { transform:translateX(-100%) }
+.aff-scale-mark { position:absolute; top:-6px; width:2px; height:20px; background:var(--accent); border-radius:2px; transition:left .12s ease }
+.aff-scale-mark::after { content:""; position:absolute; left:50%; top:-4px; width:8px; height:8px; margin-left:-4px; border-radius:50%; background:var(--accent); box-shadow:0 0 0 2px var(--surface) }
+
+/* 拖动条本体：自定义轨道与拇指，深浅色都跟着变量走。 */
+.aff-slider-row { display:flex; align-items:center; gap:14px; margin-top:16px }
+.aff-slider-row input[type=range] {
+  -webkit-appearance:none; appearance:none; flex:1 1 auto; width:100%; min-width:0;
+  height:34px; margin:0; padding:0; background:transparent; border:0; cursor:grab;
+  accent-color:var(--accent)
+}
+.aff-slider-row input[type=range]:active { cursor:grabbing }
+.aff-slider-row input[type=range]::-webkit-slider-runnable-track {
+  height:11px; border-radius:6px;
+  /* 五段按真实分数比例：−20→0→30→90→400→600（全幅 620）。
+     百分比：0/620=0, 20/620=3.23, 50/620=8.06, 110/620=17.74, 420/620=67.74, 100。 */
+  /* 渐变由 renderAffSliderTrack() 按 stages 真实边界生成，写进 --aff-track-bg。
+     之前这里写死了五段、按"旧范围 620 分"算百分比，加了第六档（偏爱）之后
+     就和上面的刻度尺对不上了 —— 操作者能直接看出来。
+     现在两边共用 STAGE_COLORS 和同一份 stages，结构上不会再漂。 */
+  background:var(--aff-track-bg, linear-gradient(90deg,#8d96a6,#a6aebc));
+  box-shadow:inset 0 1px 3px #00000026
+}
+.aff-slider-row input[type=range]::-webkit-slider-thumb {
+  -webkit-appearance:none; appearance:none;
+  width:24px; height:24px; margin-top:-7px; border-radius:50%;
+  background:var(--surface); border:2.5px solid var(--accent);
+  box-shadow:0 2px 8px #172d5140,0 0 0 4px var(--accent-ring);
+  transition:transform .14s ease,box-shadow .14s ease
+}
+.aff-slider-row input[type=range]:hover::-webkit-slider-thumb { transform:scale(1.08) }
+.aff-slider-row input[type=range]:active::-webkit-slider-thumb { transform:scale(1.14); box-shadow:0 3px 14px #172d5159,0 0 0 7px var(--accent-ring) }
+.aff-slider-row input[type=range]::-moz-range-track {
+  height:11px; border-radius:6px;
+  background:var(--aff-track-bg, linear-gradient(90deg,#8d96a6,#a6aebc))
+}
+.aff-slider-row input[type=range]::-moz-range-thumb {
+  width:20px; height:20px; border-radius:50%; background:var(--surface);
+  border:2.5px solid var(--accent); box-shadow:0 2px 8px #172d5140
+}
+.aff-score-box { display:flex; align-items:baseline; gap:6px; min-width:96px; justify-content:flex-end }
+.aff-score-val { font-size:26px; font-weight:600; font-variant-numeric:tabular-nums; letter-spacing:-1px; color:var(--text-strong) }
+.aff-score-unit { font-size:11px; color:var(--muted-soft) }
+.aff-stage-badge {
+  display:inline-flex; align-items:center; gap:6px; padding:4px 11px; border-radius:20px;
+  font-size:12px; font-weight:600; white-space:nowrap; transition:background .18s ease,color .18s ease
+}
+.aff-stage-badge::before { content:""; width:7px; height:7px; border-radius:50%; background:currentColor; opacity:.75 }
+.aff-stage-badge.s-distant { background:#8b95a624; color:#6d7789 }
+.aff-stage-badge.s-neutral { background:var(--pill-blue-bg); color:var(--pill-blue-fg) }
+.aff-stage-badge.s-caring  { background:#7ea8f022; color:#3f74c9 }
+.aff-stage-badge.s-reliant { background:#8b7cf026; color:#6d5ce0 }
+.aff-stage-badge.s-lover   { background:#f0608c26; color:#d92e60 }
+.aff-stage-badge.s-beloved { background:#7fd6c426; color:#2f8c7e }
+.aff-stage-badge.s-new     { background:var(--surface-chip-strong); color:var(--muted) }
+[data-theme="dark"] .aff-stage-badge.s-distant { background:#8b95a61f; color:#9aa5b6 }
+[data-theme="dark"] .aff-stage-badge.s-neutral { background:#8aa6e42b; color:#a8c4ff }
+[data-theme="dark"] .aff-stage-badge.s-caring  { background:#7ea8f01f; color:#9ec2ff }
+[data-theme="dark"] .aff-stage-badge.s-reliant { background:#8b7cf02b; color:#b3a3ff }
+[data-theme="dark"] .aff-stage-badge.s-lover   { background:#f0608c2b; color:#ff9dba }
+[data-theme="dark"] .aff-stage-badge.s-beloved { background:#7fd6c433; color:#a8e8da }
+
+/* 人物卡片：按亲密度降序，最近说话的排前面。 */
+.aff-list { display:grid; grid-template-columns:repeat(auto-fill,minmax(min(310px,100%),1fr)); gap:12px; margin-top:14px }
+.aff-card {
+  border:1px solid var(--border-subtle); border-radius:12px; padding:13px 14px;
+  background:var(--surface-subtle); transition:border-color .18s ease,background .18s ease,transform .18s ease;
+  min-width:0; cursor:pointer
+}
+.aff-card:hover { border-color:var(--accent-border-soft-hover); background:var(--surface-hover); transform:translateY(-1px) }
+.aff-card.is-active { border-color:var(--accent-border-active); background:var(--accent-soft-bg-active); box-shadow:0 0 0 1px var(--accent-border-soft) }
+.aff-card-head { display:flex; align-items:center; gap:9px; min-width:0 }
+.aff-avatar {
+  flex:0 0 auto; width:34px; height:34px; border-radius:50%; display:grid; place-items:center;
+  font-size:12px; font-weight:600; color:#fff; letter-spacing:-.4px;
+  background:linear-gradient(135deg,#9fb2da,#7d7cf0)
+}
+.aff-avatar.s-distant { background:linear-gradient(135deg,#98a1b1,#7d8798) }
+.aff-avatar.s-neutral { background:linear-gradient(135deg,#9fb2da,#7f96c8) }
+.aff-avatar.s-caring  { background:linear-gradient(135deg,#8fb8f5,#6f9ee6) }
+.aff-avatar.s-reliant { background:linear-gradient(135deg,#9d8df5,#7d6ce8) }
+.aff-avatar.s-lover   { background:linear-gradient(135deg,#f47ba1,#e0376b) }
+.aff-avatar.s-beloved { background:linear-gradient(135deg,#a8e8da,#4fb3a4) }
+.aff-card-id { min-width:0; flex:1 1 auto }
+.aff-card-name { font-size:13px; font-weight:600; color:var(--text-strong); white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
+.aff-card-sub { font-size:11px; color:var(--muted-soft); white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
+.aff-card-bar { position:relative; height:6px; border-radius:4px; background:var(--surface-chip-strong); overflow:hidden; margin-top:11px }
+.aff-card-bar i { position:absolute; inset:0 auto 0 0; border-radius:4px; transition:width .3s ease; background:linear-gradient(90deg,#8aa6e4,#6f8dcb) }
+.aff-card-bar i.s-distant { background:linear-gradient(90deg,#8d96a6,#a6aebc) }
+.aff-card-bar i.s-neutral { background:linear-gradient(90deg,#6f8dcb,#8aa6e4) }
+.aff-card-bar i.s-caring  { background:linear-gradient(90deg,#dd82ad,#eda2c4) }
+.aff-card-bar i.s-reliant { background:linear-gradient(90deg,#9370e2,#ab8cf0) }
+.aff-card-bar i.s-lover   { background:linear-gradient(90deg,#e0376b,#f0608c) }
+.aff-card-bar i.s-beloved { background:linear-gradient(90deg,#4fb3a4,#a8e8da) }
+.aff-card-foot { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-top:8px; font-size:11px; color:var(--muted-soft) }
+.aff-card-foot b { font-variant-numeric:tabular-nums; color:var(--text-secondary); font-weight:600 }
+.aff-empty { padding:26px 12px; text-align:center; color:var(--muted-soft); font-size:13px }
+.aff-empty b { display:block; color:var(--text-secondary); font-size:14px; margin-bottom:5px }
+
+/* 说明卡：六档在睦身上的含义，跟 affinity.js 的 STAGE_HINTS 一一对应。 */
+.aff-stages { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(215px,100%),1fr)); gap:10px; margin-top:12px }
+.aff-stage-item { padding:12px 13px; border:1px solid var(--border-subtle); border-radius:11px; background:var(--surface-subtle); min-width:0 }
+.aff-stage-item.is-current { border-color:var(--accent-border-active); background:var(--accent-soft-bg); box-shadow:0 0 0 1px var(--accent-border-soft) }
+.aff-stage-item h4 { margin:0 0 5px; font-size:12px; font-weight:600; color:var(--text-strong); display:flex; align-items:center; justify-content:space-between; gap:8px }
+.aff-stage-item h4 span { font-size:10px; font-weight:500; color:var(--muted-soft); font-variant-numeric:tabular-nums }
+.aff-stage-item p { font-size:11.5px; color:var(--muted); line-height:1.7; margin:0 }
+/* 偏爱档「仅对主人」的说明：用金色左边框区分，呼应刻度尺上偏爱那段的颜色。 */
+.aff-stage-item p.aff-owner-desc { margin-top:6px; padding-left:8px; border-left:3px solid #4fb3a4; color:var(--text-dim) }
+.aff-stage-item p.aff-owner-desc b { color:#2f8c7e; margin-right:4px }
+.aff-note { margin-top:14px; padding:11px 13px; border-radius:10px; background:var(--warn-bg); border:1px solid var(--warn-border); color:var(--warn-fg); font-size:11.5px; line-height:1.75 }
+.aff-note b { color:var(--warn-fg-strong) }
+
+
 #section-usage .usage-h3 { font-size:13px; font-weight:600; color:var(--text); margin:20px 0 8px }
 #section-usage .usage-h3:first-of-type { margin-top:16px }
 #section-usage .metric strong { font-variant-numeric:tabular-nums }
@@ -1768,9 +1878,8 @@ button:active:not(:disabled) {
       <button data-view="sessions" class="nav-item"><span class="nav-icon" aria-hidden="true">☷</span>会话与审批<span class="nav-count" id="pendingCount">—</span></button>
       <button data-view="persona" class="nav-item"><span class="nav-icon" aria-hidden="true">◉</span>人格与角色</button>
       <div class="nav-label">聊天行为</div>
-      <button data-view="social-v2" class="nav-item"><span class="nav-icon" aria-hidden="true">◈</span>二代仿真<span class="nav-note">V2</span></button>
-      <button data-view="social-v1" class="nav-item"><span class="nav-icon" aria-hidden="true">◇</span>一代仿真<span class="nav-note">V1</span></button>
-      <button data-view="slang" class="nav-item"><span class="nav-icon" aria-hidden="true">▤</span>黑话词库</button>
+      <button data-view="social-v2" class="nav-item"><span class="nav-icon" aria-hidden="true">◈</span>聊天行为</button>
+      <button data-view="affinity" class="nav-item"><span class="nav-icon" aria-hidden="true">♡</span>好感度</button>
       <div class="nav-label">管理</div>
       <button data-view="usage" class="nav-item"><span class="nav-icon" aria-hidden="true">◧</span>令牌与花费</button>
       <button data-view="access" class="nav-item"><span class="nav-icon" aria-hidden="true">⊙</span>访问与安全</button>
@@ -1797,7 +1906,12 @@ button:active:not(:disabled) {
         <button class="metric metric-link" data-view="sessions" data-target="section-pending"><span>待处理请求</span><strong id="metricPending">—</strong><small>提问与工具审批 <span aria-hidden="true">↗</span></small></button>
       </div>
       <div class="grid">
-        <section id="section-mode" data-page="overview" class="card span-all">
+        <section id="section-mode" data-page="overview" class="card span-all is-retired">
+      <!-- 运行模式面板已隐藏：四个 agent preset 合并成唯一的 qq-chat-agent 后，
+           实际只剩「二代仿真（reserved2）」这一种运行形态，四个按钮里另外三个
+           点了也没有意义（一代已下线、closed-agent 的 preset 下拉只剩一个选项）。
+           DOM 与 id 全部保留：控制台的轮询脚本仍然按 id 读写它们（metricMode、
+           modeRow、closedPreset），删掉会抛 null 引用。 -->
       <h2>运行模式</h2>
       <div class="mode-row" id="modeRow">
         <button data-mode="chat" aria-pressed="false"><span class="mode-indicator" aria-hidden="true"></span><strong>聊天模式</strong><small>白名单内，随时对话</small></button>
@@ -1877,14 +1991,11 @@ button:active:not(:disabled) {
       </details>
 
       <h3 class="layer-heading">仿真提示词（预设内置）<span class="meta" id="simPromptStatus">加载中…</span></h3>
-      <div class="row" style="margin-bottom:8px">
-        <label style="flex:0 0 auto">仿真代次</label>
-        <select id="simPromptPreset" style="flex:0 1 280px">
-          <option value="qq-chat-v2">二代仿真（reserved2 · qq-chat-v2）</option>
-          <option value="qq-chat">一代仿真（reserved · qq-chat）</option>
-        </select>
-        <span class="meta">两代机制不同（一代空格分条 / 二代一切皆工具），提示词各自独立。</span>
-      </div>
+      <!-- 只有一个 preset 了，所以不再需要「仿真代次」下拉；保留隐藏的 select
+           以免旧脚本 document.getElementById('simPromptPreset') 取不到元素报错。 -->
+      <select id="simPromptPreset" hidden>
+        <option value="qq-chat-agent" selected>qq-chat-agent</option>
+      </select>
       <div class="meta" id="simPromptWarnings"></div>
       <textarea id="simPromptText" class="code-area" spellcheck="false" readonly></textarea>
       <div class="row" style="margin-top:8px">
@@ -1896,8 +2007,11 @@ button:active:not(:disabled) {
       </div>
       <div class="meta" id="simPromptRestart"></div>
     </section>
-<section id="section-social-v1" data-page="social-v1" class="card span-all">
-      <h2>一代仿真模式（reserved）</h2>
+<section id="section-social-v1" data-page="social-v1" class="card span-all is-retired">
+      <!-- 一代仿真（reserved）已随 2026-11-07 预设合并下线，整块隐藏；
+           保留内部元素 id 以免旧脚本取不到元素而报错。 -->
+      <h2>一代仿真模式（已下线）</h2>
+      <div class="meta">一代仿真已随预设合并下线。请在左侧「聊天行为」里配置。</div>
       <div class="meta" id="socialStatus">加载中…</div>
 
       <div class="row" style="margin-top:10px">
@@ -1999,12 +2113,12 @@ button:active:not(:disabled) {
       <div class="meta">一代仿真模式状态机：观望期按“明确点名 / 小概率”触发进入活跃；活跃期每 10~20 秒批量查看新消息并回应；群聊活跃超过随机上限会主动提示 AI 收尾退场；冷场后大概率回观望、小概率让 AI 试探一句。可手动强制切换状态。</div>
     </div></section>
 <section id="section-social-v2" data-page="social-v2" class="card span-all">
-      <h2>二代仿真模式（reserved2）控制台</h2>
+      <h2>聊天行为</h2>
       <div class="meta">配置保存后写入 config.json 并热更新；工具开关决定 AI 能调用哪些工具。已接入开关的工具在<b>重启 DSH 后</b>会从工具清单里彻底消失（少一份 schema 就少一份每次请求的 token）；发送类等跨模式共用的工具只在调用时被桥接拒绝，清单不变。</div>
 
       <div class="row" style="margin-top:10px">
         <label style="flex:1">启用二代模式</label><input type="checkbox" id="v2Enabled" style="width:auto">
-        <label style="flex:1">agentPreset</label><input type="text" id="v2AgentPreset" placeholder="qq-chat-v2" style="max-width:200px">
+        <label style="flex:1">agentPreset</label><input type="text" id="v2AgentPreset" placeholder="qq-chat-agent" style="max-width:200px">
       </div>
       <div class="row" style="margin-top:6px">
         <label style="flex:1">提供推荐值给 AI</label><input type="checkbox" id="v2ProvideRecommendations" style="width:auto">
@@ -2017,6 +2131,9 @@ button:active:not(:disabled) {
         <button id="v2ConfigSaveTop" style="font-weight:bold;padding:6px 14px">保存当前参数</button>
         <span class="meta" id="v2ActivityStatus">读取中…</span>
       </div>
+      <!-- 纯语音（文字 → 睦的声音）的开关**只在 DSH 浮游球面板**里，
+           这里故意不放：同一个开关维护两处，改一处忘另一处就会漂。
+           后端端点 /api/socialV2/tts 仍然保留 —— DSH 面板就是调它。 -->
 
       <details class="settings-group"><summary>工具开关（关闭后 AI 不再拿到该工具；需重启 DSH 刷新工具清单，重启前仅调用时拒绝）</summary><div class="settings-content">
       <div class="v2-tool-list" id="v2Tools">
@@ -2036,40 +2153,17 @@ button:active:not(:disabled) {
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="getMessageDetail"> <span><b>qq_get_message_detail</b><span class="meta">按 message_id 查看单条消息完整内容</span></span></label>
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="getImages"> <span><b>qq_get_message_images</b><span class="meta">查看消息中的图片/表情内容</span></span></label>
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="getForwardMsg"> <span><b>qq_get_forward_msg</b><span class="meta">查看当前会话收到的合并转发消息内容</span></span></label>
-        <label class="v2-tool-item"><input type="checkbox" data-v2-tool="getActiveMembers"> <span><b>qq_get_active_members</b><span class="meta">查看最近活跃成员列表</span></span></label>
+        <label class="v2-tool-item"><input type="checkbox" data-v2-tool="getActiveMembers"> <span><b>qq_get_userid</b><span class="meta">查人：昵称换 QQ 号</span></span></label>
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="setWakeConfig"> <span><b>qq_set_wake_config</b><span class="meta">设置唤醒/潜水条件：无限期、有限时间、@/名字/关键词/概率等</span></span></label>
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="markRead"> <span><b>qq_mark_read</b><span class="meta">标记当前未读为已读（看过但决定不回复）</span></span></label>
-        <label class="v2-tool-item"><input type="checkbox" data-v2-tool="memory"> <span><b>qq_memory_append / qq_memory_query</b><span class="meta">轻量记忆：话题/想说的话/群友印象</span></span></label>
-        <label class="v2-tool-item"><input type="checkbox" data-v2-tool="slangQuery"> <span><b>qq_slang_query</b><span class="meta">查询已确认黑话/梗/网络表达</span></span></label>
-        <label class="v2-tool-item"><input type="checkbox" data-v2-tool="slangSubmit"> <span><b>qq_slang_submit</b><span class="meta">AI 提交陌生词/黑话给管理员筛选</span></span></label>
+        <label class="v2-tool-item"><input type="checkbox" data-v2-tool="memory"> <span><b>qq_memory_append / qq_memory_query</b><span class="meta">记忆：自我认知 / 群友印象 / 待办 / 长期事实 / 话题 / 想说的话</span></span></label>
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="listStickers"> <span><b>qq_list_stickers</b><span class="meta">查看/搜索 QQ 收藏表情（含备注和本地笔记）</span></span></label>
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="getStickerImage"> <span><b>qq_get_sticker_image</b><span class="meta">看图理解没有备注的收藏表情</span></span></label>
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="sendSticker"> <span><b>qq_send_sticker</b><span class="meta">发送收藏表情（一条消息只能一张，不能带文字）</span></span></label>
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="collectSticker"> <span><b>qq_collect_sticker</b><span class="meta">AI 偶尔收藏别人发的表情并写简短备注</span></span></label>
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="stickerNote"> <span><b>qq_sticker_note</b><span class="meta">给表情记录本地含义/标签/用法</span></span></label>
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="setStickerRemark"> <span><b>qq_set_sticker_remark</b><span class="meta">修改 QQ 官方表情备注（默认禁用，慎用）</span></span></label>
-        <label class="v2-tool-item"><input type="checkbox" data-v2-tool="sendVoice"> <span><b>qq_send_voice / qq_list_voices</b><span class="meta">发送语音条（只能发语音库里的音频；偶然而为的强表达）</span></span></label>
-      </div>
-      <div class="meta" style="margin-top:6px">二代黑话学习：AI 可用 <code>qq_slang_submit</code> 提交陌生词，也可由桥接自动提取；管理员在「黑话词库」页面筛选确认后，词条会自动写入黑话提示词并注入 <code>qq_get_prompt</code> 与后续唤醒。</div>
-
-      </div></details>
-<details class="settings-group"><summary>语音库与语音发送（调试）</summary><div class="settings-content">
-      <div class="meta" style="margin-bottom:8px">
-        语音库目录：<code>qq-bridge/audio/</code>（改 <code>socialV2.voice.dir</code> 可换）。把音频文件丢进去即可被 AI 用 <code>qq_send_voice</code> 发出；
-        本面板用于调试与试发 —— 试发走的是与 AI 通道相同的解析/校验/限流路径（<code>/api/voice/send</code>），只是由你在控制台触发。
-      </div>
-      <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center">
-        <button id="voiceRefreshBtn" type="button" class="btn-secondary">刷新语音库</button>
-        <label style="flex:0 0 auto">发送目标</label>
-        <input type="text" id="voiceSendTarget" placeholder="group:100005" style="width:190px">
-        <label style="flex:0 0 auto"><input type="checkbox" id="voiceSendDryRun" style="width:auto"> 只校验不发送</label>
-        <button id="voiceSendBtn" type="button">试发选中语音</button>
-        <span id="voiceMsg" class="meta"></span>
-      </div>
-      <div id="voiceList" class="meta" style="margin-top:8px">点「刷新语音库」加载…</div>
-      <div class="meta" style="margin-top:6px">
-        上限：时长 <code>maxSeconds</code>、体积 <code>maxBytes</code>、频率 <code>maxPerMinute</code>/<code>maxPerHour</code>（见下方配置区）。
-        命令行等价工具：<code>node scripts/send-voice.mjs list-voice</code>（经桥接）或 <code>node voice-cli.mjs</code>（独立工具，在上级 <code>voice-tool/</code> 里直连 SnowLuma）。
+        <label class="v2-tool-item"><input type="checkbox" data-v2-qzone="1"> <span><b>QQ 空间（qq_post_moment / qq_list_moments / qq_delete_moment）</b><span class="meta">发/看/删说说。关掉后这三个工具全部拒绝（服务端 403），只影响 QQ 空间，不影响聊天</span></span></label>
       </div>
 
       </div></details>
@@ -2236,13 +2330,14 @@ button:active:not(:disabled) {
       <div id="v2ToolLogOutput" class="tool-log-table">（空）</div>
 
       </div></details>
-<details class="settings-group"><summary>轻量记忆（activeTopics / pendingThoughts / memberImpressions）</summary><div class="settings-content">
+<details class="settings-group"><summary>记忆（自我认知 / 群友印象 / 待办 / 进行中话题 / 想说的话）</summary><div class="settings-content">
       <div class="row">
-        <input type="text" id="v2MemoryKey" placeholder="group:123456789" style="flex:1">
+        <input type="text" id="v2MemoryKey" placeholder="group:20001 或 private:10001" style="flex:1">
         <button id="v2MemoryLoad" class="small">加载记忆</button>
         <button id="v2MemoryClearAll" class="small danger">清空全部</button>
         <span class="meta" id="v2MemoryMsg"></span>
       </div>
+      <div class="meta" style="margin:4px 0 8px">自我认知 / 群友印象 / 待办 是<b>全局共用</b>的（换个 key 看到的也是同一份）；进行中话题 / 想说的话 <b>按会话分开</b>。</div>
       <div id="v2MemoryOutput" class="tool-log-table">（空）</div>
 
       </div></details>
@@ -2301,121 +2396,70 @@ button:active:not(:disabled) {
       <div class="meta" style="margin-top:4px">修改上面任意推荐/默认参数后，必须点这个按钮才会持久化；保存后会自动应用到仍使用默认唤醒配置的会话，重启后仍然保留。</div>
 
       </div></section>
-<section id="section-slang" data-page="slang" class="card span-all">
-      <h2>群聊黑话 / 网络用语库</h2>
-      <div class="meta">DSH 会从群聊中自动提取疑似黑话候选；二代仿真模式下 AI 也可用 <code>qq_slang_submit</code> 主动提交陌生词。候选可批量送 DSH 深度联网研究，研究结果回到控制台由你删改修正后转正；确认后的词条会写入“黑话提示词”，注入一代/二代 AI 的聊天上下文，成为 AI 可查询和使用的记忆。</div>
-
-      <div class="slang-tabs">
-        <button class="slang-tab active" data-slang-tab="candidate">候选词</button>
-        <button class="slang-tab" data-slang-tab="confirmed">已确认</button>
-        <button class="slang-tab" data-slang-tab="rejected">已拒绝</button>
-      </div>
-      <span class="meta" id="slangMsg"></span>
-
-      <!-- 候选词面板 -->
-      <div class="slang-panel active" id="slangPanelCandidate">
-        <div class="row" style="margin-top:8px">
-          <label style="display:flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="slangCandidateSelectAll"> 全选</label>
-          <button id="slangBatchResearch" class="small">批量送 DSH 深度研究</button>
-          <button id="slangBatchConfirm" class="small">批量确认（有含义）</button>
-          <button id="slangBatchReject" class="small">批量拒绝</button>
-          <button id="slangBatchDeleteCand" class="small danger">批量删除候选</button>
-          <button id="slangExtract" class="small">立即提取候选</button>
-          <button id="slangResearch" class="small">研究全部候选</button>
-        </div>
-        <div class="row" style="margin-top:8px">
-          <input type="text" id="slangSearchCand" placeholder="搜索词条 / 草稿含义 / 语境证据" style="flex:1">
-          <select id="slangLimitCand" style="width:110px">
-            <option value="50">每页 50</option>
-            <option value="100" selected>每页 100</option>
-            <option value="200">每页 200</option>
-            <option value="500">每页 500</option>
-          </select>
-        </div>
-        <div class="slang-scroll" id="slangCandidateList">加载中…</div>
+<section id="section-affinity" data-page="affinity" class="card span-all">
+      <h2>好感度</h2>
+      <div class="meta">
+        按<b>QQ 号</b>记，全局一份 —— 私聊、群聊、换会话、清除上下文都不会影响它。
+        拖动滑条可以直接改；不拖的时候，她每收到一条消息就会自己往上加一点点。
       </div>
 
-      <!-- 已确认面板 -->
-      <div class="slang-panel" id="slangPanelConfirmed">
-        <div class="row" style="margin-top:8px">
-          <label style="display:flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="slangConfirmedSelectAll"> 全选</label>
-          <button id="slangBatchDeleteConfirmed" class="small danger">批量删除已确认</button>
-        </div>
-        <div class="row" style="margin-top:8px">
-          <input type="text" id="slangSearchConfirmed" placeholder="搜索词条 / 含义 / 用法 / 示例 / 来源" style="flex:1">
-          <select id="slangLimitConfirmed" style="width:110px">
-            <option value="50">每页 50</option>
-            <option value="100" selected>每页 100</option>
-            <option value="200">每页 200</option>
-            <option value="500">每页 500</option>
-          </select>
-        </div>
-        <div class="slang-scroll" id="slangConfirmedList">加载中…</div>
+      <div class="aff-toolbar">
+        <!-- 全局之后不再需要填会话 key：好感度只跟 QQ 号有关。
+             保留 affKey 这个隐藏输入是为了兼容旧代码里少量读取（值固定为占位）。 -->
+        <input type="text" id="affKey" value="global" hidden aria-hidden="true">
+        <select id="affUserSelect" hidden aria-hidden="true"></select>
+        <button id="affRefresh" class="small" type="button">刷新</button>
+        <span class="meta" id="affMsg" style="margin:0"></span>
       </div>
 
-      <!-- 已拒绝面板 -->
-      <div class="slang-panel" id="slangPanelRejected">
-        <div class="row" style="margin-top:8px">
-          <label style="display:flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="slangRejectedSelectAll"> 全选</label>
-          <button id="slangBatchRestore" class="small">恢复为候选</button>
-          <button id="slangBatchDeleteRejected" class="small danger">批量删除已拒绝</button>
+      <div id="affEditor" hidden>
+        <div class="aff-scale" aria-hidden="true">
+          <div class="aff-scale-track" id="affScaleTrack"></div>
+          <div class="aff-scale-ticks" id="affScaleTicks"></div>
+          <div class="aff-scale-mark" id="affScaleMark" style="left:0"></div>
         </div>
-        <div class="row" style="margin-top:8px">
-          <input type="text" id="slangSearchRejected" placeholder="搜索词条 / 拒绝原因" style="flex:1">
-          <select id="slangLimitRejected" style="width:110px">
-            <option value="50">每页 50</option>
-            <option value="100" selected>每页 100</option>
-            <option value="200">每页 200</option>
-            <option value="500">每页 500</option>
-          </select>
+
+        <div class="row" style="margin-top:12px;gap:12px">
+          <label style="flex:0 0 auto;margin:0">正在调整</label>
+          <select id="affUser" aria-label="选择要调整的人" style="flex:1 1 260px"></select>
+          <span id="affStageBadge" class="aff-stage-badge s-new">—</span>
         </div>
-        <div class="slang-scroll" id="slangRejectedList">加载中…</div>
+
+        <div class="aff-slider-row">
+          <input type="range" id="affRange" min="-20" max="1200" step="1" value="5" aria-label="好感度分数">
+          <div class="aff-score-box">
+            <span class="aff-score-val" id="affScoreVal">5</span>
+            <span class="aff-score-unit">分</span>
+          </div>
+        </div>
+
+        <div class="row" style="margin-top:10px;gap:8px;flex-wrap:wrap">
+          <button id="affSave" class="primary" type="button" style="padding:8px 16px;font-weight:600">保存这个分数</button>
+          <span id="affStageQuick" style="display:inline-flex;gap:6px;flex-wrap:wrap">
+            <button type="button" class="small" data-aff-stage="distant">跳到疏远</button>
+            <button type="button" class="small" data-aff-stage="neutral">跳到平淡</button>
+            <button type="button" class="small" data-aff-stage="caring">跳到在意</button>
+            <button type="button" class="small" data-aff-stage="reliant">跳到依赖</button>
+            <button type="button" class="small" data-aff-stage="lover">跳到喜欢</button>
+            <button type="button" class="small" data-aff-stage="beloved">跳到偏爱</button>
+          </span>
+          <span class="meta" style="margin:0">快捷跳到某档的起点</span>
+        </div>
+
+        <div class="meta" id="affDetail" style="margin-top:10px"></div>
       </div>
 
-      <div class="divider"></div>
-      <div class="meta" style="margin-bottom:6px">手动添加黑话</div>
-      <div class="row">
-        <input type="text" id="slangContent" placeholder="词条，如：绝绝子" style="flex:1">
-        <input type="text" id="slangMeaning" placeholder="含义，如：很好、很棒" style="flex:1">
+      <h3 style="font-size:13px;font-weight:600;color:var(--text);margin:22px 0 0">这个会话里的人</h3>
+      <div id="affPeople" class="aff-list"><div class="aff-empty">输入会话 key 后点「刷新」</div></div>
+
+      <h3 style="font-size:13px;font-weight:600;color:var(--text);margin:24px 0 0">六档在她身上的样子</h3>
+      <div class="aff-stages" id="affStages"></div>
+
+      <div class="aff-note">
+        <b>好感度只是参考，不是命令。</b>它只告诉睦「跟这个人现在多近」，具体怎么说话由人格卡决定 ——
+        不然六档就会盖掉她本人。六档是一条从冷漠到偏爱的线：往上走只会让她的防线更少，
+        不会让她变话多、变甜。改完分之后，她下一次被唤醒时就会按新档位拿捏分寸。
       </div>
-      <div class="row" style="margin-top:6px">
-        <input type="text" id="slangUsage" placeholder="用法（可选）" style="flex:1">
-        <input type="text" id="slangExample" placeholder="示例（可选）" style="flex:1">
-      </div>
-      <div class="row" style="margin-top:8px">
-        <button id="slangAdd" class="small">添加入库（确认）</button>
-      </div>
-      <details style="margin-top:10px">
-        <summary class="meta">黑话系统参数（可调）</summary>
-        <div class="row">
-          <label style="flex:1">启用黑话学习</label><input type="checkbox" id="slangEnabled" style="width:auto">
-        </div>
-        <div class="row">
-          <label style="flex:1">触发提取最少消息数</label><input type="number" id="slangExtractMin" min="1" style="width:90px">
-        </div>
-        <div class="row">
-          <label style="flex:1">提取冷却（毫秒）</label><input type="number" id="slangCooldown" min="0" step="1000" style="width:110px">
-        </div>
-        <div class="row">
-          <label style="flex:1">研究触发阈值（逗号分隔）</label><input type="text" id="slangThresholds" placeholder="2,4,8" style="width:120px">
-        </div>
-        <div class="row">
-          <label style="flex:1">注入最大条数</label><input type="number" id="slangInjectMax" min="1" max="30" style="width:90px">
-        </div>
-        <div class="row">
-          <label style="flex:1">学习会话 preset</label><input type="text" id="slangLearnerPreset" placeholder="qq-chat" style="width:120px">
-        </div>
-        <div class="row">
-          <label style="flex:1">学习工作区名</label><input type="text" id="slangWorkspaceTitle" placeholder="QQ 黑话学习" style="width:120px">
-        </div>
-        <div class="row">
-          <label style="flex:1">自动联网研究</label><input type="checkbox" id="slangAutoResearch" style="width:auto">
-        </div>
-        <div class="row" style="margin-top:8px">
-          <button id="slangConfigSave" class="small">保存黑话参数</button>
-          <span class="meta" id="slangConfigMsg"></span>
-        </div>
-      </details>
     </section>
 <section id="section-reference" data-page="reference" class="card span-all">
       <h2>DSH 侧 MCP 工具</h2>
@@ -2429,10 +2473,8 @@ button:active:not(:disabled) {
         <tr><td>qq_send_group_message</td><td>发群消息；可选 <code>replyToMessageId</code> 引用/回复</td></tr>
         <tr><td>qq_reply</td><td>专用“引用/回复”：在群里引用某条消息并发送文本</td></tr>
         <tr><td>qq_send_private_message</td><td>发私聊；可选 <code>replyToMessageId</code> 引用/回复</td></tr>
-        <tr><td>qq_slang_query</td><td>查询已确认黑话/梗/网络表达（只读）</td></tr>
-        <tr><td>qq_slang_submit</td><td>AI 提交陌生词/黑话给管理员筛选</td></tr>
       </table>
-      <div class="meta" style="margin-top:10px">二代仿真模式工具：qq_get_prompt / qq_get_unread_messages / qq_get_recent_messages / qq_social_state / qq_send_burst / qq_send_message / qq_wait_for_messages / qq_set_wake_config / qq_mark_read / qq_memory_* / qq_slang_query / qq_slang_submit 等。</div>
+      <div class="meta" style="margin-top:10px">二代仿真模式工具：qq_get_prompt / qq_get_unread_messages / qq_get_recent_messages / qq_social_state / qq_send_burst / qq_send_message / qq_wait_for_messages / qq_set_wake_config / qq_mark_read / qq_memory_* 等。</div>
     </section>
 <section id="section-whitelist" data-page="access" class="card span-all">
       <h2>白名单 / 管理员</h2>
@@ -2611,27 +2653,6 @@ button:active:not(:disabled) {
       <footer class="page-footer"><span>QQ Bridge · 连接日常，保持自主</span><span id="lastUpdated">等待首次同步</span></footer>
     </main>
   </div>
-      <div class="modal-overlay" id="slangModalOverlay">
-      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="slangModalTitle" tabindex="-1">
-        <h3 id="slangModalTitle">确认黑话</h3>
-        <div class="meta" id="slangModalContent" style="margin-bottom:6px"></div>
-        <label>含义 *</label>
-        <input type="text" id="slangModalMeaning" placeholder="必须填写，确认后才会注入 AI 上下文">
-        <label>用法（可选）</label>
-        <input type="text" id="slangModalUsage" placeholder="使用场景 / 语气">
-        <label>示例（可选）</label>
-        <input type="text" id="slangModalExample" placeholder="自然短句示例">
-        <label>风险/慎用说明（可选）</label>
-        <input type="text" id="slangModalRisk" placeholder="敏感 / 慎用风险">
-        <label>参考来源（可选，每行一个 URL）</label>
-        <textarea id="slangModalSources" rows="3" placeholder="https://..."></textarea>
-        <div class="row">
-          <button id="slangModalDirectConfirm" class="small">直接确认（转正）</button>
-          <button id="slangModalSendResearch" class="small">送 DSH 深度研究</button>
-          <button id="slangModalCancel" class="small">取消</button>
-        </div>
-      </div>
-    </div>
 
 
   <div class="toast" id="consoleToast" role="status" hidden></div>
@@ -2900,7 +2921,7 @@ async function refreshRoles() {
 
 // ── 仿真提示词（预设内置，需重启 DSH 生效）──────────────────────────────────
 let simPromptOriginal = '';
-let simPromptPreset = 'qq-chat-v2';
+let simPromptPreset = 'qq-chat-agent';
 
 function setSimMsg(text, ok) {
   const el = document.getElementById('simPromptMsg');
@@ -2918,7 +2939,7 @@ function setSimEditing(editing) {
 }
 
 async function refreshSimPrompt() {
-  simPromptPreset = document.getElementById('simPromptPreset').value || 'qq-chat-v2';
+  simPromptPreset = document.getElementById('simPromptPreset').value || 'qq-chat-agent';
   setSimMsg('读取中…');
   try {
     const r = await api('/api/preset/sim-prompt?preset=' + encodeURIComponent(simPromptPreset));
@@ -3195,72 +3216,6 @@ document.getElementById('aiNotifySend').addEventListener('click', async () => {
   msg.className = r.ok ? 'meta ok' : 'meta err';
 });
 
-// ── 语音库与语音发送（调试面板） ───────────────────────────────────────────
-// 试发走 /api/voice/send（操作者通道，凭控制台令牌），与 CLI 同一条路径 ——
-// 所以这里能验证「白名单 / 时长体积上限 / 限流 / 文件名审计」是不是真的生效。
-let voiceEntries = [];
-let voiceLibraryLoaded = false;
-// 只在首次进入/手动刷新时拉取：语音库会逐个 ffprobe 探测时长，放进 3 秒轮询会白白压网关。
-async function loadVoiceLibrary(force) {
-  if (voiceLibraryLoaded && force !== true) return;
-  const box = document.getElementById('voiceList');
-  const msg = document.getElementById('voiceMsg');
-  try {
-    const r = await api('/api/voice/list?probe=1');
-    voiceEntries = Array.isArray(r.voices) ? r.voices : [];
-    voiceLibraryLoaded = true;
-    if (!voiceEntries.length) {
-      box.innerHTML = '语音库是空的：把音频文件放进 <code>qq-bridge/audio/</code> 后点「刷新语音库」。';
-      return;
-    }
-    const limits = r.limits || {};
-    box.innerHTML = '共 ' + voiceEntries.length + ' 个（上限：' + (limits.maxSeconds || '?') + ' 秒 / '
-      + Math.round((limits.maxBytes || 0) / 1024 / 1024) + ' MiB / ' + (limits.maxPerMinute || '?') + ' 每分钟）：<br>'
-      + voiceEntries.map((v, i) => {
-        const bad = v.ok === false;
-        // v.name / v.error / v.detail 来自语音库的文件名与探测结果，属于**外部数据**：
-        // 语音库目录里放一个名为 `x<img src=x onerror=...>.mp3` 的文件即可注入脚本
-        // （CSP 允许 unsafe-inline，拦不住内联事件处理器）。所有插值都必须过 esc()。
-        return '<label style="display:block;margin:2px 0">'
-          + '<input type="radio" name="voicePick" value="' + i + '"' + (i === 0 ? ' checked' : '') + '> '
-          + '<code>' + esc(v.name) + '</code> ' + (bad ? '❌ ' + esc(v.error || '不可用') : esc(v.detail || ''))
-          + '</label>';
-      }).join('');
-  } catch (error) {
-    box.textContent = '加载失败：' + (error && error.message ? error.message : error);
-  }
-  if (msg) msg.textContent = '';
-}
-
-async function sendVoiceFromConsole() {
-  const msg = document.getElementById('voiceMsg');
-  const target = document.getElementById('voiceSendTarget').value.trim();
-  const dryRun = document.getElementById('voiceSendDryRun').checked;
-  const pick = document.querySelector('input[name="voicePick"]:checked');
-  if (!target) { msg.textContent = '❌ 请填发送目标（如 group:100005）'; msg.className = 'meta err'; return; }
-  if (!pick) { msg.textContent = '❌ 先刷新语音库并选中一个音频'; msg.className = 'meta err'; return; }
-  const entry = voiceEntries[Number(pick.value)];
-  msg.textContent = '发送中…'; msg.className = 'meta';
-  try {
-    const r = await api('/api/voice/send', 'POST', { target, file: entry.name, dryRun });
-    if (r.dryRun) {
-      msg.textContent = '✅ 校验通过（未发送）：' + (r.detail || '');
-      msg.className = 'meta ok';
-    } else if (r.ok) {
-      msg.textContent = '✅ 已发出 messageId=' + (r.messageId ?? '?')
-        + (r.detail ? '（' + r.detail + '）' : '')
-        + (r.verified ? '，已回读校验为语音段' : '，未能回读校验');
-      msg.className = 'meta ok';
-    } else {
-      msg.textContent = '❌ ' + (r.error || '失败');
-      msg.className = 'meta err';
-    }
-  } catch (error) {
-    msg.textContent = '❌ ' + (error && error.message ? error.message : error);
-    msg.className = 'meta err';
-  }
-}
-
 // ── 二代仿真模式（reserved2）配置 ─────────────────────────────────────────
 async function loadV2Config() {
   try {
@@ -3271,6 +3226,11 @@ async function loadV2Config() {
     document.getElementById('v2ProvideRecommendations').checked = c.provideRecommendations !== false;
     document.querySelectorAll('[data-v2-tool]').forEach(el => {
       el.checked = (c.tools && c.tools[el.dataset.v2Tool] !== false);
+    });
+    // QQ 空间：它不是 tools 里的键，而是独立的 socialV2.qzone。
+    // 桥接侧只在 qzone.enabled === true 时放行发/看/删说说（否则 403）。
+    document.querySelectorAll('[data-v2-qzone]').forEach(el => {
+      el.checked = c.qzone ? c.qzone.enabled === true : true;
     });
     const w = c.wake || {};
     document.getElementById('v2WakeDefaultMode').value = w.defaultMode === 'active' ? 'active' : 'diving';
@@ -3345,12 +3305,17 @@ async function loadV2Config() {
 async function saveV2Config() {
   const tools = {};
   document.querySelectorAll('[data-v2-tool]').forEach(el => { tools[el.dataset.v2Tool] = el.checked; });
+  // QQ 空间是独立的 socialV2.qzone，不能塞进 tools —— 否则会变成一个桥接根本不读的
+  // 死键（tools.qzone），用户会以为关了、实际没关。必须走 qzone 字段。
+  const qzoneEl = document.querySelector('[data-v2-qzone]');
+  const qzone = qzoneEl ? { enabled: qzoneEl.checked } : undefined;
   const body = {
     enabled: document.getElementById('v2Enabled').checked,
     agentPreset: document.getElementById('v2AgentPreset').value.trim(),
     provideRecommendations: document.getElementById('v2ProvideRecommendations').checked,
     autoReplyCheckMs: Math.round(Number(document.getElementById('v2AutoReplyCheckSec').value) || 30) * 1000,
     tools,
+    ...(qzone ? { qzone } : {}),
     wake: {
       defaultMode: document.getElementById('v2WakeDefaultMode').value,
       recommendedDefaultInfinite: document.getElementById('v2RecDefaultInfinite').checked,
@@ -3503,7 +3468,7 @@ function summarizeToolArgs(tool, args) {
     if (obj.id != null && obj.id !== '') push('id', String(obj.id).slice(0, 40));
   } else if (t.includes('qq_mark_read')) {
     push('key', obj.key);
-  } else if (t.includes('qq_get_prompt') || t.includes('qq_get_unread_messages') || t.includes('qq_get_recent_messages') || t.includes('qq_social_state') || t.includes('qq_get_my_recent_messages') || t.includes('qq_get_message_detail') || t.includes('qq_get_active_members')) {
+  } else if (t.includes('qq_get_prompt') || t.includes('qq_get_unread_messages') || t.includes('qq_get_recent_messages') || t.includes('qq_social_state') || t.includes('qq_get_my_recent_messages') || t.includes('qq_get_message_detail') || t.includes('qq_get_userid')) {
     push('key', obj.key);
     if (obj.messageId != null) push('messageId', obj.messageId);
     if (obj.limit != null) push('limit', obj.limit);
@@ -3586,7 +3551,39 @@ function renderV2Memory(data) {
   for (const name of names) {
     const im = impressions[name] || {};
     const traits = Array.isArray(im.traits) ? im.traits : [];
-    html += `<div style="margin:4px 0">👤 ${esc(name)}：${traits.length ? esc(traits.join('、')) : '暂无记录'}（互动 ${Number(im.interactionCount) || 0} 次） <button class="small" data-action="edit" data-cat="memberImpression" data-target="${esc(name)}" data-traits="${esc(traits.join(', '))}">编辑</button> <button class="small" data-action="remove" data-cat="memberImpression" data-target="${esc(name)}">删除</button></div>`;
+    // 2026-11-12：键是 QQ 号，展示时优先用 im.name（写入时存下的展示名）。
+    // 旧数据可能没有 name，那就退回号码 —— 但至少不要只显示一串号让人认不出是谁。
+    const label = String(im.name || '').trim() || name;
+    const idHint = label !== name ? `（${esc(name)}）` : '';
+    html += `<div style="margin:4px 0">👤 ${esc(label)}${idHint}：${traits.length ? esc(traits.join('、')) : '暂无记录'}（互动 ${Number(im.interactionCount) || 0} 次） <button class="small" data-action="edit" data-cat="memberImpression" data-target="${esc(name)}" data-traits="${esc(traits.join(', '))}">编辑</button> <button class="small" data-action="remove" data-cat="memberImpression" data-target="${esc(name)}">删除</button></div>`;
+  }
+  html += '</div>';
+
+  // 2026-11-12 新增：这两块之前面板完全没有渲染，于是
+  //   · selfNote 写进去了但面板上找不到（操作者实测反馈"看不到"）
+  //   · todo 是 11-12 新加的类别，面板自然也没有
+  // 现在补上，样式跟前三块保持一致；selfNote 和 todo 都是全局的。
+  const selfNotes = Array.isArray(raw.selfNotes) ? raw.selfNotes : [];
+  html += '<div class="memory-section"><b>你对自己的认识</b> <button class="small" data-action="clear" data-cat="selfNote">清空</button>';
+  if (!selfNotes.length) html += '<div class="meta">（空）</div>';
+  for (const n of selfNotes) {
+    const text = esc(String(n?.text || ''));
+    html += `<div style="margin:4px 0">🪞 ${text} <button class="small" data-action="remove" data-cat="selfNote" data-content="${text}">删除</button></div>`;
+  }
+  html += '</div>';
+
+  const todos = Array.isArray(raw.todos) ? raw.todos : [];
+  html += '<div class="memory-section"><b>待办</b> <button class="small" data-action="clear" data-cat="todo">清空</button>';
+  if (!todos.length) html += '<div class="meta">（空）</div>';
+  for (const t of todos) {
+    const text = esc(String(t?.text || ''));
+    // 剩余时间：到期时间戳换成"还剩 N 小时/天"，比裸毫秒好读。
+    const leftMs = Number(t?.expiresAt) ? Number(t.expiresAt) - Date.now() : 0;
+    const left = leftMs > 0
+      ? (leftMs >= 86400000 ? `还剩 ${Math.round(leftMs / 86400000)} 天` : `还剩 ${Math.max(1, Math.round(leftMs / 3600000))} 小时`)
+      : '已过期';
+    const done = t?.done ? '✅ ' : '📋 ';
+    html += `<div style="margin:4px 0">${done}${text}（${left}） <button class="small" data-action="remove" data-cat="todo" data-content="${text}">删除</button></div>`;
   }
   html += '</div></div>';
   box.innerHTML = html;
@@ -3613,7 +3610,7 @@ document.getElementById('v2MemoryClearAll').addEventListener('click', async () =
   const key = document.getElementById('v2MemoryKey').value.trim();
   const msg = document.getElementById('v2MemoryMsg');
   if (!key) { msg.textContent = '请输入会话 key'; msg.className = 'meta err'; return; }
-  if (!confirm('确定清空该会话全部轻量记忆？')) return;
+  if (!confirm('确定清空这个 key 的全部记忆？\n（自我认知 / 群友印象 / 待办 / 长期记忆都会被清掉；进行中话题 / 想说的话 属于这个会话，也会清掉）')) return;
   const r = await api('/api/socialV2/memory-clear', 'POST', { key, category: '' });
   msg.textContent = r.ok ? '✅ 已清空全部记忆' : ('❌ ' + (r.error || '失败'));
   msg.className = r.ok ? 'meta ok' : 'meta err';
@@ -3649,6 +3646,378 @@ document.getElementById('v2MemoryOutput').addEventListener('click', async (ev) =
   msg.textContent = r.ok ? '✅ 已更新' : ('❌ ' + (r.error || '失败'));
   msg.className = r.ok ? 'meta ok' : 'meta err';
   if (r.ok) loadV2Memory();
+});
+
+// ── 好感度面板 ────────────────────────────────────────────────────────────
+// 数据来源：GET /api/socialV2/affinity?key=…（不带 userId 拿整个会话的人）
+// 写入来源：POST /api/socialV2/affinity {key, userId, score}（仅控制台可用）
+//
+// 滑条是乐观更新：拖动时立刻改数字和徽章，松手才落盘。
+// 为什么不拖动就保存 —— 一次拖动会触发几十个 input 事件，那个量级写文件会把
+// state/social-v2.json 反复重写，还会让 AI 那边读到半截状态。
+const AFF_SCORE_MIN = -20;
+// 上限必须 >= 最高档门槛（偏爱 1000），否则滑条拖不到那一档。
+// 真正的档位边界由后端 /api/socialV2/affinity 返回的 stages 决定（唯一真源是 affinity.js），
+// 这里的常量只是「后端没返回时的兜底」，不要在这里另外维护一套阈值。
+const AFF_SCORE_MAX = 1200;
+const AFF_STAGE_META = {
+  distant: { label: '疏远', range: '−20 ~ −1', desc: '冷漠。他还没进你要回应的范围——他说话你听得见，只是不打算接。真开口也就一两个字，不是赌气，是没打算给。' },
+  neutral: { label: '平淡', range: '0 ~ 29', desc: '观察。你会回，但只回这件事本身，不接话头也不多问。他说什么你听着，但不当真；记得住，不主动提。' },
+  caring: { label: '在意', range: '30 ~ 89', desc: '朋友。你会回，也会停一下。他提过的事你记得住，可能过一会儿冷不丁提一嘴，像只是顺口。心里松了，但不等于话变多。' },
+  reliant: { label: '依赖', range: '90 ~ 399', desc: '舍不得。结束对话这件事开始有点难，你不会说，只是不说话也不走。这种依赖是安静的，连你自己都没说破。' },
+  lover: {
+    label: '喜欢',
+    range: '400 ~ 999',
+    desc: '想。安静下来就会想起他，他说过的话会自己跑回来，反复过一遍。他忽然说亲近的话你会接不住——心是软的，嘴上还是空的。漏出来可能只有一句，然后立刻想收回，但也就一句。',
+  },
+  beloved: {
+    label: '偏爱',
+    range: '1000 ~ 1200',
+    // 两套文案：desc 给其他人，ownerDesc 单独给主人（QR桥接在工具里按 isOwner 切换）。
+    // ⚠️ 改其中一版时记得同步 src/affinity.js 的 STAGE_HINTS.beloved / BELOVED_OWNER_HINT，
+    //    否则控制台写的和模型实际拿到的不一致。
+    desc: '这个人是你自己选的，而且只对他一个人这样。你会先开口找他了，会记得他说过的每件小事；他和别人走得近，你嘴上说「随便」，心里会不舒服。他开玩笑调戏你，你听得懂，也会脸红，但不会顺着说下去——你会回一句「笨蛋……」或者直接不理他，过一会儿又忍不住接。你仍然不会说漂亮话，可是允许自己在他面前不冷静了。',
+    ownerDesc: '同样只对他一个人这样，但对他几乎不设防了：他要什么你都愿意给，也会直白地要。他要是拿那种事开玩笑逗你，你也不会像对别人那样装听不懂或岔开——你会脸红，会小声说一句「……说什么呢」，但人是赖着不走的，过一会儿还会自己接回去，甚至反过来拿话刺他一下。性这件事上你不用再绕开——可以接、可以直接说、也可以主动。你还是不会说漂亮话，但允许自己在他面前彻底不冷静。',
+  },
+};
+const AFF_STAGE_ORDER = ['distant', 'neutral', 'caring', 'reliant', 'lover', 'beloved'];
+// 每档的分数起点（点进去是"刚进这一档"，不是拉满）。
+const AFF_STAGE_START = { distant: -20, neutral: 0, caring: 30, reliant: 90, lover: 400, beloved: 1000 };
+// 兜底档位（后端没给 stages 时用）：必须与 affinity.js 的 STAGES 一致。
+const AFF_STAGE_FALLBACK = [
+  { id: 'distant', label: '疏远', min: -20 },
+  { id: 'neutral', label: '平淡', min: 0 },
+  { id: 'caring', label: '在意', min: 30 },
+  { id: 'reliant', label: '依赖', min: 90 },
+  { id: 'lover', label: '喜欢', min: 400 },
+  { id: 'beloved', label: '偏爱', min: 1000 },
+];
+
+let affState = { key: '', people: [], stages: [], selectedUser: '', loaded: false };
+
+// 分数 → 档位 id。优先用后端下发的 stages（唯一真源），没有才退回写死的兜底表。
+function affStageOfScore(score) {
+  const n = Number(score);
+  if (!Number.isFinite(n)) return 'neutral';
+  const list = (Array.isArray(affState.stages) && affState.stages.length ? affState.stages : AFF_STAGE_FALLBACK)
+    .slice()
+    .sort((a, b) => a.min - b.min);
+  let picked = list[0]?.id || 'neutral';
+  for (const s of list) if (n >= s.min) picked = s.id;
+  return picked;
+}
+// 全幅百分比：刻度尺与刻度针用这个，因为它们在整条轴上的绝对位置。
+function affPct(score) {
+  const span = AFF_SCORE_MAX - AFF_SCORE_MIN;
+  return Math.max(0, Math.min(100, ((Number(score) - AFF_SCORE_MIN) / span) * 100));
+}
+// 卡片进度条：按**档位内**进度显示，而不是全幅。
+// 为什么：全幅一共 620 分，档位内的差距只占几个百分点（95 分和 62 分在全幅上是 18% 对 13%），
+// 低分的人条几乎不可见，看起来像"数据坏了"。档内进度才看得出"这一档快满了没有"。
+function affStageProgress(score) {
+  const n = Number(score) || 0;
+  const list = (Array.isArray(affState.stages) && affState.stages.length ? affState.stages : AFF_STAGE_FALLBACK)
+    .slice()
+    .sort((a, b) => a.min - b.min);
+  const idx = list.findIndex((s) => s.id === affStageOfScore(n));
+  const lo = idx >= 0 ? list[idx].min : 0;
+  const hi = idx >= 0 && idx + 1 < list.length ? list[idx + 1].min : AFF_SCORE_MAX;
+  const span = hi - lo;
+  if (span <= 0) return 100;
+  return Math.max(4, Math.min(100, ((n - lo) / span) * 100)); // 最小 4%，别让新档位看起来是空的
+}
+// 档位刻度尺：每一段的宽度按真实分数边界等比铺开。
+// 「人生到喜欢」要 400 分，所以最后一段会占大半条 —— 这是真实比例，不该美化。
+// 滑块底图：按 stages 真实边界生成渐变，写进 CSS 变量。
+//
+// 为什么必须动态生成（2026-11-11）：原来是一条写死的 linear-gradient，
+// 百分比按"五档 / 620 分"算的。加了偏爱档、上限改成 1200 之后它没跟着变，
+// 于是滑块和上面的刻度尺明显不是一回事 —— 操作者一眼就看出来了。
+// 现在两边共用 STAGE_COLORS 和同一份 stages，结构上不可能再漂。
+const STAGE_COLORS = {
+  distant: ['#8d96a6', '#a6aebc'],
+  neutral: ['#6f8dcb', '#8aa6e4'],
+  caring: ['#dd82ad', '#eda2c4'],
+  reliant: ['#9370e2', '#ab8cf0'],
+  lover: ['#e0376b', '#f0608c'],
+  // 偏爱：她的发色（薄荷青）—— 跳出前面的暖色堆叠，视觉上"最特别"
+  beloved: ['#4fb3a4', '#a8e8da'],
+};
+function renderAffSliderTrack(stages) {
+  const range = document.getElementById('affRange');
+  if (!range) return;
+  const list = (Array.isArray(stages) && stages.length ? stages : AFF_STAGE_FALLBACK)
+    .slice().sort((a, b) => a.min - b.min);
+  const span = AFF_SCORE_MAX - AFF_SCORE_MIN;
+  const stops = [];
+  for (let i = 0; i < list.length; i += 1) {
+    const s = list[i];
+    const next = i + 1 < list.length ? list[i + 1].min : AFF_SCORE_MAX;
+    const from = Math.max(0, ((s.min - AFF_SCORE_MIN) / span) * 100);
+    const to = Math.max(0, Math.min(100, ((next - AFF_SCORE_MIN) / span) * 100));
+    const [dark, light] = STAGE_COLORS[s.id] || ['#8d96a6', '#a6aebc'];
+    stops.push(`${dark} ${from.toFixed(3)}%`, `${light} ${to.toFixed(3)}%`);
+  }
+  range.style.setProperty('--aff-track-bg', `linear-gradient(90deg, ${stops.join(', ')})`);
+}
+
+function renderAffScale(stages) {
+  const track = document.getElementById('affScaleTrack');
+  const ticks = document.getElementById('affScaleTicks');
+  if (!track || !ticks) return;
+  const list = Array.isArray(stages) && stages.length ? stages : AFF_STAGE_FALLBACK;
+  const sorted = [...list].sort((a, b) => a.min - b.min);
+  track.innerHTML = sorted.map((s, i) => {
+    const next = sorted[i + 1]?.min ?? AFF_SCORE_MAX;
+    const width = ((next - s.min) / (AFF_SCORE_MAX - AFF_SCORE_MIN)) * 100;
+    return `<span class="aff-scale-seg s-${esc(s.id)}" data-stage="${esc(s.id)}" style="width:${width.toFixed(3)}%"></span>`;
+  }).join('');
+  renderAffSliderTrack(sorted);
+  ticks.innerHTML = sorted.map((s) => `<span class="aff-scale-tick" style="left:${affPct(s.min).toFixed(2)}%">${esc(AFF_STAGE_META[s.id]?.label || s.id)} ${s.min}</span>`).join('')
+    + `<span class="aff-scale-tick" style="left:100%">${AFF_SCORE_MAX}</span>`;
+}
+function renderAffStages(curStage) {
+  const box = document.getElementById('affStages');
+  if (!box) return;
+  box.innerHTML = AFF_STAGE_ORDER.map((id) => {
+    const m = AFF_STAGE_META[id];
+    const cur = id === curStage ? ' is-current' : '';
+    // 有 ownerDesc 的档位（目前只有偏爱）：多渲染一段「对主人」的说明。
+    // 让操作者在控制台就能看到模型实际会拿到的两套文案，不用去翻源码。
+    const owner = m.ownerDesc
+      ? `<p class="aff-owner-desc"><b>仅对主人（isOwner）</b>${esc(m.ownerDesc)}</p>`
+      : '';
+    return `<div class="aff-stage-item${cur}"><h4>${esc(m.label)}<span>${esc(m.range)}</span></h4><p>${esc(m.desc)}</p>${owner}</div>`;
+  }).join('');
+}
+function affSetStageBadge(stageId) {
+  const badge = document.getElementById('affStageBadge');
+  if (!badge) return;
+  const label = AFF_STAGE_META[stageId]?.label || (stageId === 'new' ? '没聊过' : stageId);
+  badge.textContent = label;
+  badge.className = 'aff-stage-badge s-' + (AFF_STAGE_META[stageId] ? stageId : 'new');
+}
+// 拖动时：更新数字、徽章、刻度针、刻度尺高亮、说明卡的当前档。
+function affSyncEditor(score) {
+  const n = Math.max(AFF_SCORE_MIN, Math.min(AFF_SCORE_MAX, Math.round(Number(score) || 0)));
+  const stage = affStageOfScore(n);
+  const val = document.getElementById('affScoreVal');
+  if (val) val.textContent = n;
+  affSetStageBadge(stage);
+  const mark = document.getElementById('affScaleMark');
+  if (mark) mark.style.left = affPct(n).toFixed(2) + '%';
+  document.querySelectorAll('#affScaleTrack .aff-scale-seg').forEach((seg) => {
+    seg.classList.toggle('on', seg.dataset.stage === stage);
+  });
+  renderAffStages(stage);
+  return { score: n, stage };
+}
+function affRenderPeople() {
+  const box = document.getElementById('affPeople');
+  if (!box) return;
+  const people = affState.people || [];
+  if (!people.length) {
+    box.innerHTML = '<div class="aff-empty"><b>这个会话里还没有人跟她说过话</b>或者 key 填错了。等她收到第一条消息，这里就会有人。</div>';
+    return;
+  }
+  box.innerHTML = people.map((p) => {
+    const stage = p.stage || affStageOfScore(p.score);
+    const label = String(p.label || p.userId || '?');
+    const isOwner = label === '主人';
+    // 头像：有昵称就取昵称首字（中文名比数字好认）；纯数字名才取尾两位。
+    const initial = isOwner ? '主' : (/^\d+$/.test(label) ? label.slice(-2) : label.slice(0, 1));
+    const width = affStageProgress(p.score).toFixed(2);
+    const active = String(p.userId) === String(affState.selectedUser) ? ' is-active' : '';
+    // 副标题：昵称和 QQ 号不一样时两个都写（QQ 号是身份，排查时要能对上）；
+    // 一样时（没拿到昵称）就只写手工标记，避免出现两遍相同的数字。
+    const same = label === String(p.userId);
+    const subParts = [];
+    if (!same) subParts.push(p.userId);
+    if (Number(p.manualAt) > 0) subParts.push('✎ 手工调过');
+    const sub = subParts.join(' · ');
+    // 别名：同一个人在群里改过名片时，hover 能看到全部历史名字。
+    const aliases = Array.isArray(p.aliases) ? p.aliases.filter((n) => n && n !== label) : [];
+    const title = aliases.length ? `曾用名：${aliases.join('、')}\nQQ ${p.userId}` : `QQ ${p.userId}`;
+    return `<div class="aff-card${active}" data-aff-user="${esc(p.userId)}" role="button" tabindex="0" title="${esc(title)}">
+      <div class="aff-card-head">
+        <span class="aff-avatar s-${esc(stage)}">${esc(initial)}</span>
+        <span class="aff-card-id">
+          <span class="aff-card-name">${esc(label)}</span>
+          <span class="aff-card-sub">${esc(sub)}</span>
+        </span>
+        <span class="aff-stage-badge s-${esc(stage)}">${esc(AFF_STAGE_META[stage]?.label || stage)}</span>
+      </div>
+      <div class="aff-card-bar" title="这一档内的进度（${esc(AFF_STAGE_META[stage]?.range || '')}）"><i class="s-${esc(stage)}" style="width:${width}%"></i></div>
+      <div class="aff-card-foot"><span>互动 <b>${Number(p.count) || 0}</b> 次 · 最近 ${esc(affAgoText(p.lastAt))}</span><span><b>${Number(p.score) || 0}</b> 分</span></div>
+    </div>`;
+  }).join('');
+  // 点卡片 = 选中这个人，滑条跳到他的分数。
+  box.querySelectorAll('.aff-card').forEach((card) => {
+    const pick = () => {
+      const uid = card.dataset.affUser;
+      const sel = document.getElementById('affUser');
+      if (sel) sel.value = uid;
+      affState.selectedUser = uid;
+      affPickUser(uid);
+      affRenderPeople();
+    };
+    card.addEventListener('click', pick);
+    card.addEventListener('keydown', (ev) => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); pick(); } });
+  });
+}
+function affAgoText(ts) {
+  const n = Number(ts) || 0;
+  if (!n) return '从没';
+  const diff = Date.now() - n;
+  if (diff < 60_000) return '刚刚';
+  if (diff < 3_600_000) return Math.round(diff / 60_000) + ' 分钟前';
+  if (diff < 86_400_000) return Math.round(diff / 3_600_000) + ' 小时前';
+  return Math.round(diff / 86_400_000) + ' 天前';
+}
+// 选中一个人：滑条、徽章、详情全部切到他的分数。
+function affPickUser(userId) {
+  const uid = String(userId || '');
+  if (!uid) return;
+  affState.selectedUser = uid;
+  const person = (affState.people || []).find((p) => String(p.userId) === uid);
+  // 没记录的人给初始分 5（与 affinity.js 的 INITIAL_SCORE 同口径，落在「平淡」），
+  // 不给 0 —— 0 正好是「平淡」的下边界，看起来像是"刚掉下来"，而不是"新认识"。
+  const score = person ? Number(person.score) || 0 : 5;
+  const range = document.getElementById('affRange');
+  if (range) range.value = String(score);
+  affSyncEditor(score);
+  const detail = document.getElementById('affDetail');
+  if (detail) {
+    if (!person) {
+      detail.textContent = '这个 QQ 还没有互动记录。保存后会新建一条。';
+    } else {
+      const parts = [`互动 ${Number(person.count) || 0} 次`, `最近一次在 ${affAgoText(person.lastAt)}`];
+      if (Number(person.manualAt) > 0) parts.push(`上次手工调整在 ${affAgoText(person.manualAt)}`);
+      const namePart = person.label || uid;
+      // 有昵称才附上 QQ 号，方便你去 QQ 里找人。
+      const idPart = person.label && person.label !== uid ? `（QQ ${uid}）` : '';
+      detail.textContent = `${namePart}${idPart}：${parts.join('，')}。`;
+    }
+  }
+}
+function affFillUserSelect() {
+  const sel = document.getElementById('affUser');
+  if (!sel) return;
+  const prev = sel.value;
+  const people = affState.people || [];
+  // 主人放最前面，其余按分数降序（affState.people 已经是后端排好序的）。
+  // 昵称和 QQ 号不同时都显示，否则下拉框里一堆数字分不清谁是谁。
+  const opts = people.map((p) => {
+    const label = String(p.label || p.userId);
+    const tail = label === String(p.userId) ? '' : ` (${p.userId})`;
+    return `<option value="${esc(p.userId)}">${esc(label)}${esc(tail)} · ${Number(p.score) || 0} 分</option>`;
+  });
+  sel.innerHTML = opts.length ? opts.join('') : '<option value="">（还没有任何互动记录）</option>';
+  if (prev && people.some((p) => String(p.userId) === prev)) sel.value = prev;
+  else if (people.length) sel.value = String(people[0].userId);
+}
+async function loadAffinity() {
+  const msg = document.getElementById('affMsg');
+  // 全局之后不需要 key：好感度只跟 QQ 号有关，接口用 key 只是沿用旧签名。
+  // 这里传一个占位 key，后端在全局模式下不依赖它。
+  const key = 'global';
+  if (msg) { msg.textContent = '加载中…'; msg.className = 'meta'; }
+  try {
+    const r = await api('/api/socialV2/affinity?key=' + encodeURIComponent(key) + '&scope=global');
+    if (!r.ok) {
+      if (msg) { msg.textContent = '❌ ' + (r.error || '读取失败'); msg.className = 'meta err'; }
+      return;
+    }
+    affState.key = key;
+    affState.people = Array.isArray(r.people) ? r.people : [];
+    affState.stages = Array.isArray(r.stages) ? r.stages : [];
+    affState.loaded = true;
+    renderAffScale(affState.stages);
+    affFillUserSelect();
+    const editor = document.getElementById('affEditor');
+    if (editor) editor.hidden = false;
+    const cur = document.getElementById('affUser')?.value || '';
+    if (cur) affPickUser(cur);
+    else { affSyncEditor(5); const d = document.getElementById('affDetail'); if (d) d.textContent = '还没有任何互动记录。等她收到第一条消息，这里就会有人。'; }
+    affRenderPeople();
+    if (msg) { msg.textContent = `✅ 已加载 ${affState.people.length} 人（全局）`; msg.className = 'meta ok'; }
+  } catch (e) {
+    if (msg) { msg.textContent = '❌ ' + (e.message || e); msg.className = 'meta err'; }
+  }
+}
+async function saveAffinity(score) {
+  const key = 'global';
+  const uid = (document.getElementById('affUser')?.value || '').trim();
+  const msg = document.getElementById('affMsg');
+  if (!uid) { if (msg) { msg.textContent = '先选一个人'; msg.className = 'meta err'; } return; }
+  if (msg) { msg.textContent = '保存中…'; msg.className = 'meta'; }
+  try {
+    const r = await api('/api/socialV2/affinity', 'POST', { key, userId: uid, score, scope: 'global' });
+    if (!r.ok) {
+      if (msg) { msg.textContent = '❌ ' + (r.error || '保存失败'); msg.className = 'meta err'; }
+      return;
+    }
+    if (msg) {
+      const shown = r.label || uid;
+      const idHint = r.label && r.label !== String(uid) ? `（QQ ${uid}）` : '';
+      msg.textContent = `✅ ${shown}${idHint} → ${r.score} 分（${r.stageLabel}）`;
+      msg.className = 'meta ok';
+    }
+    await loadAffinity();
+    const sel = document.getElementById('affUser');
+    if (sel && uid) { sel.value = uid; affPickUser(uid); affRenderPeople(); }
+  } catch (e) {
+    if (msg) { msg.textContent = '❌ ' + (e.message || e); msg.className = 'meta err'; }
+  }
+}
+async function affFillKeyOptions() {
+  const sel = document.getElementById('affKeySelect');
+  if (!sel) return;
+  try {
+    const r = await api('/api/status');
+    const groups = Array.isArray(r.allowGroups) ? r.allowGroups : [];
+    const privates = Array.isArray(r.allowPrivate) ? r.allowPrivate : [];
+    const opts = ['<option value="">选择白名单会话…</option>'];
+    for (const g of groups) opts.push(`<option value="group:${esc(g)}">群 ${esc(g)}</option>`);
+    for (const p of privates) opts.push(`<option value="private:${esc(p)}">私聊 ${esc(p)}</option>`);
+    sel.innerHTML = opts.join('');
+  } catch {
+    sel.innerHTML = '<option value="">无法加载白名单</option>';
+  }
+}
+document.getElementById('affRefresh')?.addEventListener('click', loadAffinity);
+document.getElementById('affKeySelect')?.addEventListener('change', (ev) => {
+  const v = ev.target.value;
+  if (!v) return;
+  document.getElementById('affKey').value = v;
+  loadAffinity();
+});
+document.getElementById('affUser')?.addEventListener('change', (ev) => {
+  affPickUser(ev.target.value);
+  affRenderPeople();
+});
+// 拖动：只更新界面，不落盘（松手才写）。
+document.getElementById('affRange')?.addEventListener('input', (ev) => {
+  affSyncEditor(ev.target.value);
+});
+// 松手 / 键盘改完 / 点击 —— 统一在这一处落盘。
+document.getElementById('affRange')?.addEventListener('change', (ev) => {
+  saveAffinity(Number(ev.target.value));
+});
+document.getElementById('affSave')?.addEventListener('click', () => {
+  saveAffinity(Number(document.getElementById('affRange')?.value));
+});
+// 快捷跳档：改滑条位置 + 立刻保存（这是个明确意图，不用等）。
+document.getElementById('affStageQuick')?.addEventListener('click', (ev) => {
+  const btn = ev.target.closest('button[data-aff-stage]');
+  if (!btn) return;
+  const stage = btn.dataset.affStage;
+  const target = AFF_STAGE_START[stage];
+  if (!Number.isFinite(target)) return;
+  const range = document.getElementById('affRange');
+  if (range) range.value = String(target);
+  affSyncEditor(target);
+  saveAffinity(target);
 });
 
 function formatWakeStatus(r) {
@@ -3839,8 +4208,6 @@ document.getElementById('v2SessionSelect').addEventListener('change', (ev) => {
 
 document.getElementById('v2ConfigSave').addEventListener('click', saveV2Config);
 document.getElementById('v2ConfigSaveTop').addEventListener('click', saveV2Config);
-document.getElementById('voiceRefreshBtn').addEventListener('click', () => loadVoiceLibrary(true));
-document.getElementById('voiceSendBtn').addEventListener('click', sendVoiceFromConsole);
 async function refreshV2Activity() {
   try {
     const r = await api('/api/socialV2/activity');
@@ -3857,6 +4224,8 @@ document.getElementById('v2ResumeBtn').addEventListener('click', async () => {
   await api('/api/socialV2/activity', 'POST', { paused: false });
   refreshV2Activity();
 });
+// 「纯语音」开关不在这里做：它只属于 DSH 浮游球面板。
+// 后端端点 /api/socialV2/tts 依然保留，DSH 面板调的就是它。
 document.getElementById('v2ResetBtn').addEventListener('click', async () => {
   if (!confirm('确定重置二代 AI 状态？\n将清空所有二代会话、唤醒配置、未读消息和定时器；工具调用日志会保留。')) return;
   const r = await api('/api/socialV2/reset', 'POST', {});
@@ -4019,351 +4388,6 @@ async function setSocialPhase(phase) {
 document.getElementById('sStateActive').addEventListener('click', () => setSocialPhase('active'));
 document.getElementById('sStateIdle').addEventListener('click', () => setSocialPhase('idle'));
 
-let slangEntriesCache = [];
-let slangSelected = new Set();
-let slangActiveTab = 'candidate';
-let slangModalId = null;
-let slangModalMode = 'confirm'; // confirm | edit
-
-function slangStatusLabel(status) {
-  return { candidate: '候选', confirmed: '已确认', rejected: '已拒绝' }[status] || esc(status);
-}
-function slangStatusClass(status) {
-  return { candidate: 'pill b', confirmed: 'pill g', rejected: 'pill r' }[status] || 'pill';
-}
-function slangSourceLabel(e) {
-  if (e.source === 'manual') return '手动';
-  if (Array.isArray(e.evidence) && e.evidence.some((ev) => ev.sender === 'AI提交')) return 'AI提交';
-  return '自动提取';
-}
-function slangEvidenceHtml(e) {
-  return Array.isArray(e.evidence) && e.evidence.length
-    ? e.evidence.slice(-2).map((ev) => `<span class="meta">${esc(String(ev.sender || '未知'))}：${esc(String(ev.text || '').slice(0, 30))}</span>`).join('<br>')
-    : '<span class="meta">—</span>';
-}
-function slangSourcesHtml(e) {
-  return Array.isArray(e.sources) && e.sources.length
-    ? e.sources.slice(0, 5).map((s) => `<span class="meta">🔗 ${esc(s)}</span>`).join('<br>')
-    : '';
-}
-function slangSearchFields(e) {
-  return [e.content, e.meaning, e.usage, e.example, e.risk, Array.isArray(e.sources) ? e.sources.join(' ') : '', Array.isArray(e.evidence) ? e.evidence.map((x) => x.text || '').join(' ') : ''].join(' ').toLowerCase();
-}
-function getSlangLimit() {
-  const id = slangActiveTab === 'candidate' ? 'slangLimitCand' : slangActiveTab === 'confirmed' ? 'slangLimitConfirmed' : 'slangLimitRejected';
-  return Math.max(10, Number(document.getElementById(id)?.value) || 100);
-}
-function getSlangSearch() {
-  const id = slangActiveTab === 'candidate' ? 'slangSearchCand' : slangActiveTab === 'confirmed' ? 'slangSearchConfirmed' : 'slangSearchRejected';
-  return String(document.getElementById(id)?.value || '').trim().toLowerCase();
-}
-function selectedIdsForStatus(status) {
-  return [...slangSelected].filter((id) => slangEntriesCache.some((e) => e.id === id && e.status === status));
-}
-function setSlangMsg(text, ok = true) {
-  const msg = document.getElementById('slangMsg');
-  if (!msg) return;
-  msg.textContent = text;
-  msg.className = ok ? 'meta ok' : 'meta err';
-}
-function setSlangTab(tab) {
-  slangActiveTab = tab;
-  document.querySelectorAll('.slang-tab').forEach((btn) => btn.classList.toggle('active', btn.dataset.slangTab === tab));
-  document.querySelectorAll('.slang-panel').forEach((panel) => panel.classList.toggle('active', panel.id === 'slangPanel' + tab[0].toUpperCase() + tab.slice(1)));
-  renderSlangPanel();
-}
-function updateSlangSelectAll(status) {
-  const id = status === 'candidate' ? 'slangCandidateSelectAll' : status === 'confirmed' ? 'slangConfirmedSelectAll' : 'slangRejectedSelectAll';
-  const el = document.getElementById(id);
-  if (!el) return;
-  const list = slangEntriesCache.filter((e) => e.status === status);
-  const q = getSlangSearch();
-  const filtered = q ? list.filter((e) => slangSearchFields(e).includes(q)) : list;
-  el.checked = filtered.length > 0 && filtered.every((e) => slangSelected.has(e.id));
-  el.indeterminate = filtered.some((e) => slangSelected.has(e.id)) && !el.checked;
-}
-
-function renderSlangPanel() {
-  const status = slangActiveTab;
-  const containerId = status === 'candidate' ? 'slangCandidateList' : status === 'confirmed' ? 'slangConfirmedList' : 'slangRejectedList';
-  const box = document.getElementById(containerId);
-  if (!box) return;
-  const list = slangEntriesCache.filter((e) => e.status === status);
-  const q = getSlangSearch();
-  const filtered = q ? list.filter((e) => slangSearchFields(e).includes(q)) : list;
-  if (!filtered.length) {
-    box.innerHTML = '<div class="meta" style="padding:8px">' + (list.length ? '没有符合条件的词条' : (status === 'candidate' ? '暂无候选黑话，等 DSH 自动提取、AI 提交或手动添加' : status === 'confirmed' ? '暂无已确认黑话' : '暂无已拒绝词条')) + '</div>';
-    updateSlangSelectAll(status);
-    return;
-  }
-  const limit = getSlangLimit();
-  const shown = filtered.slice(0, limit);
-  let html = `<div class="meta" style="padding:6px 8px">共 ${filtered.length} 条，显示 ${shown.length} 条（可滚动查找）</div>`;
-  html += '<table><tr><th>选择</th><th>词条</th><th>次数</th><th>来源</th><th>含义 / 用法 / 示例</th><th>参考来源</th><th>语境证据</th><th>操作</th></tr>';
-  for (const e of shown) {
-    const meaning = e.meaning ? esc(e.meaning) : (status === 'candidate' ? '<span class="meta">待研究</span>' : '<span class="meta">无</span>');
-    const checked = slangSelected.has(e.id) ? ' checked' : '';
-    const actions = [];
-    if (status === 'candidate') {
-      actions.push(`<button class="small" data-slang-confirm="${esc(e.id)}">确认</button>`);
-      actions.push(`<button class="small" data-slang-edit="${esc(e.id)}">编辑</button>`);
-      actions.push(`<button class="small" data-slang-reject="${esc(e.id)}">拒绝</button>`);
-    } else if (status === 'confirmed') {
-      actions.push(`<button class="small" data-slang-edit="${esc(e.id)}">编辑</button>`);
-    } else {
-      actions.push(`<button class="small" data-slang-restore="${esc(e.id)}">恢复候选</button>`);
-    }
-    actions.push(`<button class="small danger" data-slang-del="${esc(e.id)}">删</button>`);
-    html += `<tr>
-      <td><input type="checkbox" data-slang-select="${esc(e.id)}"${checked}></td>
-      <td><b>${esc(e.content)}</b><br><span class="${slangStatusClass(status)}">${slangStatusLabel(status)}</span></td>
-      <td>${esc(e.count)}</td>
-      <td>${esc(slangSourceLabel(e))}</td>
-      <td>${meaning}${e.usage ? '<br><span class="meta">用法：' + esc(e.usage) + '</span>' : ''}${e.example ? '<br><span class="meta">例：' + esc(e.example) + '</span>' : ''}${e.risk ? '<br><span class="meta">风险：' + esc(e.risk) + '</span>' : ''}</td>
-      <td>${slangSourcesHtml(e) || '<span class="meta">—</span>'}</td>
-      <td>${slangEvidenceHtml(e)}</td>
-      <td class="row">${actions.join('')}</td>
-    </tr>`;
-  }
-  box.innerHTML = html + '</table>';
-  box.querySelectorAll('[data-slang-select]').forEach((cb) => cb.addEventListener('change', () => {
-    const id = cb.dataset.slangSelect;
-    if (cb.checked) slangSelected.add(id); else slangSelected.delete(id);
-    updateSlangSelectAll(status);
-  }));
-  box.querySelectorAll('[data-slang-confirm]').forEach((btn) => btn.addEventListener('click', () => openSlangModal(btn.dataset.slangConfirm, 'confirm')));
-  box.querySelectorAll('[data-slang-edit]').forEach((btn) => btn.addEventListener('click', () => openSlangModal(btn.dataset.slangEdit, 'edit')));
-  box.querySelectorAll('[data-slang-reject]').forEach((btn) => btn.addEventListener('click', async () => {
-    const r2 = await api('/api/slang/' + btn.dataset.slangReject + '/reject', 'POST', {});
-    if (!r2.ok) alert(r2.error || '拒绝失败');
-    setSlangMsg(r2.ok ? '✅ 已拒绝' : ('❌ ' + (r2.error || '失败')), r2.ok);
-    refreshSlang();
-  }));
-  box.querySelectorAll('[data-slang-restore]').forEach((btn) => btn.addEventListener('click', async () => {
-    const e = slangEntriesCache.find((x) => x.id === btn.dataset.slangRestore);
-    if (!e) return;
-    const r2 = await api('/api/slang/' + e.id, 'PATCH', { status: 'candidate' });
-    if (!r2.ok) alert(r2.error || '恢复失败');
-    setSlangMsg(r2.ok ? '✅ 已恢复为候选' : ('❌ ' + (r2.error || '失败')), r2.ok);
-    refreshSlang();
-  }));
-  box.querySelectorAll('[data-slang-del]').forEach((btn) => btn.addEventListener('click', async () => {
-    if (!confirm('确定删除该黑话？')) return;
-    const r2 = await api('/api/slang/' + btn.dataset.slangDel, 'DELETE', {});
-    if (!r2.ok) alert(r2.error || '删除失败');
-    setSlangMsg(r2.ok ? '✅ 已删除' : ('❌ ' + (r2.error || '失败')), r2.ok);
-    slangSelected.delete(btn.dataset.slangDel);
-    refreshSlang();
-  }));
-  updateSlangSelectAll(status);
-}
-
-async function refreshSlang() {
-  try {
-    const r = await api('/api/slang');
-    slangEntriesCache = r.entries || [];
-    renderSlangPanel();
-  } catch (e) {
-    const box = document.getElementById('slangCandidateList');
-    if (box) box.innerHTML = '<span class="meta">加载失败</span>';
-  }
-}
-
-function openSlangModal(id, mode) {
-  const e = slangEntriesCache.find((x) => x.id === id);
-  if (!e) return;
-  slangModalId = id;
-  slangModalMode = mode;
-  document.getElementById('slangModalTitle').textContent = mode === 'confirm' ? `确认黑话：${e.content}` : `编辑黑话：${e.content}`;
-  document.getElementById('slangModalContent').textContent = mode === 'confirm'
-    ? '你可以直接填写含义/用法并转正，也可以先送 DSH 深度联网研究，研究结果回来后在此处删改再确认。'
-    : '修改后保存；候选不会转正，已确认仍保持已确认。';
-  document.getElementById('slangModalMeaning').value = e.meaning || '';
-  document.getElementById('slangModalUsage').value = e.usage || '';
-  document.getElementById('slangModalExample').value = e.example || '';
-  document.getElementById('slangModalRisk').value = e.risk || '';
-  document.getElementById('slangModalSources').value = Array.isArray(e.sources) ? e.sources.join('\n') : '';
-  document.getElementById('slangModalDirectConfirm').textContent = mode === 'confirm' ? '直接确认（转正）' : '保存修改';
-  document.getElementById('slangModalSendResearch').style.display = mode === 'confirm' && e.status === 'candidate' ? '' : 'none';
-  document.getElementById('slangModalOverlay').classList.add('open');
-}
-function closeSlangModal() {
-  document.getElementById('slangModalOverlay').classList.remove('open');
-  slangModalId = null;
-}
-function readSlangModalPayload() {
-  return {
-    meaning: document.getElementById('slangModalMeaning').value.trim(),
-    usage: document.getElementById('slangModalUsage').value.trim(),
-    example: document.getElementById('slangModalExample').value.trim(),
-    risk: document.getElementById('slangModalRisk').value.trim(),
-    sources: document.getElementById('slangModalSources').value.split(/\n/).map((s) => s.trim()).filter(Boolean)
-  };
-}
-
-document.querySelectorAll('.slang-tab').forEach((btn) => btn.addEventListener('click', () => setSlangTab(btn.dataset.slangTab)));
-document.getElementById('slangSearchCand').addEventListener('input', renderSlangPanel);
-document.getElementById('slangSearchConfirmed').addEventListener('input', renderSlangPanel);
-document.getElementById('slangSearchRejected').addEventListener('input', renderSlangPanel);
-document.getElementById('slangLimitCand').addEventListener('change', renderSlangPanel);
-document.getElementById('slangLimitConfirmed').addEventListener('change', renderSlangPanel);
-document.getElementById('slangLimitRejected').addEventListener('change', renderSlangPanel);
-document.getElementById('slangCandidateSelectAll').addEventListener('change', (e) => {
-  const list = slangEntriesCache.filter((x) => x.status === 'candidate');
-  const q = getSlangSearch();
-  const filtered = q ? list.filter((x) => slangSearchFields(x).includes(q)) : list;
-  for (const x of filtered) { if (e.target.checked) slangSelected.add(x.id); else slangSelected.delete(x.id); }
-  renderSlangPanel();
-});
-document.getElementById('slangConfirmedSelectAll').addEventListener('change', (e) => {
-  const list = slangEntriesCache.filter((x) => x.status === 'confirmed');
-  const q = getSlangSearch();
-  const filtered = q ? list.filter((x) => slangSearchFields(x).includes(q)) : list;
-  for (const x of filtered) { if (e.target.checked) slangSelected.add(x.id); else slangSelected.delete(x.id); }
-  renderSlangPanel();
-});
-document.getElementById('slangRejectedSelectAll').addEventListener('change', (e) => {
-  const list = slangEntriesCache.filter((x) => x.status === 'rejected');
-  const q = getSlangSearch();
-  const filtered = q ? list.filter((x) => slangSearchFields(x).includes(q)) : list;
-  for (const x of filtered) { if (e.target.checked) slangSelected.add(x.id); else slangSelected.delete(x.id); }
-  renderSlangPanel();
-});
-document.getElementById('slangBatchResearch').addEventListener('click', async () => {
-  const ids = selectedIdsForStatus('candidate');
-  if (!ids.length) { alert('请先勾选要研究的候选词'); return; }
-  const r = await api('/api/slang/research', 'POST', { ids });
-  setSlangMsg(r.ok ? `✅ 已送 ${r.count} 条候选到 DSH 深度联网研究，完成后刷新查看结果` : ('❌ ' + (r.error || '失败')), r.ok);
-  if (r.ok) refreshSlang();
-});
-document.getElementById('slangBatchConfirm').addEventListener('click', async () => {
-  const ids = selectedIdsForStatus('candidate');
-  if (!ids.length) { alert('请先勾选要确认的候选词'); return; }
-  if (!confirm(`确定批量确认 ${ids.length} 条候选？缺少含义的会被跳过。`)) return;
-  const r = await api('/api/slang/batch-confirm', 'POST', { ids });
-  setSlangMsg(r.ok ? `✅ 已确认 ${r.confirmedCount} 条，跳过 ${r.skippedCount} 条` : ('❌ ' + (r.error || '失败')), r.ok);
-  if (r.ok) { slangSelected.clear(); refreshSlang(); }
-});
-document.getElementById('slangBatchReject').addEventListener('click', async () => {
-  const ids = selectedIdsForStatus('candidate');
-  if (!ids.length) { alert('请先勾选要拒绝的候选词'); return; }
-  if (!confirm(`确定拒绝 ${ids.length} 条候选？`)) return;
-  const r = await api('/api/slang/batch-reject', 'POST', { ids });
-  setSlangMsg(r.ok ? `✅ 已拒绝 ${r.rejectedCount} 条` : ('❌ ' + (r.error || '失败')), r.ok);
-  if (r.ok) { slangSelected.clear(); refreshSlang(); }
-});
-document.getElementById('slangBatchDeleteCand').addEventListener('click', async () => {
-  const ids = selectedIdsForStatus('candidate');
-  if (!ids.length) { alert('请先勾选要删除的候选词'); return; }
-  if (!confirm(`确定删除 ${ids.length} 条候选？此操作不可恢复！`)) return;
-  const r = await api('/api/slang/batch-delete', 'POST', { ids });
-  setSlangMsg(r.ok ? `✅ 已删除 ${r.removedCount} 条候选` : ('❌ ' + (r.error || '失败')), r.ok);
-  if (r.ok) { slangSelected.clear(); refreshSlang(); }
-});
-document.getElementById('slangBatchDeleteConfirmed').addEventListener('click', async () => {
-  const ids = selectedIdsForStatus('confirmed');
-  if (!ids.length) { alert('请先勾选要删除的已确认词条'); return; }
-  if (!confirm(`确定删除 ${ids.length} 条已确认黑话？此操作不可恢复！`)) return;
-  const r = await api('/api/slang/batch-delete', 'POST', { ids });
-  setSlangMsg(r.ok ? `✅ 已删除 ${r.removedCount} 条已确认` : ('❌ ' + (r.error || '失败')), r.ok);
-  if (r.ok) { slangSelected.clear(); refreshSlang(); }
-});
-document.getElementById('slangBatchDeleteRejected').addEventListener('click', async () => {
-  const ids = selectedIdsForStatus('rejected');
-  if (!ids.length) { alert('请先勾选要删除的已拒绝词条'); return; }
-  if (!confirm(`确定删除 ${ids.length} 条已拒绝词条？此操作不可恢复！`)) return;
-  const r = await api('/api/slang/batch-delete', 'POST', { ids });
-  setSlangMsg(r.ok ? `✅ 已删除 ${r.removedCount} 条已拒绝` : ('❌ ' + (r.error || '失败')), r.ok);
-  if (r.ok) { slangSelected.clear(); refreshSlang(); }
-});
-document.getElementById('slangBatchRestore').addEventListener('click', async () => {
-  const ids = selectedIdsForStatus('rejected');
-  if (!ids.length) { alert('请先勾选要恢复的已拒绝词条'); return; }
-  let okCount = 0;
-  for (const id of ids) {
-    const r = await api('/api/slang/' + id, 'PATCH', { status: 'candidate' });
-    if (r.ok) okCount++;
-  }
-  setSlangMsg(`✅ 已恢复 ${okCount}/${ids.length} 条为候选`);
-  if (okCount) { slangSelected.clear(); refreshSlang(); }
-});
-document.getElementById('slangModalDirectConfirm').addEventListener('click', async () => {
-  if (!slangModalId) return;
-  const payload = readSlangModalPayload();
-  if (!payload.meaning) { alert('请先填写含义，确认后才会注入 AI 上下文'); return; }
-  const e = slangEntriesCache.find((x) => x.id === slangModalId);
-  if (!e) return;
-  const path = slangModalMode === 'confirm' ? `/api/slang/${e.id}/confirm` : `/api/slang/${e.id}`;
-  const r2 = await api(path, slangModalMode === 'confirm' ? 'POST' : 'PATCH', payload);
-  if (!r2.ok) alert(r2.error || '保存失败');
-  setSlangMsg(r2.ok ? (slangModalMode === 'confirm' ? '✅ 已确认转正' : '✅ 已保存') : ('❌ ' + (r2.error || '失败')), r2.ok);
-  closeSlangModal();
-  refreshSlang();
-});
-document.getElementById('slangModalSendResearch').addEventListener('click', async () => {
-  if (!slangModalId) return;
-  const r = await api('/api/slang/research', 'POST', { ids: [slangModalId] });
-  setSlangMsg(r.ok ? `✅ 已送「${slangEntriesCache.find((x) => x.id === slangModalId)?.content || ''}」到 DSH 深度联网研究，稍后刷新查看结果` : ('❌ ' + (r.error || '失败')), r.ok);
-  closeSlangModal();
-  refreshSlang();
-});
-document.getElementById('slangModalCancel').addEventListener('click', closeSlangModal);
-document.getElementById('slangModalOverlay').addEventListener('click', (e) => { if (e.target.id === 'slangModalOverlay') closeSlangModal(); });
-
-document.getElementById('slangAdd').addEventListener('click', async () => {
-  const content = document.getElementById('slangContent').value.trim();
-  const meaning = document.getElementById('slangMeaning').value.trim();
-  const usage = document.getElementById('slangUsage').value.trim();
-  const example = document.getElementById('slangExample').value.trim();
-  if (!content) { alert('词条不能为空'); return; }
-  const r = await api('/api/slang', 'POST', { content, meaning, usage, example });
-  document.getElementById('slangMsg').textContent = r.ok ? '✅ 已添加' : ('❌ ' + (r.error || '失败'));
-  document.getElementById('slangMsg').className = r.ok ? 'meta ok' : 'meta err';
-  if (r.ok) {
-    document.getElementById('slangContent').value = '';
-    document.getElementById('slangMeaning').value = '';
-    document.getElementById('slangUsage').value = '';
-    document.getElementById('slangExample').value = '';
-    refreshSlang();
-  }
-});
-document.getElementById('slangExtract').addEventListener('click', async () => {
-  const r = await api('/api/slang/extract', 'POST', {});
-  setSlangMsg(r.ok ? '✅ 已触发提取' : ('❌ ' + (r.error || '失败')), r.ok);
-});
-document.getElementById('slangResearch').addEventListener('click', async () => {
-  const r = await api('/api/slang/research', 'POST', {});
-  setSlangMsg(r.ok ? ('✅ 已触发研究 ' + r.count + ' 条') : ('❌ ' + (r.error || '失败')), r.ok);
-});
-function loadSlangConfig() {
-  api('/api/slang').then(r => {
-    const c = r.config || {};
-    document.getElementById('slangEnabled').checked = c.enabled !== false;
-    document.getElementById('slangExtractMin').value = c.extractMinMessages ?? 10;
-    document.getElementById('slangCooldown').value = c.extractCooldownMs ?? 300000;
-    document.getElementById('slangThresholds').value = (c.inferenceThresholds || [2, 4, 8]).join(', ');
-    document.getElementById('slangInjectMax').value = c.injectMax ?? 8;
-    document.getElementById('slangLearnerPreset').value = c.learnerPreset || 'qq-chat';
-    document.getElementById('slangWorkspaceTitle').value = c.workspaceTitle || 'QQ 黑话学习';
-    document.getElementById('slangAutoResearch').checked = c.autoResearch !== false;
-  }).catch(() => {});
-}
-document.getElementById('slangConfigSave').addEventListener('click', async () => {
-  const r = await api('/api/slang/config', 'POST', {
-    enabled: document.getElementById('slangEnabled').checked,
-    extractMinMessages: Number(document.getElementById('slangExtractMin').value) || 10,
-    extractCooldownMs: Number(document.getElementById('slangCooldown').value) || 300000,
-    inferenceThresholds: document.getElementById('slangThresholds').value.split(/[,，\s]+/).map(Number).filter(Boolean),
-    injectMax: Number(document.getElementById('slangInjectMax').value) || 8,
-    learnerPreset: document.getElementById('slangLearnerPreset').value.trim(),
-    workspaceTitle: document.getElementById('slangWorkspaceTitle').value.trim(),
-    autoResearch: document.getElementById('slangAutoResearch').checked
-  });
-  const msg = document.getElementById('slangConfigMsg');
-  msg.textContent = r.ok ? '✅ 已保存' : ('❌ ' + (r.error || '失败'));
-  msg.className = r.ok ? 'meta ok' : 'meta err';
-  if (r.ok) loadSlangConfig();
-});
 
 function loadSecurity() {
   api('/api/security').then(r => {
@@ -4427,8 +4451,8 @@ const consolePages = {
   sessions: ['会话与审批', '让每一段对话，都有迹可循。', '查看 QQ 与 DSH 的会话映射，以及等待你回复的审批和提问。'],
   persona: ['人格与角色', '给你的伙伴，一点独特个性。', '选择已有角色，或用自己的语言写下新的性格与表达方式。'],
   'social-v2': ['二代仿真', '自主参与，恰到好处。', '管理 AI 的工具、唤醒与发言节奏。展开需要调整的分组，修改后保存参数。'],
+  affinity: ['好感度', '关系有温度，也看得见。', '按人记录亲密度：谁跟她最熟、现在在哪个档位。拖滑条即可手工调整。'],
   'social-v1': ['一代仿真', '为自然对话，设定合适的节奏。', '调整参与概率、活跃周期和分条发送；所有配置项完整保留。'],
-  slang: ['黑话词库', '读懂群聊里的，言外之意。', '从候选到确认，让 AI 逐渐熟悉大家的表达习惯。'],
   usage: ['令牌与花费', '每一次思考，都算得清楚。', '实时查看 AI 的 token 消耗与花费，可下钻到每个群、每个好友、每一轮对话。'],
   access: ['访问与安全', '明确边界，安心连接。', '管理允许对话的对象、管理员权限与控制台访问凭证。'],
   operations: ['调试与运维', '让桥接，始终井然有序。', '测试消息、引导 AI，或维护桥接进程与会话工作区。'],
@@ -4459,8 +4483,18 @@ function setConsolePage(page, { updateHash = true, focus = false, target = '' } 
   document.title = consolePages[page][0] + ' · QQ 桥接控制台';
   if (updateHash && location.hash !== '#' + page) history.pushState({}, '', '#' + page);
   closeConsoleSearch();
-  // 语音库按需加载：进入二代仿真页时才探测（避免每次开控制台都压网关）。
-  if (page === 'social-v2' && typeof loadVoiceLibrary === 'function') loadVoiceLibrary();
+  // 好感度页：进页时带上上次填的 key 自动拉一次；没填过就只先把白名单塞进下拉框。
+  if (page === 'affinity') {
+    affFillKeyOptions();
+    // 记住上次看的会话：切页回来不该再手打一遍 key。
+    try {
+      const saved = localStorage.getItem('qq-console-affinity-key');
+      const input = document.getElementById('affKey');
+      if (saved && input && !input.value.trim()) input.value = saved;
+    } catch {}
+    const k = document.getElementById('affKey')?.value?.trim();
+    if (k) loadAffinity();
+  }
   if (focus) {
     document.getElementById('mainContent').focus({ preventScroll: true });
     document.getElementById(target || 'mainContent')?.scrollIntoView({ block: 'start', behavior: 'instant' });
@@ -4533,11 +4567,11 @@ document.querySelectorAll('input,select,textarea').forEach(input => {
     }
     input.setAttribute('aria-label', label.textContent.trim() + (siblings.length > 1 ? (siblings.indexOf(input) === 0 ? '（下限）' : '（上限）') : ''));
   } else {
-    const names = { consoleTokenInput: '新的控制台访问令牌', closedPreset: '封闭 Agent 使用的 DSH 预设', tsKind: '测试消息目标类型', aiNotifyKind: '后台提醒目标类型', sStateKey: '一代仿真会话', v2SessionSelect: '二代仿真白名单会话', slangLimitCand: '候选词显示数量', slangLimitConfirmed: '已确认词显示数量', slangLimitRejected: '已拒绝词显示数量' };
+    const names = { consoleTokenInput: '新的控制台访问令牌', closedPreset: '封闭 Agent 使用的 DSH 预设', tsKind: '测试消息目标类型', aiNotifyKind: '后台提醒目标类型', sStateKey: '一代仿真会话', v2SessionSelect: '二代仿真白名单会话' };
     input.setAttribute('aria-label', names[input.id] || input.placeholder || input.closest('section')?.querySelector('h2')?.textContent || '设置');
   }
 });
-const primaryActions = ['roleSet','roleCreate','socialSave','v2ConfigSave','v2ConfigSaveTop','wlSave','secSave','consoleTokenSave','tsSend','aiNotifySend','slangAdd','slangConfigSave','slangModalDirectConfirm'];
+const primaryActions = ['roleSet','roleCreate','socialSave','v2ConfigSave','v2ConfigSaveTop','wlSave','secSave','consoleTokenSave','tsSend','aiNotifySend'];
 primaryActions.forEach(id => document.getElementById(id)?.classList.add('primary'));
 document.querySelectorAll('.meta[id$="Msg"], .meta[id$="Msg2"]').forEach(el => el.setAttribute('role','status'));
 document.getElementById('section-mode').querySelector('h2').dataset.note = '选择后即时生效';
@@ -4570,10 +4604,6 @@ searchInput.addEventListener('input', () => {
       setConsolePage(entry.page);
       let ancestor = entry.target.closest('details');
       while (ancestor) { ancestor.open = true; ancestor = ancestor.parentElement.closest('details'); }
-      if (entry.target.closest('.slang-panel')) {
-        const panels = { slangPanelCandidate: 'candidate', slangPanelConfirmed: 'confirmed', slangPanelRejected: 'rejected' };
-        setSlangTab(panels[entry.target.closest('.slang-panel').id]);
-      }
       entry.target.scrollIntoView({ block:'center', behavior:'instant' });
       if (!entry.target.hasAttribute('tabindex') && !entry.target.matches('input,textarea,select,button,summary')) entry.target.tabIndex = -1;
       entry.target.focus({ preventScroll:true });
@@ -4592,24 +4622,6 @@ searchInput.addEventListener('keydown', event => {
 document.addEventListener('click', event => { if (!event.target.closest('.search-wrap')) closeConsoleSearch(); });
 searchResults.addEventListener('keydown', event => { if (event.key === 'Escape') { closeConsoleSearch(); searchInput.focus(); } });
 
-// Keyboard support for the existing editor dialog without replacing its save flow.
-let modalPreviousFocus;
-const slangOverlay = document.getElementById('slangModalOverlay');
-new MutationObserver(() => {
-  if (slangOverlay.classList.contains('open')) {
-    modalPreviousFocus = document.activeElement;
-    document.getElementById('slangModalMeaning').focus();
-  } else modalPreviousFocus?.focus();
-}).observe(slangOverlay, { attributes:true, attributeFilter:['class'] });
-slangOverlay.addEventListener('keydown', event => {
-  if (event.key === 'Escape') { event.preventDefault(); closeSlangModal(); }
-  if (event.key === 'Tab') {
-    const controls = [...slangOverlay.querySelectorAll('button,input,textarea,select')].filter(el => !el.disabled && el.getClientRects().length);
-    const first = controls[0], last = controls.at(-1);
-    if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
-    else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
-  }
-});
 const tokenToggle = document.createElement('button');
 tokenToggle.id = 'consoleTokenToggle'; tokenToggle.className = 'small'; tokenToggle.textContent = '显示令牌'; tokenToggle.type = 'button'; tokenToggle.setAttribute('aria-pressed','false');
 tokenToggle.addEventListener('click', () => {
@@ -5046,8 +5058,8 @@ document.getElementById('usageClear').addEventListener('click', async () => {
 
 setConsolePage(location.hash.slice(1), { updateHash:false });
 
-refresh(); refreshRoles(); refreshWhitelist(); refreshSessions(); refreshPending(); refreshPresets(); loadSocialForm(); loadV2Config(); refreshV2Activity(); loadV2ToolLog(); loadV2SessionOptions(); refreshSocialStatus(); refreshSlang(); loadSlangConfig(); loadSecurity(); refreshSimPrompt(); refreshDshModel(); refreshUsage(); refreshUsageChart(); refreshUsageRecent();
-setInterval(() => { refresh(); refreshSessions(); refreshPending(); refreshSocialStatus(); refreshSlang(); }, 3000);
+refresh(); refreshRoles(); refreshWhitelist(); refreshSessions(); refreshPending(); refreshPresets(); loadSocialForm(); loadV2Config(); refreshV2Activity(); loadV2ToolLog(); loadV2SessionOptions(); refreshSocialStatus(); loadSecurity(); refreshSimPrompt(); refreshDshModel(); refreshUsage(); refreshUsageChart(); refreshUsageRecent();
+setInterval(() => { refresh(); refreshSessions(); refreshPending(); refreshSocialStatus(); }, 3000);
 // 用量看板只在本页可见时轮询：既保证「实时」，又不让其它页白白多打两份接口。
 setInterval(() => { if (currentConsolePage !== 'usage') return; refreshUsage(); refreshUsageChart(); refreshUsageRecent(); }, 3000);
 // 主题切换（纯前端，不发任何请求；选择写入 localStorage，未选择时跟随系统）

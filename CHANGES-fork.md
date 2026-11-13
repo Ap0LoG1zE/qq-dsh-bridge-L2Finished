@@ -61,7 +61,7 @@
 
 ## 二、控制台面板增强
 
-**文件**：`dsh-plugins/dsh-thinking-zh/`
+**文件**：`dsh-plugins/qq-dsh-panel/`
 
 ### 新增「长期记忆」页签
 
@@ -113,8 +113,8 @@ DSH 桌面端每次都监听**三个连续端口**，只有**最低**那个是 W
 ## 四、改动文件清单
 
 ```
-dsh-plugins/dsh-thinking-zh/lib/client.js                        +485
-dsh-plugins/dsh-thinking-zh/lib/features/qq-bigfish.js            +84
+dsh-plugins/qq-dsh-panel/lib/client.js                        +485
+dsh-plugins/qq-dsh-panel/lib/features/qq-bigfish.js            +84
 qq-bridge/src/bridge.js                                          +287
 qq-bridge/src/mcp-snowluma-safe.js                                +61
 tools/qq-bot.ps1                                                  +13

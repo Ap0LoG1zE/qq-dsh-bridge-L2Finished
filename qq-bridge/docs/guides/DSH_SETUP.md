@@ -1,6 +1,10 @@
 # DSH 端安装说明（本机或另一台设备）
 
-`qq-bridge` 仓库本身包含桥接、控制台和插件，但 **DSH 端的四个 agent preset（`qq-chat` / `qq-chat-v2` / `qq-chat-owner` / `qq-chat-readonly`）以及 MCP 挂载** 不在仓库根目录，需要通过本说明安装到目标设备的 DSH 环境中。
+`qq-bridge` 仓库本身包含桥接、控制台和插件，但 **DSH 端的 agent preset 以及 MCP 挂载** 不在仓库根目录，需要通过本说明安装到目标设备的 DSH 环境中。
+
+> **⚠️ 2026-11-07 起 preset 只有一个。** 原本的四个（`qq-chat` / `qq-chat-v2` / `qq-chat-readonly` / `qq-chat-owner`）已经**合并成唯一的 `qq-chat-agent`**，权限档位统一按 readonly（能看文件，不能写、不能执行）。三档分级（owner / 白名单 / 仅聊天）在桥接代码里仍然存在，但三档现在**都指向这同一个 preset**，所以实际上不再有权限差异。
+>
+> 本文档下面若还出现 `qq-chat-v2` 等旧名字，都是在讲**历史机制**（比如 DSH 0.1.5 → 0.1.7 的 preset 加载方式变化），不代表现在需要装四个。
 
 ## 安装步骤
 
@@ -53,7 +57,7 @@
 
    脚本会完成：
 
-   - 安装 agent preset：通过 `plugins/qq-agent-presets` 这个 DSH bundle 把四个 `@deepseek-ai/dsh-agent-preset` 行（`qq-chat` / `qq-chat-v2` / `qq-chat-owner` / `qq-chat-readonly`）插入 profile（DSH 0.1.7 起 preset **不再是** `~/.dsh/.agent-presets/<名>/` 目录，该目录完全不被读取）。patch 由 `scripts/build-agent-preset-patches.mjs` 从 `dsh/agent-presets/` 的权威源生成
+   - 安装 agent preset：通过 `plugins/qq-agent-presets` 这个 DSH bundle 把**唯一一个** `@deepseek-ai/dsh-agent-preset` 行（`qq-chat-agent`）插入 profile（DSH 0.1.7 起 preset **不再是** `~/.dsh/.agent-presets/<名>/` 目录，该目录完全不被读取）。patch 由 `scripts/build-agent-preset-patches.mjs` 从 `dsh/agent-presets/qq-chat-agent/` 的权威源生成
    - 在 `~/.dsh/profiles/web/cordis.patch.yml` 挂载：
      - `mcp-snowluma`（`src/mcp-snowluma-safe.js`，带 `toolCallTimeoutMs: 725000`）
      - `mcp-snowluma-host`（`src/mcp-host-server.js`）
@@ -89,17 +93,35 @@
 1. **切换桥接模式**：打开桥接控制台（默认 `http://127.0.0.1:3100`），顶部的「聊天模式 / 封闭 Agent / 一代仿真模式 / 二代仿真模式」按钮即为当前生效的切换入口。控制台会同时写入 DSH 设置与本地 `state/mode.json`。
    > ℹ️ DSH 设置页 `Plugins → Plugin configuration` 里**不会**出现 `qq-mode` 卡片：该槽位要求插件自带浏览器半（`package.json` 的 `dsh.client` + `lib/client.js`），而 `plugins/qq-mode-console` 只实现了 host 半。`qq-mode` 命名空间本身**可用**（`settings/describe` 能列出、`settings/update` 能写成功），缺的只是那张 GUI 表单 —— 所以模式改走控制台。参见下方「常见问题」。
    > DSH 0.2.0 起命名空间**不再需要任何注册调用**：它由 profile 里 `id: qq-mode` 那条 loader entry + 插件导出的 `Config`（带 `volatile` 字段）推导出来。0.1.x 的 `ctx.settings.register()` 已被 DSH 删除。
-2. **新建会话时**：agent preset 列表中应能看到四个（三档权限分级，2026-10-26 起）：
-   - `QQ 聊天角色`（`qq-chat`）—— 一代仿真
-   - `QQ 聊天角色（二代仿真）`（`qq-chat-v2`）—— 二代仿真 / **仅聊天档**
-   - `QQ 聊天角色（只读）`（`qq-chat-readonly`）—— **白名单档**：能看文件，不能改、不能执行
-   - `QQ 聊天角色（管理员 / 全工具）`（`qq-chat-owner`）—— **Owner 档**：仅 `private:<ownerQQ>`
+2. **新建会话时**：agent preset 列表中只有**一个** QQ preset（2026-11-07 合并后）：
+   - `QQ 聊天角色（角色A · 只读）`（`qq-chat-agent`）—— 四个旧预设合并而成，权限按 readonly：**能看文件，不能改、不能执行**
 
-   > 桥接按会话自动选档（`src/bridge.js` 的 `sessionTier()`），你不需要手工挂；
+   > 旧的四档（`qq-chat` 一代 / `qq-chat-v2` 二代仅聊天 / `qq-chat-readonly` 白名单只读 /
+   > `qq-chat-owner` 管理员全工具）已全部取消，合并进上面这一个。**合并后不再有全工具档**，
+   > 即使是 `private:<ownerQQ>` 也拿不到写文件/执行命令的能力 —— 这是刻意的。
+   >
+   > 桥接按会话自动选档（`src/bridge.js` 的 `sessionTier()`），但三档现在**都指向同一个
+   > preset**，所以档位判定只剩「记不记这个会话」的意义，不再改变工具面。
    > 想核对"某个号/某个群现在算哪一档"用 `GET /api/permission-tiers`（见 RULES.md）。
-   > 四个都没装时桥接**拒绝建会话**（fail-closed），QQ 上表现为"发了消息没人回"。
-3. **工具列表**：QQ 会话中应能看到 `mcp__snowluma__*`、`mcp__snowluma-host__*`、`mcp__web-search-safe__*` 等工具；不应看到 `dev_*` 等开发工具。本地工具（`read` / `write` / `pwsh` 等）只在 Owner 档出现，只读档只有 `read`/`read_image`/`glob`/`grep`。
+   > preset 没装时桥接**拒绝建会话**（fail-closed），QQ 上表现为"发了消息没人回"。
+3. **工具列表**：QQ 会话中应能看到 `mcp__snowluma__*`、`mcp__snowluma-host__*`、`mcp__web-search-safe__*` 等工具；不应看到 `dev_*` 等开发工具。合并后**只有只读档**，所以只能看到 `read` / `read_image` / `glob` / `grep`，没有 `write` / `edit` / `pwsh`。
    实测工具面的探针：`node scripts/probe-permission-tiers.mjs`（需 DSH 在跑）。
+
+## 两个「qq-」插件分别管什么（别再混淆）
+
+`plugins/` 下有两个容易看混的包，名字都带 `qq-`、都由 `setup-dsh.mjs` 一起挂进 profile，但**职责完全不重叠，装在一起不冲突**：
+
+| 插件 | 管什么 | 声明了什么 |
+|---|---|---|
+| `qq-mode-console` | **模式开关**：给 DSH 设置页暴露 `qq-mode` 命名空间，只有 `mode` 和 `ownerQQ` 两个字段 | 一条 loader entry（`id: qq-mode`）+ 导出的 `Config` |
+| `qq-agent-presets` | **agent preset**：把 `qq-chat-agent` 作为 `@deepseek-ai/dsh-agent-preset` 行插进 profile，并带上 `qq-tool-restrict` 安全守卫 | 一条 bundle patch（`presets/qq-chat-agent.patch.yml`） |
+
+**关键澄清**：`qq-mode-console` **不含任何 preset**。它的 schema 里那几个值是**模式名**（`chat` / `closed-agent` / `reserved` / `reserved2` / `simulation`），不是预设名 —— 看到 `reserved2` 不要理解成"第二个 preset"，它是二代仿真模式。
+
+历史上有过「四个 agent preset」（`qq-chat` / `qq-chat-v2` / `qq-chat-readonly` / `qq-chat-owner`），那四个是 **`qq-agent-presets`** 产出的，且已于 2026-11-07 合并成唯一一个 `qq-chat-agent`。所以：
+
+- 如果你在旧文档/旧截图里看到「四个预设」，那是过期信息；
+- 如果你以为 `qq-mode-console` 里也有四个预设、和 `qq-agent-presets` 打架 —— 并没有，它连一个 preset 都不管。
 
 ## 常见问题
 

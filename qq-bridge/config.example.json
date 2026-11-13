@@ -23,7 +23,7 @@
   },
   "ownerQQ": null,
   "sessionCwd": "",
-  "agentPreset": "qq-chat",
+  "agentPreset": "qq-chat-agent",
   "workspaceTitle": "QQ 聊天",
   "allow": {
     "private": [],
@@ -53,20 +53,6 @@
   },
   "security": {
     "interceptNotify": true
-  },
-  "slang": {
-    "enabled": true,
-    "extractMinMessages": 10,
-    "extractCooldownMs": 300000,
-    "inferenceThresholds": [
-      2,
-      4,
-      8
-    ],
-    "injectMax": 8,
-    "learnerPreset": "qq-chat",
-    "workspaceTitle": "QQ 黑话学习",
-    "autoResearch": true
   },
   "social": {
     "enabled": true,
@@ -108,7 +94,7 @@
   "socialV2": {
     "enabled": true,
     "autoReplyCheckMs": 30000,
-    "agentPreset": "qq-chat-v2",
+    "agentPreset": "qq-chat-agent",
     "provideRecommendations": true,
     "tools": {
       "getPrompt": true,
@@ -128,8 +114,6 @@
       "setWakeConfig": true,
       "markRead": true,
       "memory": true,
-      "slangQuery": true,
-      "slangSubmit": true,
       "getImages": true,
       "getForwardMsg": true,
       "sendPoke": true,
@@ -201,6 +185,7 @@
       "longGapMaxMs": 10000,
       "maxSendPerMinute": 8,
       "maxSendPerHour": 60,
+      "minSendIntervalMs": 5000,
       "maxMessageChars": 500,
       "maxGapMs": 10000,
       "gapBaseMs": 800,
@@ -327,6 +312,17 @@
       "gifFrames": 6,
       "gifTile": 240,
       "normalizeTimeoutMs": 25000
+    },
+    "cards": {
+      "enabled": true,
+      "bili": true,
+      "timeoutMs": 2500,
+      "cacheTtlMs": 1800000,
+      "titleMaxChars": 40,
+      "upMaxChars": 14,
+      "includeStats": true,
+      "includeDesc": false,
+      "descMaxChars": 60
     }
   },
   "webSearch": {

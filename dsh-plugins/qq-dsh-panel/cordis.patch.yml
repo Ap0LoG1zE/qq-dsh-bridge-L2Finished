@@ -1,0 +1,5 @@
+# qq-dsh-panel bundle patch
+# 把插件插入桌面端 profile 的插件清单。
+- insert:
+    - id: qq-dsh-panel
+      name: qq-dsh-panel

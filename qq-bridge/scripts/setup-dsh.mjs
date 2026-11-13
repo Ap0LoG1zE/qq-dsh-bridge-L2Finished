@@ -2,7 +2,8 @@
 // setup-dsh.mjs — 在目标设备上安装 qq-bridge 的 DSH 端配置
 //
 // 功能：
-//   1. 安装两套 agent preset：qq-chat、qq-chat-v2
+//   1. 安装 agent preset：qq-chat-agent（2026-11-07 由 qq-chat / qq-chat-v2 /
+//      qq-chat-readonly / qq-chat-owner 四个合并而来，权限按 readonly）
 //      （DSH 0.1.7 机制：作为 qq-agent-presets bundle 的 patch 层插入
 //        @deepseek-ai/dsh-agent-preset 行；~/.dsh/.agent-presets/ 目录已不再被读取）
 //   2. 在 DSH profile 的 cordis.patch.yml 中挂载三个 MCP server：

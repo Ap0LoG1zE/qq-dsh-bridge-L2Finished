@@ -236,7 +236,7 @@ test('legacy read tools are not registered at all outside closed-agent', async (
     assert.equal(callTool.has('qq_get_group_history'), false, `${mode} 下不该注册 qq_get_group_history`);
     // 带令牌的 v2 读工具在任何模式下都该在
     assert.equal(callTool.has('qq_get_group_members'), true, `${mode} 下 v2 群成员工具必须可用`);
-    assert.equal(callTool.has('qq_get_active_members'), true);
+    assert.equal(callTool.has('qq_get_userid'), true, `${mode} 下查人工具必须可用`);
   }
   const closed = loadSnowlumaTools(async () => Response.json({ mode: 'closed-agent' }), null, null, 'closed-agent');
   assert.equal(closed.has('qq_list_groups'), true, 'closed-agent 下旧只读工具必须存在');

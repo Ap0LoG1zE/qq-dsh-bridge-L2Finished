@@ -17,6 +17,9 @@ const tests = [
   'test-md-to-plain.mjs', 'test-slang-learn.mjs', 'test-mux-reconnect.mjs',
   'test-token-economy.mjs', 'test-qq-model-view.mjs', 'test-qq-preset-contract.mjs',
   'test-reply-wait.mjs', 'test-preset-prompt.mjs', 'test-role-card.mjs',
+  // 预设完整性：按"累积改动清单"核对，防止改一处把别处弄没（2026-11-12 加）。
+  // 起因：拿旧备份回滚时，把操作者在控制台改的记忆段落整段盖掉了。
+  'test-preset-completeness.mjs',
   // 体检修复回归：无令牌智能体调用面、send-burst 失败回滚、唤醒限频重试、
   // 定时器类暂存唤醒补发、collector 生命周期、ownerQQ 覆盖语义、预设名校验、
   // wake triggers 白名单、memory-update 边界、wait 租约归一化、md/黑话/表情/账本；
@@ -26,11 +29,25 @@ const tests = [
   // （DSH 同一路 DeepSeek 搜索、Bing RSS 兜底、凭据优先级与端点安全；
   //  本轮新增：空结果 note 必须在写缓存之前生成，否则缓存命中丢掉提示）。
   'test-media-search.mjs',
+  // B站分享卡片内联展开（2026-11-12）：卡片 JSON 抽取、链接归类、外网文本清洗、
+  // 降级链（开关关/非B站/接口失败都要回到「[卡片消息]」）。纯函数段不依赖网络；
+  // 真实网络那一条失败只告警，不会把必跑回归打红。
+  'test-card-parse.mjs',
   // GitHub issue 回归：#22 模式 user 层优先 / #11/#19 回合判忙租约 / #29 机器人身份注入。
   'test-issue-regressions.mjs',
   // 二代「会话初始提示词」：只在首次唤醒注入、管理面隔离、损坏文件只读降级、
   // 以及控制台「立即唤醒」不得顶掉首次 bootstrap（否则初始提示词永远发不出去）。
   'test-v2-initial-prompt.mjs',
+  // 冷启动引导（2026-11-13 重建）：新会话 / 刚压缩过 → 那两句提示。
+  // 只认**投递出口**（DSH 真收到了什么）。覆盖旧实现的两个真实故障：
+  // 压缩后那句从没发出去（被第一遍渲染清掉标记）、新会话那句在同一会话里发两遍
+  // （降级只作用于被丢弃的那一份）。断言直接用 h.calls.prompts，禁止再对着
+  // buildWakePromptV2 单次渲染写断言 —— 那正是旧测试全绿而线上出错的根因。
+  'test-cold-start.mjs',
+  // 冷启动标记的归属：共用会话下一份、没开共用时各一份（替换旧的 test-bootstrap-sharing /
+  // test-double-bootstrap —— 那两个断言的是 bootstrapSent 的组级置位，
+  // 而 bootstrapSent 现在只管【初始提示词】，不再决定那两句提示）。
+  'test-cold-start-sharing.mjs',
   // 令牌账本 / 价目表 与 体检修复回归（纯函数，无外部依赖）
   'test-token-usage.mjs', 'test-hardening.mjs',
   // 语音发送（纯函数 + 端点存在性；真发语音只在 --live 或 CLI 里做）

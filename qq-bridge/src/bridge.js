@@ -10,7 +10,7 @@ import os from 'node:os';
 import http from 'node:http';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import yaml from 'js-yaml';
 import { extractPresetPrefix, presetPromptBlockers, presetPromptWarnings, presetTierKey, renderPresetPromptYaml } from './preset-prompt.js';
 import { checkSendFilePath, normalizeSendFileConfig } from './send-file-lib.js';
@@ -23,37 +23,34 @@ import { SENSITIVE_RE, auditOutbound } from './sensitive.js';
 import { looksLikeUnfinished } from './v2-wait.js';
 import { compactModelMessage, describeAge } from './qq-model-view.js';
 import { safeFetchBuffer, looksLikeImageBuffer } from './safe-fetch.js';
+  // B站分享卡片内联展开。只导入需要的这两个。
+import { setCardConfig, summarizeCard } from './card-parse.js';
 import { normalizeImageForModel } from './media-normalize.js';
-import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, inspectAudio, listAudioFiles, parseTargetKey, processAudioVolume, resolveAudioProcessing, resolveAudioSource, safeJoinLibrary } from './send-voice-lib.js';
 import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken } from './snowluma-conn.js';
 import { hardenDir, manualDirCommand } from './state-acl.mjs';
-import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardResponse } from './forward.js';
+import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardResponse, renderForwardText } from './forward.js';
 import { resolvePriceTable } from './model-prices.js';
 import { createTokenLedger } from './token-ledger.js';
 import { createStore as createMemoryStore } from './memory-store.js';
 import { selectForInjection as selectFactsForInjection, addFact, loadFacts, weightOf, archiveFact, TAG_WEIGHTS, factsFileOf } from './memory-facts.js';
+import { INITIAL_SCORE as AFFINITY_INITIAL, STAGES as AFFINITY_STAGES, SCORE_MIN as AFFINITY_SCORE_MIN, SCORE_MAX as AFFINITY_SCORE_MAX, stageOf as affinityStageOf, bumpAffinity, decayAffinity, scoreForMessage, describeAffinity } from './affinity.js';
 import { createRecall } from './memory-search.js';
 import { createArtifactStore } from './artifact-store.js';
 import {
-  loadSlang,
-  saveSlang,
-  upsertSlangEntry,
-  buildSlangContext,
-  buildExtractionPrompt,
-  buildResearchPrompt,
-  parseExtractionJson,
-  parseResearchJson,
-  createSlangEntry,
-  mergeEvidence,
-  SLANG_STATUS,
-  SLANG_MAX_ENTRIES
-} from './slang-learner.js';
+  synthesize as synthesizeTts,
+  ensureTtsServer,
+  ttsReady as ttsServerReady,
+  normalizeTtsConfig,
+  TTS_DEFAULTS,
+} from './tts.js';
 import {
   loadStickerStore,
   saveStickerStore,
   mergeStickerLibrary,
   findSticker,
+  resolveSticker,
   formatStickerList,
+  renderStickerListText,
   buildStickerContext,
   buildStickerStrategyHint,
   applyStickerNote,
@@ -63,6 +60,8 @@ import {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
 const STATE_DIR = path.join(ROOT, 'state');
+// 纯语音的合成产物：按"文本+音色"哈希缓存，同一句话不重复合成。
+const TTS_CACHE_DIR = path.join(STATE_DIR, 'tts');
 // 原文库检索器：懒加载（首次检索才建索引），events 目录 mtime 变了自动重建。
 // 与 memoryStoreHandle 一样放在模块级，避免每个请求都新建一份索引。
 let recallHandle = null;
@@ -78,8 +77,6 @@ function getArtifacts() {
 }
 const STATE_FILE = path.join(STATE_DIR, 'sessions.json');
 const ROLE_STATE_FILE = path.join(STATE_DIR, 'current-role.json');
-const SLANG_FILE = path.join(STATE_DIR, 'slang.json');
-const SLANG_SESSION_FILE = path.join(STATE_DIR, 'slang-session.json');
 const SOCIAL_V2_FILE = path.join(STATE_DIR, 'social-v2.json');
 // 操作者为每个会话预写的「初始提示词」（见 main() 里的 initialPrompts）。
 // 单独一个文件：它属于操作者配置，不能随 social-v2.json 的会话状态一起被重置清掉。
@@ -433,15 +430,16 @@ function writeRoleContent(name, content) {
 // 四个仿真预设各自有独立的预设提示词，控制台可分别查看与修改：
 //   一代 qq-chat（空格分条 / [SILENT]）· 二代 qq-chat-v2（一切皆工具，仅聊天档）
 //   qq-chat-owner（管理员私聊，全工具档）· qq-chat-readonly（白名单，只读档）
-// 三档分级的「硬性不变量」不同（owner/readonly 不该被要求写「你没有本地工具」），
-// 由 preset-prompt.js 的 presetTierKey() 决定，改这里的名字清单不影响那套映射。
-const PRESET_NAMES = { v1: 'qq-chat', v2: 'qq-chat-v2', owner: 'qq-chat-owner', readonly: 'qq-chat-readonly' };
+//
+// ⚠️ 2026-11-07 合并：上面四个已经合并成唯一一个 `qq-chat-agent`（权限按 readonly）。
+//    为了不打断控制台与既有调用方，PRESET_NAMES 的四个键仍然存在，但**值全部是同一个
+//    preset 名**——于是想按档位取名字的代码不用改，取到的自然都是合并后的那个。
+//    三档分级本身已取消：owner 不再拥有全工具档（这是刻意的，合并要求权限按 readonly）。
+const MERGED_PRESET = 'qq-chat-agent';
+const PRESET_NAMES = { v1: MERGED_PRESET, v2: MERGED_PRESET, owner: MERGED_PRESET, readonly: MERGED_PRESET };
 /** 控制台展示用的档位名（键与 PRESET_NAMES 一致）。 */
 const PRESET_LABELS = Object.freeze({
-  [PRESET_NAMES.v1]: '一代仿真（reserved）',
-  [PRESET_NAMES.v2]: '二代仿真（reserved2）· 仅聊天档',
-  [PRESET_NAMES.owner]: '管理员私聊 · 全工具档',
-  [PRESET_NAMES.readonly]: '白名单会话 · 只读档',
+  [MERGED_PRESET]: 'QQ 聊天（角色A · 只读档，已合并）',
 });
 const PRESET_BACKUP_DIR = path.join(STATE_DIR, 'preset-backups');
 const PRESET_BACKUP_KEEP = 10;
@@ -522,17 +520,45 @@ function listPresetBackups(name) {
   }
 }
 
+/**
+ * DSH 当前可用的 preset id 列表（来自 `agentPresets/list`）。
+ *
+ * ⚠️ 必须是**模块级**变量。历史 bug：`presetStatus()` / `isPresetInstalledInDsh()`
+ * 是模块级函数，却去读 `main()` 内部声明的 `dshPresetIds` —— 那是另一个作用域，
+ * 运行时直接 `ReferenceError: dshPresetIds is not defined`，
+ * 表现为控制台「仿真提示词」整个区域 500，而不是给出一条能看懂的报错。
+ * 模块级声明后，刷新函数（在 main 内）写它、模块级函数读它，两边都成立。
+ */
+let dshPresetIds = [];
+
+/**
+ * 这个 preset 在 DSH 里**真正生效**了没。
+ *
+ * ⚠️ 别用 `.agent-presets/` 目录判断（那是 DSH 0.1.5 的旧机制，0.1.7 起 DSH
+ * 完全不读它）。现在 preset 是 profile 里的一条 `@deepseek-ai/dsh-agent-preset`
+ * 行，由 qq-agent-presets 这个 bundle 的 patch 插入。所以唯一可靠的判据是
+ * **问 DSH 自己**：从 `agentPresets/list` 的结果里找这个 id。
+ *
+ * 拿不到清单（DSH 还没连上）时返回 null，表示"不知道"，不要谎报 false/true。
+ */
+function isPresetInstalledInDsh(name) {
+  if (!Array.isArray(dshPresetIds) || dshPresetIds.length === 0) return null;
+  return dshPresetIds.includes(name);
+}
+
 function presetStatus(name) {
   // 只回传控制台需要的信息：不回传 DSH_HOME / 安装副本的绝对路径，减少无谓的信息暴露
   // （路径已经写在服务端日志里，排查时看日志即可）。
+  const installedInDsh = isPresetInstalledInDsh(name);
   return {
     preset: name,
-    label: PRESET_LABELS[name] ?? '二代仿真（reserved2）',
+    label: PRESET_LABELS[name] ?? 'QQ 聊天（角色A · 只读档，已合并）',
     sourceFile: path.relative(ROOT, presetSourceYaml(name)),
-    // ⚠️ 只反映 DSH 0.1.5 的旧目录（~/.dsh/.agent-presets/<名>/）；0.1.7 起 DSH 完全不读它，
-    // 所以 false 不代表"没装"——真正生效的是 profile 里由 bundle patch 插入的那一行，
-    // 可用 `/api/permission-tiers` 的 dshPresets 字段或 /api/presets 核对。
+    // 旧字段保留（控制台可能还在读），但要理解它只代表 0.1.5 的旧目录，
+    // **不代表 preset 有没有装进 DSH**。真正该看的 `installedInDsh` 在下面。
     installed: fs.existsSync(installedPresetYaml(name)),
+    // 真实状态：true=DSH 清单里有它；false=清单里没有；null=DSH 没连上，无法判断。
+    installedInDsh,
     requiresRestart: true,
   };
 }
@@ -696,11 +722,160 @@ function normalizeIdList(value) {
   return value.map((v) => String(v).trim()).filter((v) => /^\d+$/.test(v));
 }
 
+// ── DSH 端点自动跟随 ────────────────────────────────────────────────────────
+//
+// 桌面版 DSH 的 HTTP 端口**每次启动都由 Electron 重新分配**。config.json 里
+// `dsh.baseUrl` 记的是上一次那个数值，所以 DSH 一重启它就过期，桥接的所有 RPC
+// 全部打到一个没人监听的端口 → `dshReady` 恒为 false → 面板「读不到数据」。
+//
+// 这就是「同一个毛病反复出现、每次都得进 DSH 手动改一下」的机制：手改只是把
+// **这一次**的值补对，下一次 DSH 重启照样漂。启动时自动探测一次并写回，
+// 才能从根上去掉这个手工步骤。
+//
+// 探测思路（只认本机回环、只认真的像 DSH 的端口）：
+//   1. 先试配置里的 baseUrl —— 它还有效就不要多余动作（最常见的顺利路径）；
+//   2. 再试上次跟随成功记下的端口池；
+//   3. 最后用 `netstat -ano` 让系统告诉我们哪些端口在监听，只对这些端口做指纹确认。
+//      **不要逐端口扫**：实测 2000~20000 全扫要 4~7 秒，而 netstat 一次只要 25 毫秒。
+// 写回失败不影响启动（只记日志）——探测到的新值仍然留在内存里本次生效。
+
+/**
+ * 列出本机回环地址上正在监听的端口。
+ *
+ * 用 `netstat -ano`：Windows 自带、无需权限，实测 25 毫秒返回。
+ * 解析失败就返回空数组（调用方会退化到"只用配置值"，绝不阻塞启动）。
+ */
+function listListeningLoopbackPorts() {
+  if (process.platform !== 'win32') return [];
+  try {
+    const res = spawnSync('netstat', ['-ano'], { encoding: 'utf8', timeout: 5000, windowsHide: true });
+    if (res.error || res.status !== 0) return [];
+    const ports = new Set();
+    for (const line of String(res.stdout ?? '').split(/\r?\n/)) {
+      // 形如：TCP    127.0.0.1:12126        0.0.0.0:0              LISTENING       5516
+      const m = line.match(/^\s*TCP\s+127\.0\.0\.1:(\d+)\s+\S+\s+LISTENING/i);
+      if (m) ports.add(Number(m[1]));
+    }
+    // 端口小的先试（DSH 落在低位段的可能性更高），结果稳定可复现。
+    return [...ports].sort((a, b) => a - b);
+  } catch {
+    return [];
+  }
+}
+
+/** 某个回环端口上是不是一个活着的 DSH。
+ *
+ * ⚠️ 只判「HTTP 200/401」是**不够的**：实测本机 4310 端口上的另一个服务
+ * （看着像个二进制协议服务）对 `/` 直接回 200、对 `/api/status` 也回 200，
+ * 于是按状态码扫会把它误认成 DSH —— 自动跟随就会把 baseUrl 指到一个根本没有
+ * DSH API 的端口上，症状比原来更糟（面板照样读不到，且更难查）。
+ *
+ * 所以必须认**DSH 自己的指纹**。实测可靠的两条：
+ *   · 未鉴权时 `GET /` 回 401，正文是纯文本
+ *     `dsh web authentication required; reopen the URL printed by dsh web.`
+ *   · `/api/*` 回 401 且正文是 `unauthorized`
+ * 二者任一命中才算 DSH。正文只取前 512 字节，避免被大页面拖慢。
+ */
+async function probeDshPort(port, timeoutMs = 1200) {
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) return false;
+  const looksLikeDsh = async (path) => {
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}${path}`, {
+        method: 'GET',
+        redirect: 'manual',
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      // 只有 401 这个分支带识别正文；200 一律不认（4310 就是 200）。
+      const status = res.status;
+      let head = '';
+      if (status === 401) head = (await res.text()).slice(0, 512);
+      else await res.body?.cancel();
+      if (status !== 401) return false;
+      return /dsh web authentication required/i.test(head) || /^unauthorized\s*$/i.test(head.trim());
+    } catch {
+      return false;
+    }
+  };
+  if (await looksLikeDsh('/')) return true;
+  return looksLikeDsh('/api/status');
+}
+
+/**
+ * 让 `cfg.dsh.baseUrl` 跟上 DSH 当前实际监听的端口。
+ * @returns {Promise<{changed: boolean, baseUrl: string, from?: string}>}
+ */
+async function followDshEndpoint(cfg) {
+  const configured = String(cfg?.dsh?.baseUrl || '').trim();
+  const parsePort = (url) => {
+    try { return Number(new URL(url).port) || 0; } catch { return 0; }
+  };
+
+  // 1) 配置里的地址还能用就什么都不做（不制造无谓的文件改写）。
+  const configuredPort = parsePort(configured);
+  if (configuredPort && await probeDshPort(configuredPort)) return { changed: false, baseUrl: configured };
+
+  // 跳过 SnowLuma(3000/3001) 与本桥接控制台端口。
+  const skip = new Set([3000, 3001, Number(cfg?.consolePort) || 3100]);
+
+  /** 候选端口的基本过滤：不重复探配置值、不探已知的非 DSH 服务。 */
+  const inRange = (p) => Number.isInteger(p) && p > 0 && p <= 65535
+    && p !== configuredPort && !skip.has(p);
+
+  // 2) 让操作系统告诉我们哪些端口在监听 —— 再只对这些端口做 DSH 指纹确认。
+  //    ⚠️ 不要逐端口 TCP/HTTP 扫描：实测 2000~20000 全扫要 4~7 秒，
+  //    而 `netstat -ano` 一次只要 **25 毫秒**（实测），拿到的还是精确的监听集合。
+  //    本机同时在监听的端口通常只有十几个，逐个确认指纹瞬间完成。
+  //
+  // ⚠️ 这里**刻意不做**「记住上次的端口再优先试」。
+  //    桌面版 DSH 每次启动都重新分配端口（实测一天里见过 5306→9149→7167→4801…），
+  //    上一次成功记录的端口下一次必然失效；先试它只会白等一个超时才回退，
+  //    反而比直接查监听列表更慢。netstat 这条路已经是毫秒级，没有优化的必要。
+  const listening = listListeningLoopbackPorts().filter(inRange);
+  for (const port of listening) {
+    if (await probeDshPort(port)) return finish(port);
+  }
+
+  return { changed: false, baseUrl: configured, from: configured };
+
+  /** 采纳找到的端口：更新内存配置 + 写回 config.json + 记住它。 */
+  function finish(port) {
+    const nextUrl = `http://127.0.0.1:${port}`;
+    if (nextUrl === configured) return { changed: false, baseUrl: configured };
+    log(`[dsh] 配置里的 DSH 地址 ${configured || '(空)'} 已失效，自动跟随到 ${nextUrl}`);
+    cfg.dsh.baseUrl = nextUrl;
+
+    // 写回 config.json（只替换 baseUrl 那一行的值，其余字节原样保留）。
+    const configPath = String(process.env.QQ_BRIDGE_CONFIG || '').trim()
+      ? path.resolve(String(process.env.QQ_BRIDGE_CONFIG).trim())
+      : path.join(ROOT, 'config.json');
+    try {
+      const raw = fs.readFileSync(configPath, 'utf8');
+      const patched = raw.replace(/("baseUrl"\s*:\s*")[^"]*(")/, `$1${nextUrl}$2`);
+      if (patched !== raw) {
+        fs.writeFileSync(configPath, patched, 'utf8');
+        log(`[dsh] 已把新地址写回 ${path.basename(configPath)}`);
+      }
+    } catch (error) {
+      // 写不进去也要继续跑：内存里的 cfg 已是新值，本次进程能用。
+      log(`[dsh] ⚠️ 自动跟随已生效，但写回配置失败（下次启动可能仍要重新探测）：${error?.message ?? error}`);
+    }
+    // 不再记 dsh-port.json：桌面版 DSH 每次启动都换端口，上一次记下的值下一次必然失效，
+    // 留着只会让「优先试旧端口」那条路径白等一个超时。端口发现改成直接读监听列表。
+    return { changed: true, baseUrl: nextUrl, from: configured };
+  }
+}
+
 // ── 配置 ────────────────────────────────────────────────────────────────────
 function loadConfig() {
-  const p = path.join(ROOT, 'config.json');
+  // 配置路径：默认 ROOT/config.json。
+  // 支持 QQ_BRIDGE_CONFIG 环境变量覆盖 —— 实测遇到过 config.json 被句柄锁死
+  // （读/改/删/重命名全被拒，但同目录其他文件正常、ACL 也正常）的情况，
+  // 没有这个逃生口就只能重启整机。指向一份可用副本即可继续跑。
+  const override = String(process.env.QQ_BRIDGE_CONFIG || '').trim();
+  const p = override ? path.resolve(override) : path.join(ROOT, 'config.json');
   const file = readJsonSafe(p, null, true);
   if (!file || typeof file !== 'object' || Array.isArray(file)) throw new Error(`配置格式错误：${p}`);
+  if (override) log(`[config] 使用 QQ_BRIDGE_CONFIG 指定的配置：${p}`);
   const cfg = {
     dsh: {
       baseUrl: 'http://127.0.0.1:3080',
@@ -721,7 +896,7 @@ function loadConfig() {
     snowluma: { wsUrl: 'ws://127.0.0.1:3001', accessToken: '', ...(file.snowluma ?? {}) },
     // 空 => 每个会话在 state/agents/<key> 下建独立工作目录
     sessionCwd: file.sessionCwd ?? '',
-    agentPreset: file.agentPreset ?? 'qq-chat',
+    agentPreset: file.agentPreset ?? 'qq-chat-agent',
     workspaceTitle: file.workspaceTitle ?? 'QQ 聊天',
     ownerQQ: normalizeOwnerQQ(file.ownerQQ),
     allow: {
@@ -744,17 +919,6 @@ function loadConfig() {
     security: {
       interceptNotify: true,
       ...(file.security ?? {})
-    },
-    slang: {
-      enabled: true,
-      extractMinMessages: 10,
-      extractCooldownMs: 5 * 60 * 1000,
-      inferenceThresholds: [2, 4, 8],
-      injectMax: 8,
-      learnerPreset: 'qq-chat',
-      workspaceTitle: 'QQ 黑话学习',
-      autoResearch: true,
-      ...(file.slang ?? {})
     },
     social: {
       enabled: true,
@@ -795,10 +959,17 @@ function loadConfig() {
       longGapMaxMs: 5000,             // 长间隔上限（当前控制台保存值）
       ...(file.social ?? {})
     },
+    // 共用会话（默认关）。开启后：私聊与群共用一个 DSH 会话 + 一套记忆，
+    // 但每轮唤醒包会写明【当前场景】，回复按 turn 归属路由，不会串号。
+    // 权限取组内最低档（见 sharedPresetName），私聊会因此失去本地工具。
+    sessionSharing: {
+      ...SESSION_SHARING_DEFAULTS,
+      ...(file.sessionSharing ?? {})
+    },
     socialV2: {
       enabled: true,
       autoReplyCheckMs: 30000,
-      agentPreset: 'qq-chat-v2',
+      agentPreset: 'qq-chat-agent',
       provideRecommendations: true,
       tools: {
         getPrompt: true,
@@ -818,7 +989,8 @@ function loadConfig() {
         setWakeConfig: true,
         markRead: true,
         memory: true,
-        fact: true,
+        // 2026-11-10：fact 开关已删除 —— 长期事实并入 qq_memory_append(category='longTerm')，
+        // 写入走 memory 开关，不再单独有 fact 闸门。
         getImages: true,
         getForwardMsg: true,
         sendPoke: true,
@@ -829,11 +1001,18 @@ function loadConfig() {
         stickerNote: true,
         collectSticker: true,
       },
+      // 纯语音（文字 → 睦的声音）：她照常打字，桥接把文字合成语音再发。
+      // 默认关闭。开关在控制台「运行概览 → 暂停/恢复」那一排。
+      tts: { ...TTS_DEFAULTS },
       wake: {
         defaultMode: 'diving',
         preSleepWaitEnabled: true,      // 沉睡前强制观察窗口开关：防止 AI 聊两句就潜水
         preSleepWaitMs: 300000,          // 默认沉睡前至少等待/观察 5 分钟（后台可调）
         recommendedDefaultInfinite: true, // 默认下一次唤醒是否无限期（true=永久潜水等条件；false=有限时长）
+        // 硬下限：她设的潜水时长不能短于这个值。
+        // 默认保持 1 分钟 —— 具体数值由操作者在控制台「最小潜水（秒）」里改，
+        // 这里只是**缺字段时的兜底**。（2026-11-11 曾误改成 600000，已还原：
+        // 操作者明确要求这个值归他自己管，代码不要替他做主。）
         sleepMinMs: 60000,
         sleepMaxMs: 0,
         recommendedSleepMinMs: 300000,
@@ -862,7 +1041,10 @@ function loadConfig() {
         idleMs: 1800000,          // 30 分钟没有**用户**消息（模型自己的动作不重置计时）
         thresholdTokens: 300000,  // 上下文超过 30 万 token 才值得压（1M 窗口的 30%）
         checkIntervalMs: 60000,   // 每分钟扫一次
-        summarize: true           // 压缩前先让模型把要点写进长期记忆
+        // 2026-11-10：压缩前「记忆整理」投递已删除（summarize 开关随之失效）。
+        // 旧行为是压缩前投递一次模型调用，让她把要点写进记忆库；现在长期记忆由她
+        // 自己在聊天中用 qq_memory_append(category='longTerm') 写，压缩不再额外调模型。
+        // 这个字段保留只为兼容旧 config.json，读代码时不要以为它还在生效。
       },
       send: {
         burstEnabled: true,
@@ -874,6 +1056,9 @@ function loadConfig() {
         longGapMaxMs: 10000,
         maxSendPerMinute: 8,
         maxSendPerHour: 60,
+        // 同一会话两次发送之间的最小间隔（2026-11-13）。0 = 关闭。
+        // 5 秒是操作者定的：既能挡住观望循环里的连发，又不至于让正常对话明显变慢。
+        minSendIntervalMs: 5000,
         maxMessageChars: 500,
         maxGapMs: 10000,
         gapBaseMs: 800,
@@ -918,7 +1103,7 @@ function loadConfig() {
         inlineWakeMessages: true,
         wakeMessageLimit: 12,
         wakeRecentLimit: 4,
-        wakeMaxChars: 6000
+        wakeMaxChars: 6500
       },
       // 操作者在控制台为单个会话预写的「初始提示词」的字数上限（只在首次唤醒时注入一次）。
       // 它不是安全边界，只是防止误粘贴一篇长文把首次唤醒的 prompt 撑爆。
@@ -960,9 +1145,7 @@ function loadConfig() {
     setWakeConfig: true,
     markRead: true,
     memory: true,
-    fact: true,
-    slangQuery: true,
-    slangSubmit: true,
+    // fact 开关已删除（见上面默认配置处的说明）。
     getImages: true,
     getForwardMsg: true,
     sendPoke: true,
@@ -972,36 +1155,19 @@ function loadConfig() {
     setStickerRemark: false,
     stickerNote: true,
     collectSticker: true,
-    sendVoice: false,
     // 发文件（qq_send_file）：只对 Owner 档（private:<ownerQQ>）生效，路由里有独立档位闸门；
     // 这里的开关是"要不要给管理员用这个工具"，默认开。详细边界见 socialV2.files。
     sendFile: true,
     ...(cfg.socialV2.tools ?? {})
   };
 
-  // socialV2.voice：语音发送（把准备好的音频文件当 QQ 语音发出去）。
-  // dir 为相对仓库根目录的语音库路径；AI 的 qq_send_voice 默认只能从这个目录取文件，
-  // 绝对路径需要显式开 allowAbsolutePath（默认关，避免 prompt injection 读到任意本地文件）。
-  //
-  // 默认**关闭**（enabled/sendVoice 均为 false）：语音是"开口说话"的强表达，且需要你先准备好
-  // 语音库内容。没放音频就让 AI 发语音只会得到一串错误。把音频放进 audio/ 后，
-  // 在控制台「二代仿真 → 语音库与语音发送」里打开开关即可。
-  cfg.socialV2.voice = {
-    enabled: false,
-    dir: 'audio',
-    maxSeconds: 300,
-    maxBytes: 20 * 1024 * 1024,
-    maxPerMinute: 2,
-    maxPerHour: 10,
-    allowAbsolutePath: false,
-    // 音量：默认倍数（1 = 原样）+ 智能音量档位 + ffmpeg 位置（空 = 走 PATH）。
-    // SnowLuma 的 record 段没有增益字段，所以音量必须在本地先调好再发。
-    defaultVolume: 1,
-    loudness: 'normal',
-    ffmpegPath: '',
-    autoReadback: true,
-    ...(cfg.socialV2?.voice ?? {})
-  };
+  // ⚠️ 2026-11-12：`socialV2.voice`（语音库 / 固定语音发送）已整体删除。
+  //   那是原作者做的一套功能，操作者不再使用 —— 现在用的是**纯语音 TTS**
+  //   （她的话用 GPT-SoVITS 合成后发出），链路在 onebotSend / maybeSendAsVoice 里，
+  //   直接生成 record 段，与本配置无关。
+  //   同时删掉：qq_send_voice / qq_list_voices、voice-core.js、send-voice-lib.js、
+  //   /api/socialV2/send-voice、/api/socialV2/voices、控制台语音库面板。
+  //   保留：socialV2.tts（纯语音）与 socialV2.ffmpegPath（media-normalize 要用）。
 
   // socialV2.sticker.collect 也需要深度合并，避免旧配置缺失 collect 子项时丢默认值。
   cfg.socialV2.sticker = {
@@ -1035,6 +1201,15 @@ function loadConfig() {
     maxCount: 5,
     ...((cfg.socialV2?.media && typeof cfg.socialV2.media === 'object' && !Array.isArray(cfg.socialV2.media)) ? cfg.socialV2.media : {})
   };
+
+  // socialV2.cards（B站分享卡片内联展开）：
+  //   默认开、只认 B站。为什么默认开：卡片在群聊里很常见，而「[卡片消息]」四个字对
+  //   她等于什么都没说——她只能装没看见，或者白花一步去调 web_fetch 抓一个短链。
+  //   在桥接侧内联成 `[B站] 标题 · UP · 时长 · 播放` 之后，她零工具调用就能接话。
+  //   详细取舍见 src/card-parse.js 文件头。
+  // 注意：这里**必须**在建配置对象时就归一化，setCardConfig 内部也会兜一层，
+  //   但配置是用户可直接编辑的，非法值不能变成运行期异常。
+  cfg.socialV2.cards = setCardConfig(cfg.socialV2.cards);
 
   // socialV2.initialPromptMaxChars：会话「初始提示词」的字数上限。config.json 是用户可编辑的，
   // 手工写进字符串/负数/超大值时要收敛到安全区间，否则要么保存接口永远报"过长"，要么等于没上限。
@@ -1074,6 +1249,17 @@ function loadConfig() {
 
 // ── 状态持久化（QQ 会话 ↔ DSH 会话映射） ─────────────────────────────────────
 let state = { sessions: {} };
+// 冷启动登记表：**DSH sessionId → { newAt, compactedAt, consumedAt, at }**。
+//
+// 它回答的唯一问题：下一次唤醒要不要带那两句提示（记忆 / 人格卡）。
+// 为什么按 DSH sessionId 而不是 QQ key：私聊和群可能共用同一个 DSH 会话，
+// 而"上下文没了"是**会话级**的事实 —— 按 DSH 会话记，天然就是全组一份，
+// 两个入口不可能各发一遍。
+const coldStartRegistry = new Map();
+// 正在压缩中的 DSH 会话（compaction/start 到 compaction/end 之间）。
+// 用途只有一个：压缩期间如果正好有唤醒要渲染，那会儿历史上的"compress 完了"还没发生，
+// 提示不该提前挂 —— 但也不能漏，所以结束时会再登记一次。这里只做日志与判重。
+const compactionInFlight = new Map();
 // sessions.json 读不动/读坏时必须**大声失败**，不能静默回落成空映射：
 // 那会让每个 QQ 会话都拿到一个全新的 DSH 会话（上下文全丢），而紧接着的
 // saveState() 会把这份空映射原子写回磁盘 —— 一次截断/占用/写满就变成永久丢失。
@@ -1112,6 +1298,39 @@ function saveState() {
   // 占住 sessions.json.tmp 时抛 EPERM，且写出的文件权限与其它 state 文件不一致。
   if (!stateWritable) return; // 见 loadState：读失败/损坏时绝不回写，避免把丢失变成永久
   atomicWriteJson(STATE_FILE, state);
+}
+
+// ── 冷启动登记表：读写 ───────────────────────────────────────────────────────
+//
+// 落盘在 sessions.json 的 `coldStarts` 下（和 sessions 一样是"会话 ↔ DSH"的事实，
+// 不属于 socialV2 的聊天状态）。丢一次的后果是"少提示一次"，所以读写都按尽力而为：
+// 解析失败当空表，绝不阻断启动。
+const COLD_START_KEEP = 200; // 只留最近 200 条；每次新会话/压缩都会产生一条，旧的没人读
+
+function loadColdStarts() {
+  coldStartRegistry.clear();
+  const raw = state?.coldStarts;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return;
+  const entries = Object.entries(raw)
+    .filter(([sid, v]) => typeof sid === 'string' && v && typeof v === 'object')
+    .sort((a, b) => (Number(b[1].at) || 0) - (Number(a[1].at) || 0));
+  for (const [sid, v] of entries.slice(0, COLD_START_KEEP)) {
+    coldStartRegistry.set(sid, {
+      newAt: Number(v.newAt) || 0,
+      compactedAt: Number(v.compactedAt) || 0,
+      consumedAt: Number(v.consumedAt) || 0,
+      at: Number(v.at) || 0
+    });
+  }
+}
+
+function saveColdStarts() {
+  if (!stateWritable) return;
+  const entries = [...coldStartRegistry.entries()]
+    .sort((a, b) => (b[1].at || 0) - (a[1].at || 0))
+    .slice(0, COLD_START_KEEP);
+  state.coldStarts = Object.fromEntries(entries);
+  saveState();
 }
 
 // ── 单实例锁 ─────────────────────────────────────────────────────────────────
@@ -1348,7 +1567,27 @@ async function segmentsToText(segments, options = {}) {
         out.push(replyText || '[引用消息]');
         break;
       }
-      case 'json': out.push('[卡片消息]'); break;
+      case 'json': {
+        // 分享卡片（小程序 / 结构化分享）。以前一律渲染成「[卡片消息]」，对模型等于
+        // 什么都没说；B站卡片现在在**桥接侧**内联展开成一行摘要（见 src/card-parse.js），
+        // 这样她零工具调用就知道群友转的是什么视频，既少一次往返、也不多占 schema。
+        //
+        // 三层降级，任何一层失败都不影响消息投递：
+        //   ① 不是 B站卡片 / 开关关了 → 原文重发，回到「[卡片消息]」；
+        //   ② 短链解析失败 → 用卡片自带标题兜底；
+        //   ③ 一切正常 → `[B站] 标题 · UP · 时长 · 播放 · BV号`。
+        // 同一条消息会调本函数两次（带引用版/纯文本版），summarizeCard 按原始 JSON
+        // 做 memo，第二次不再出网。
+        const rawCard = typeof d.data === 'string'
+          ? d.data
+          : (d.data && typeof d.data === 'object' ? JSON.stringify(d.data) : '');
+        let cardLine = '';
+        if (rawCard) {
+          try { cardLine = await summarizeCard(rawCard); } catch { cardLine = ''; }
+        }
+        out.push(cardLine || '[卡片消息]');
+        break;
+      }
       // markdown：SnowLuma 1.14.9 的线上段落是 `{type:'markdown',data:{content}}`。
       // 上游 1.14.17+（commit 1934e4e7「include text alongside received markdown」）
       // 起还会带上 `data.text`。两个形状都读，这样将来升级 SnowLuma 运行时不会退化成
@@ -1446,6 +1685,81 @@ function canonicalV2Key(key) {
   return `${m[1]}:${id}`;
 }
 
+// ── 共用会话（sessionSharing）────────────────────────────────────────────────
+//
+// 需求原话：私聊与群聊「用一样的 selfNote 和记忆」，但两个场景各自知道自己是谁在跟谁说话，
+// 回复也不能串到别的聊天里。
+//
+// 做法：把**一个 DSH 会话**同时挂在多个 QQ key 上（两个 key 共享同一个 sessionId），
+// 记忆层也按 owner 共享一份；每轮唤醒包显式写明【当前场景】，发言靠 qq_send_message 的
+// key 参数落到各自的聊天里 —— 所以"不串"靠的是工具参数，不是靠会话隔离。
+//
+// ⚠️ 权限必须取**最低档**：一个 DSH 会话只有一个 preset。私聊（owner 档，能读写本机）
+// 与群聊（readonly 档）共用一个会话时，只能挂 readonly —— 否则群里任何人都能诱导
+// 她读写本机文件。开启本功能即等于私聊也放弃本地工具，这是刻意的取舍，不是缺陷。
+//
+// 配置（config.json 的 sessionSharing）：
+//   { "enabled": true,
+//     "groups": { "private:10001": "group:20001" } }   // 私聊 key -> 归属群 key
+// 私聊 key 的会话、记忆、长期事实全部改用群 key 的那一份；只影响"存到哪"，不影响发到哪。
+const SESSION_SHARING_DEFAULTS = Object.freeze({
+  enabled: false,
+  groups: {},
+  // 共用会话跑哪个 preset。留空 = 用共用组里**最低档**的 preset（readonly < v2 < owner）。
+  preset: '',
+});
+
+/**
+ * 把 QQ key 归一成「共享组内的代表 key」（owner key）。
+ *
+ * 没有开启共享、或这个 key 不属于任何共享组时，原样返回 —— 全部旧行为不变。
+ * 代表 key 统一取组内那个 group: 的 key；组里没有 group 时取字典序最小的那个，
+ * 保证同一个组无论从哪个成员发起都落到同一个 key 上（否则事实库会分裂成两份）。
+ */
+function sharedOwnerKeyOf(cfg, key) {
+  const sharing = cfg?.sessionSharing;
+  if (!sharing || sharing.enabled !== true) return key;
+  const canonical = canonicalV2Key(key);
+  if (!canonical) return key;
+  const groups = sharing.groups && typeof sharing.groups === 'object' ? sharing.groups : {};
+  // ⚠️ 方向不能反。本函数的契约（见上方注释）是 **私聊 key → 归属群 key**，
+  // 也就是 `{ "private:10001": "group:20001" }` 里 **key 是私聊、value 是群**。
+  //
+  // 这里曾经把 key 当 leader、value 当 member 来遍历（那是 shareGroupOf 的视角），
+  // 结果 `private:10001` 找不到自己所属的组、被原样返回 —— 于是"共用记忆"只在
+  // **会话层**成立了（ensureSession 走的是另一条路），记忆层却各自存一份：
+  // 私聊写的 selfNote 在群里读不到。实测踩过，表现就是"说好共用的记忆没共用"。
+  //
+  // 两种写法都要能认：既支持 { private: 群 } 的箭头形式，也支持 { 群: [私聊...] }
+  // 的成员列表形式（老配置与未来的多人群组）。
+  for (const [leaderRaw, memberRaw] of Object.entries(groups)) {
+    const leader = canonicalV2Key(leaderRaw) || String(leaderRaw);
+    const members = Array.isArray(memberRaw) ? memberRaw : [memberRaw];
+    const pool = [leader, ...members.map((m) => canonicalV2Key(m) || String(m))];
+    if (!pool.includes(canonical)) continue;
+    // 组内代表 key：优先 group:，其次字典序最小 —— 必须是**组内容的纯函数**，
+    // 不能依赖"谁先说话"，否则重启顺序一变事实库就换文件了。
+    const groupsInPool = pool.filter((k) => k.startsWith('group:')).sort();
+    return groupsInPool[0] ?? [...pool].sort()[0];
+  }
+  // 箭头形式兜底：canonical 本身是某个键、其 value 指向另一个 key，则代表取那个 group。
+  // （上面那轮已经覆盖了这种形状，这里保留是为了让"私聊指向群但群不在同一项"的
+  //  分散写法也能合并，例如 { private:A: 'group:G', private:B: 'group:G' }。）
+  const targets = new Set();
+  for (const [fromRaw, toRaw] of Object.entries(groups)) {
+    const from = canonicalV2Key(fromRaw) || String(fromRaw);
+    if (from !== canonical) continue;
+    const to = canonicalV2Key(toRaw) || String(toRaw);
+    if (to) targets.add(to);
+  }
+  if (targets.size) {
+    const asGroups = [...targets].filter((k) => k.startsWith('group:')).sort();
+    return asGroups[0] ?? [...targets].sort()[0];
+  }
+  return key;
+}
+
+
 // ── 三档权限分级：会话 → preset（2026-10-26） ────────────────────────────────
 //
 // 档位与 preset 的对应（preset 源在 dsh/agent-presets/<preset>/agent.cordis.yml）：
@@ -1456,9 +1770,12 @@ function canonicalV2Key(key) {
 //
 // ⚠️ owner 优先于白名单：同一账号同时出现在 ownerQQ 与 allow 里时按 owner 处理
 //   （用户明确要求）。config.json 的默认形态就是这样——ownerQQ 通常也在 allow.private 里。
+// ⚠️ 2026-11-07 合并后两档指向同一个 preset：不再有 owner 全工具档。
+//   保留这两个键是为了让 shareGroupOf / sharedPresetName 那套「取最低权限档」的
+//   逻辑继续成立（现在它们恒等，等价于"没有分级"）。
 const TIER_PRESETS = Object.freeze({
-  OWNER: 'qq-chat-owner',
-  READONLY: 'qq-chat-readonly',
+  OWNER: 'qq-chat-agent',
+  READONLY: 'qq-chat-agent',
 });
 
 /**
@@ -1519,33 +1836,23 @@ async function main() {
   hardenStateDirAcl();
   acquireLock();
   loadState();
+  // 冷启动登记表跟着 sessions.json 一起读回：重启后"新会话/刚压缩过"的判定不能失忆。
+  loadColdStarts();
+  // ── 自动跟上 DSH 的实际端口 ────────────────────────────────────────────
+  // 桌面版 DSH 每次启动都由 Electron 重新分配端口（历史备份里见过
+  // 2113/3632/5412/6694/9509/10613/14061/14851…），而 config.json 里存的是**上一次**
+  // 那个数值。DSH 一重启，baseUrl 就指到一个没人监听的端口 —— 桥接所有 RPC 全挂、
+  // `dshReady` 永远是 false，QQ 大肥鱼面板就显示「读不到数据」。
+  // 这就是「同一个毛病反复出现、每次都要进 DSH 改一下」的真正原因：
+  // 手动改 baseUrl 只修好这一次，下次 DSH 重启又漂了。
+  // 启动时自动探测一次并写回，从结构上消掉这个手工步骤。
+  await followDshEndpoint(cfg);
 
-  // ── 群聊黑话/网络用语学习（slang） ──────────────────────────────────────
-  let slangEntries = [];
-  // 读失败时（被占用 / 权限 / JSON 损坏）必须**暂停写入**：否则内存里的空数组
-  // 会在下一次 saveSlangStore() 时覆盖掉磁盘上那份数据，学到的词条全丢。
-  let slangStoreWritable = true;
-  try {
-    slangEntries = loadSlang(SLANG_FILE, { onCorrupt: (message) => log(`⚠️ ${message}`) });
-  } catch (error) {
-    slangStoreWritable = false;
-    log(`⚠️ 黑话库加载失败，已暂停写入以免覆盖磁盘数据（修好后重启即可恢复）：${error?.message ?? error}`);
-  }
-  const slangWindows = new Map();       // key -> [{sender,text,time}]：待学习消息窗口
-  const slangExtractionCooldowns = new Map(); // key -> timestamp
-  const slangSubmitTimes = new Map();   // key -> [timestamp]：AI 提交黑话候选限频（内存态）
-  const feedbackTimes = new Map();      // key -> [timestamp]：AI 反馈限频（内存态）
-  const slangResearchingIds = new Set(); // 正在研究中的候选 id，防止重复排队
-  const learnerSessions = new Set();    // sessionId -> 学习会话（不映射 QQ，不发送）
-  const learnerCollectors = new Map();  // sessionId -> turn collector
-  const learnerWaiters = new Map();     // sessionId -> [{resolve,reject,timer}]
-  let slangLearnerSessionId = null;
-  let slangTaskChain = Promise.resolve();
 
   // ── 表情包体系（二代仿真）本地知识库 ────────────────────────────────────
   // 库文件损坏/读不动时**不能当成空库继续**：下面任何一次 saveStickerStoreSafe 都会把
   // 「空库」写回去，把 AI 学到的 localNote/tags/usage 永久清零。读失败就显式降级为
-  // 「只读不写」，并留下醒目日志（与 loadSlang 的 slangStoreWritable 同一套路）。
+  // 「只读不写」，并留下醒目日志。
   let stickerEntries = [];
   let stickerStoreWritable = true;
   try {
@@ -1645,15 +1952,13 @@ async function main() {
   // 取单个表情的图片字节（多模态用）。
   async function getStickerImageData(stickerId) {
     const synced = await syncStickerLibrary(false);
-    const entry = findSticker(synced?.entries ?? stickerEntries, stickerId);
-    if (!entry) {
-      // 本地没有时，尝试强制刷新一次再找（收藏可能在会话过程中新增）
-      const forced = await syncStickerLibrary(true);
-      const entry2 = findSticker(forced?.entries ?? stickerEntries, stickerId);
-      if (!entry2) throw new Error(`找不到表情 ${stickerId}，请先用 qq_list_stickers 获取有效 id`);
-      return entry2;
-    }
-    return entry;
+    const resolved = resolveSticker(synced?.entries ?? stickerEntries, stickerId);
+    if (resolved.entry) return resolved.entry;
+    // 本地没有时，尝试强制刷新一次再找（收藏可能在会话过程中新增）
+    const forced = await syncStickerLibrary(true);
+    const resolved2 = resolveSticker(forced?.entries ?? stickerEntries, stickerId);
+    if (!resolved2.entry) throw new Error(resolved2.error || `找不到表情 ${stickerId}`);
+    return resolved2.entry;
   }
 
   // ── 语音发送（把准备好的音频当 QQ 语音条发出） ──────────────────────────────
@@ -1680,259 +1985,6 @@ async function main() {
       log(`⚠️ 文件/语音发送被安全策略拦截 (${key})：文件名疑似含${audit.reason}`);
       appendActivity(`${key} [file] 发送被拦截（文件名疑似含${audit.reason}）`);
       throw new Error(`文件名疑似包含${audit.reason}，已阻止发送；请重命名后再发`);
-    }
-  }
-
-  function voiceCfg() {
-    const v = cfg.socialV2?.voice ?? {};
-    return {
-      enabled: v.enabled !== false,
-      dir: path.resolve(ROOT, String(v.dir ?? 'audio')),
-      maxSeconds: Number(v.maxSeconds) > 0 ? Number(v.maxSeconds) : 300,
-      maxBytes: Number(v.maxBytes) > 0 ? Number(v.maxBytes) : 20 * 1024 * 1024,
-      maxPerMinute: Number(v.maxPerMinute) >= 0 ? Number(v.maxPerMinute) : 2,
-      maxPerHour: Number(v.maxPerHour) >= 0 ? Number(v.maxPerHour) : 10,
-      allowAbsolutePath: v.allowAbsolutePath === true,
-      defaultVolume: Number(v.defaultVolume) > 0 ? Number(v.defaultVolume) : 1,
-      loudness: v.loudness || 'normal',
-      ffmpegPath: process.env.FFMPEG_PATH || v.ffmpegPath || null,
-      autoReadback: v.autoReadback !== false
-    };
-  }
-
-  function voiceLibrary() {
-    const dir = voiceCfg().dir;
-    const files = listAudioFiles(dir);
-    return files.map((f) => {
-      let stat = null;
-      try { stat = fs.statSync(f); } catch {}
-      return { name: path.relative(dir, f).split(path.sep).join('/'), bytes: stat?.size ?? 0, mtimeMs: stat?.mtimeMs ?? 0 };
-    });
-  }
-
-  /**
-   * 把「AI 给的语音引用」解析成可发送的本地绝对路径。
-   *
-   * 安全边界：**AI 只能从语音库目录里取文件**（防 prompt injection 拿任意本地文件当语音外发）。
-   *
-   * 历史坑（已修）：这里曾经在 `socialV2.voice.allowAbsolutePath: true` 时直接把 AI 给的
-   * 绝对路径交给 resolveAudioSource 解析，于是「AI 传 C:\Users\x\Music\任意.mp3」
-   * 就能把本机任意音频（< 20 MB）发到群里 —— 而 inspectAudio 对「没有音频流」或
-   * ffprobe 不可用的情况是放行的，等于把开关变成了任意文件外发通道。
-   * 现在即使开了这个开关，也要求绝对路径**必须落在语音库目录之内**；
-   * 真要从库外发文件请走操作者通道（resolveVoicePathForOperator / CLI）。
-   */
-  function voicePathInsideLibrary(vc, absPath) {
-    const rel = path.relative(vc.dir, absPath);
-    if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return null;
-    if (!fs.existsSync(absPath) || !fs.statSync(absPath).isFile()) return null;
-    return safeJoinLibrary(vc.dir, rel);
-  }
-
-  function resolveVoicePathForV2(input) {
-    const vc = voiceCfg();
-    const raw = String(input ?? '').trim();
-    if (!raw) throw new Error('缺少音频：给语音库里的文件名（可用 qq_list_voices 查看）');
-    if (/^(base64:\/\/|data:|https?:\/\/)/i.test(raw)) {
-      throw new Error('语音只接受语音库里的本地文件；不接受 base64://、data: 或 http(s):// 来源');
-    }
-    const isAbs = path.isAbsolute(raw) || /^file:\/\//i.test(raw) || raw.startsWith('~');
-
-    let resolved = null;
-    if (isAbs) {
-      const r = resolveAudioSource(raw, {});
-      const confined = r.path ? voicePathInsideLibrary(vc, r.path) : null;
-      if (confined) {
-        resolved = { path: confined, via: `${r.via}+library-confined` };
-      } else {
-        // 只报目录名，不报绝对路径：这条消息会经 MCP 工具错误回给模型，
-        // 而模型面对的是不可信的群聊内容（prompt injection 可能诱导它复述本机路径）。
-        throw new Error(`语音只能从语音库取文件（语音库目录：${path.basename(vc.dir)}）；即使是绝对路径也必须位于语音库之内（socialV2.voice.allowAbsolutePath 已不再放宽 AI 通道）。请把音频放进语音库，或用操作者通道（CLI / 控制台）发送库外文件。`);
-      }
-    } else {
-      // ⚠️ 安全关键：相对路径**只能**在语音库内解析。
-      //
-      // 不能直接丢给 resolveAudioSource —— 它会**先用 process.cwd() 解析相对路径**
-      // （voice-core.js 的 cwd 分支），于是 AI 传 `..\..\某个\本机文件.mp3` 就能读库外文件，
-      // 把 allowAbsolutePath=false 这个闸门整个绕过去（实测可复现）。
-      // 相对路径一律先过 safeJoinLibrary（含 realpath 复核，挡 symlink 逃逸）。
-      const joined = safeJoinLibrary(vc.dir, raw);
-      if (joined && fs.existsSync(joined) && fs.statSync(joined).isFile()) {
-        resolved = { path: joined, via: 'voice-dir-safe' };
-      } else {
-        // 允许省略扩展名：逐个补常见扩展名再在库内试一次（仍然不越出语音库）
-        if (!path.extname(raw)) {
-          for (const ext of AUDIO_EXTS) {
-            const cand = safeJoinLibrary(vc.dir, `${raw}${ext}`);
-            if (cand && fs.existsSync(cand) && fs.statSync(cand).isFile()) {
-              resolved = { path: cand, via: 'voice-dir-safe+ext' };
-              break;
-            }
-          }
-        }
-        if (!resolved) {
-          // 库内没找到：检查是不是"想读库外文件"（这条错误要说清楚，避免误以为是名字写错）
-          const looksLikeEscape = /(^|[\\/])\.\.([\\/]|$)/.test(raw) || path.isAbsolute(raw);
-          if (looksLikeEscape) {
-            throw new Error('语音只能从语音库取文件：路径里出现了「..」或绝对路径，已拒绝（防止读到库外的本机文件）');
-          }
-        }
-      }
-    }
-
-    if (resolved) return { path: resolved.path, via: resolved.via, resolvedFrom: raw };
-
-    // 模糊提示：只列库内文件（绝不回显库外路径）
-    const library = voiceLibrary();
-    const hint = library.length
-      ? `语音库里现有：${library.slice(0, 12).map((x) => x.name).join('、')}${library.length > 12 ? ` 等 ${library.length} 个` : ''}`
-      : `语音库（${path.basename(vc.dir)}）目前是空的，先把音频文件放进去`;
-    // 按 basename 去扩展名做近似匹配（只用于提示）
-    const want = path.basename(raw).toLowerCase();
-    const wantNoExt = want.replace(/\.[^.]+$/, '');
-    const fuzzyHits = library
-      .filter((x) => {
-        const base = path.basename(x.name).toLowerCase();
-        return base === want || base.replace(/\.[^.]+$/, '') === wantNoExt;
-      })
-      .map((x) => x.name);
-    const fuzzy = fuzzyHits.length ? `；近似匹配：${fuzzyHits.join('、')}` : '';
-    throw new Error(`语音库里找不到「${raw}」${fuzzy}。${hint}`);
-  }
-
-  /**
-   * 操作者通道（CLI）的路径解析：允许绝对路径（操作者本来就能读本机文件），
-   * 相对路径先按「语音库」解析，再按当前工作目录解析 —— 这样两种直觉写法都成立。
-   * base64/http 来源仍然禁止：语音应来自本地文件，别让 CLI 变成任意 URL 的外发口子。
-   */
-  function resolveVoicePathForOperator(input) {
-    const vc = voiceCfg();
-    const raw = String(input ?? '').trim();
-    if (!raw) throw new Error('缺少音频路径');
-    if (/^(base64:\/\/|data:|https?:\/\/)/i.test(raw)) {
-      throw new Error('语音只接受本地文件；不接受 base64://、data: 或 http(s):// 来源');
-    }
-    const r = resolveAudioSource(raw, { voiceDir: vc.dir });
-    if (r.path) return { path: r.path, via: r.via, resolvedFrom: raw };
-    const fuzzy = r.candidates?.length ? `；语音库近似匹配：${r.candidates.map((c) => path.basename(c.path)).join('、')}` : '';
-    throw new Error(`找不到音频「${raw}」${fuzzy}`);
-  }
-
-  /**
-   * 语音发送限流：与文本发送分开计数，避免语音吃掉聊天额度（也避免聊天把语音额度耗光）。
-   *
-   * 只**检查**不占额度：额度在真正发出去之后才由 voiceBudgetCommit 记账 ——
-   * 这样参数错、被审计拦截、网关失败都不会白白吃掉配额（否则连失败几次就被假 429 卡住）。
-   */
-  function voiceBudgetCheck(scopeKey, cfgV) {
-    const now = Date.now();
-    const bucket = voiceSendTimes.get(scopeKey) ?? [];
-    const inMinute = bucket.filter((t) => now - t < 60000);
-    const inHour = bucket.filter((t) => now - t < 3600000);
-    if (cfgV.maxPerMinute > 0 && inMinute.length + 1 > cfgV.maxPerMinute) {
-      throw new Error(`语音发送频率超限（每分钟最多 ${cfgV.maxPerMinute} 条），请稍后再试`);
-    }
-    if (cfgV.maxPerHour > 0 && inHour.length + 1 > cfgV.maxPerHour) {
-      throw new Error(`语音发送频率超限（每小时最多 ${cfgV.maxPerHour} 条），请稍后再试`);
-    }
-  }
-
-  /** 语音真正发出后记账（顺带裁掉超过 1 小时的旧时间戳，避免数组无界增长）。 */
-  function voiceBudgetCommit(scopeKey, at = Date.now()) {
-    const bucket = (voiceSendTimes.get(scopeKey) ?? []).filter((t) => at - t < 3600000);
-    bucket.push(at);
-    voiceSendTimes.set(scopeKey, bucket);
-  }
-
-  /**
-   * 底层发送：把音频作为 record 段交给 SnowLuma。
-   * guard=true（agent 通道）时，发送前必须通过 captureSendGuard —— 会话/模式/白名单任一变
-   * 就放弃发送；guard=false（操作者通道）时不套会话闸门（操作者可能不在任何会话里）。
-   *
-   * audio 可传音量设置 { volume, normalize, loudness }：SnowLuma 的 record 段没有增益字段，
-   * 所以音量必须在本地用 ffmpeg 调好再发（临时文件发完即删）。
-   */
-  async function sendVoiceV2(key, filePath, { guard = false, audit = true, audio = null } = {}) {
-    const vc = voiceCfg();
-    // 注意：这里**不检查** vc.enabled —— 那是「AI 能不能发语音」的开关，判定放在
-    // AI 路由（/api/socialV2/send-voice）与 sendVoiceForV2 里。底层只管发，
-    // 否则"默认不启用"会连操作者通道（CLI / 控制台面板 / 图形界面）一起封死。
-    if (audit) assertOutboundAuditOk(key, `[语音:${path.basename(filePath)}]`);
-    let info;
-    try {
-      info = await inspectAudio(filePath, { maxBytes: vc.maxBytes, maxSeconds: vc.maxSeconds });
-    } catch (error) {
-      throw new Error(`音频检查失败：${error?.message ?? error}`);
-    }
-    if (!info.ok) throw new Error(`音频不可发送：${info.error}`);
-
-    // 音量处理（默认原样 → 不产生临时文件）
-    let processed;
-    try {
-      processed = await processAudioVolume(filePath, {
-        volume: audio?.volume ?? vc.defaultVolume,
-        normalize: audio?.normalize === true,
-        loudness: audio?.loudness ?? vc.loudness,
-        ffmpegPath: vc.ffmpegPath
-      });
-    } catch (error) {
-      throw new Error(`音量处理失败：${error?.message ?? error}`);
-    }
-    const sendPath = processed.path;
-
-    const assertSendAllowed = guard ? captureSendGuard(key) : null;
-    const [kind, id] = key.split(':');
-    const recordSegment = { type: 'record', data: { file: sendPath } };
-    let resolveSend;
-    let rejectSend;
-    const sendPromise = new Promise((resolve, reject) => { resolveSend = resolve; rejectSend = reject; });
-    sendChain = sendChain.then(async () => {
-      try {
-        if (assertSendAllowed) assertSendAllowed();
-        // 语音条比图片大、要过一次 SILK 转码，给 60s 预算（文本/图片共用同一 sendChain，
-        // 所以这条语音发完之前后面的文本会自然排队，不会插队到语音前面）。
-        const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
-        const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg';
-        const params = kind === 'private'
-          ? { user_id: Number(id), message: [recordSegment] }
-          : { group_id: Number(id), message: [recordSegment] };
-        const res = await fetch(`${httpUrl}/${action}`, {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-            ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {})
-          },
-          body: JSON.stringify(params),
-          signal: AbortSignal.timeout(60000)
-        });
-        const body = await res.json().catch(() => ({}));
-        if (!res.ok || body.status !== 'ok' || body.retcode !== 0) {
-          const hint = res.status === 426 ? '（HTTP 426：snowluma.httpUrl 可能指向了 WebSocket 端口）' : '';
-          throw new Error(`OneBot ${action} 失败: ${body.wording || body.retcode || res.status}${hint}`);
-        }
-        resolveSend(body.data);
-      } catch (error) {
-        rejectSend(error);
-      }
-    });
-    try {
-      const data = await sendPromise;
-      return {
-        messageId: data?.message_id ?? null,
-        bytes: info.size,
-        duration: info.duration ?? null,
-        codec: info.codec ?? '',
-        warnings: info.warnings ?? [],
-        detail: describeAudio(info),
-        // 音量处理信息：mode='original' 表示没动过（没产生临时文件）
-        audioProcessing: processed.detail,
-        volume: processed.volume,
-        loudness: processed.loudness,
-        audioMode: processed.mode
-      };
-    } finally {
-      // 音量处理产物是一次性的：发完（或失败）就删，别把 temp 撑大
-      cleanupTemp(sendPath, processed.converted);
     }
   }
 
@@ -2064,119 +2116,14 @@ async function main() {
     }
   }
 
-  /**
-   * 把「我发了条语音」写进二代会话的 recentMessages，让 AI 自己知道刚发过什么。
-   */
-  function recordVoiceSentV2(key, sent, label) {
-    const st = getSocialV2State(key);
-    const display = label || `[语音 ${sent.detail}]`;
-    const entry = {
-      messageId: sent.messageId ? String(sent.messageId) : null,
-      sender: '我',
-      text: truncateText(display, 200),
-      plain: truncateText(display, 200),
-      quoteTargetIsSelf: false,
-      isOwner: true,
-      ownerLabel: '我',
-      isSelf: true,
-      at: Date.now()
-    };
-    st.recentMessages.push(entry);
-    if (st.recentMessages.length > 200) st.recentMessages = st.recentMessages.slice(-200);
-    st.lastAiReplyAt = entry.at;
-    st.lastActionAt = entry.at;
-    st.wakeConfig.noActionCount = 0;
-    saveSocialV2State();
-  }
-
-  /**
-   * 发完语音后的**落地验证**：把这条消息从网关读回来，确认它真的带着 record 段。
-   *
-   * 为什么不用 fetch_ptt_text 做这件事：那个动作依赖 QQ 侧的语音转写结果，
-   * 而**自己发出去的**语音根本不会产生转写（实测 retcode=100「消息中不包含语音」）。
-   * 想让 AI 确认「语音真的发出去了」，唯一可靠的证据是 get_msg 回读到的 record 段。
-   * 返回 { confirmed, file, duration } 或 null（读不回来不影响"已发送"这个事实）。
-   */
-  async function verifyVoiceMessageSent(messageId) {
-    if (!messageId) return null;
-    try {
-      const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
-      const res = await fetch(`${httpUrl}/get_msg`, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {})
-        },
-        body: JSON.stringify({ message_id: Number(messageId) }),
-        signal: AbortSignal.timeout(30000)
-      });
-      const body = await res.json().catch(() => ({}));
-      if (!res.ok || body.status !== 'ok' || body.retcode !== 0) return null;
-      const segments = Array.isArray(body.data?.message) ? body.data.message : [];
-      const record = segments.find((s) => s?.type === 'record');
-      if (!record) return null;
-      // 注意：只回报「确认成功 + 时长」，**不回传 file/url**。
-      // 私聊消息里 get_msg 会把源文件路径塞进 url（如 D:\...\audio\xxx.mp3），
-      // 回给 AI 就等于把本机路径写进模型上下文（也会被敏感信息审计拦）。
-      return {
-        confirmed: true,
-        duration: record.data?.duration != null ? Number(record.data.duration) : null
-      };
-    } catch (error) {
-      log(`[voice] 发送后回读校验失败（不影响已发送）：${error?.message ?? error}`);
-      return null;
-    }
-  }
-
-  /**
-   * AI 通道入口：解析引用 → 限流 → 发送 → 记账 → 回读校验。
-   * 返回 { messageId, detail, verified, readback }。
-   */
-  async function sendVoiceForV2(key, voiceRef, { label = '', verify = null, readback = false, audio = null } = {}) {
-    const vc = voiceCfg();
-    if (!vc.enabled) throw new Error('语音功能已关闭（socialV2.voice.enabled=false）');
-    const resolved = resolveVoicePathForV2(voiceRef);
-    // 音量参数校验前置（AI 传错时给出可读错误，而不是让 ffmpeg 报奇怪的错）
-    if (audio) resolveAudioProcessing({ volume: audio.volume ?? vc.defaultVolume, normalize: audio.normalize === true, loudness: audio.loudness ?? vc.loudness });
-    voiceBudgetCheck(key, vc);
-    const sent = await sendVoiceV2(key, resolved.path, { guard: true, audit: true, audio });
-    voiceBudgetCommit(key);
-    recordVoiceSentV2(key, sent, label);
-    log(`[voice] ${key} 已发送语音 ${path.basename(resolved.path)} (${sent.detail}, messageId=${sent.messageId ?? '?'})`);
-    appendActivity(`${key} [voice] 发送语音 ${path.basename(resolved.path)} (${sent.detail})`);
-    let readbackText = null;
-    const wantReadback = readback === true;
-    if (wantReadback && sent.messageId) {
-      try {
-        const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
-        const res = await fetch(`${httpUrl}/fetch_ptt_text`, {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-            ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {})
-          },
-          body: JSON.stringify({ message_id: String(sent.messageId) }),
-          signal: AbortSignal.timeout(30000)
-        });
-        const body = await res.json().catch(() => ({}));
-        if (res.ok && body.status === 'ok' && body.retcode === 0) readbackText = body.data?.text ?? '';
-      } catch (error) {
-        log(`[voice] 语音转写回读失败（不影响已发送）：${error?.message ?? error}`);
-      }
-    }
-    // 默认做「回读到 record 段」的落地校验；转写按需（自己发的语音通常没有转写）。
-    const wantVerify = verify === true || (verify !== false && vc.autoReadback);
-    const verification = wantVerify ? await verifyVoiceMessageSent(sent.messageId) : null;
-    return { ...sent, key, file: resolved.path, via: resolved.via, verification, readback: readbackText };
-  }
-
-  // 发送一个收藏表情（按 emoji_id/url/md5 解析，发图片段）。
+  // 发送一个收藏表情（按 id/md5/url，或与备注完全一致的文字解析，发图片段）。
   async function sendStickerV2(key, stickerRef, options = {}) {
     const assertSendAllowed = captureSendGuard(key);
     // 发送前强制同步一次，确保“刚新增的表情能立即用、刚删除的表情不会继续发”。
     const synced = await syncStickerLibrary(true);
-    const entry = findSticker(synced?.entries ?? stickerEntries, stickerRef);
-    if (!entry) throw new Error(`找不到表情 ${stickerRef}，请先用 qq_list_stickers 获取有效 id`);
+    const resolved = resolveSticker(synced?.entries ?? stickerEntries, stickerRef);
+    if (!resolved.entry) throw new Error(resolved.error || `找不到表情 ${stickerRef}`);
+    const entry = resolved.entry;
     const url = entry.url;
     if (!url) throw new Error(`表情 ${entry.id} 没有可发送的图片地址`);
     const [kind, id] = key.split(':');
@@ -2202,7 +2149,27 @@ async function main() {
     } catch (error) {
       throw new Error(`表情 ${entry.id} 的图片下载失败（QQ CDN 网络异常或地址已失效）：${error?.message ?? error}`);
     }
-    segments.push({ type: 'image', data: { file: 'base64://' + image.buffer.toString('base64') } });
+    // ── 必须以「表情」而不是「图片」发出：sub_type=1 ─────────────────────────
+    //
+    // QQ 的图片段靠 picSubType 区分渲染方式：0 = 普通图片（撑满气泡宽度），
+    // 1 = 表情（按表情尺寸显示、可被当成斗图表情）。历史上这里只发 file，
+    // 不带 sub_type ⇒ 网关按 0 上传 ⇒ 原本在客户端里小巧的收藏表情被拉成一大张图。
+    //
+    // 这不是猜的：SnowLuma 自己的 `send_custom_face` action（index.mjs 里
+    // `{ type: 'image', data: { file: face.url, sub_type: 1, summary: '[动画表情]' } }`）
+    // 就是靠 sub_type=1 实现「保留表情显示样式」；网关侧 uploadImageMsgInfo 把
+    // 它写进 bizType / extData.subType（群聊）或 NotOnlineImagePbReserve（私聊）。
+    //
+    // summary 一并发：它是 QQ 客户端对这条消息的文本占位（[动画表情]），
+    // 不发的话部分版本会回落到 [图片]。
+    segments.push({
+      type: 'image',
+      data: {
+        file: 'base64://' + image.buffer.toString('base64'),
+        sub_type: 1,
+        summary: '[动画表情]'
+      }
+    });
     const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg';
     const params = kind === 'private' ? { user_id: Number(id), message: segments } : { group_id: Number(id), message: segments };
     const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
@@ -2261,8 +2228,9 @@ async function main() {
   // 修改 QQ 账号里的收藏表情备注（modify_custom_face），并同步本地 desc。
   async function setStickerRemarkV2(stickerId, remark) {
     const synced = await syncStickerLibrary(false);
-    const entry = findSticker(synced?.entries ?? stickerEntries, stickerId);
-    if (!entry) throw new Error(`找不到表情 ${stickerId}，请先用 qq_list_stickers 获取有效 id`);
+    const resolved = resolveSticker(synced?.entries ?? stickerEntries, stickerId);
+    if (!resolved.entry) throw new Error(resolved.error || `找不到表情 ${stickerId}`);
+    const entry = resolved.entry;
     const cleanRemark = String(remark ?? '').trim().slice(0, 50);
     const response = await bot.request('modify_custom_face', { emoji_id: entry.id, desc: cleanRemark });
     if (!response || response.status !== 'ok' || response.retcode !== 0) {
@@ -2326,290 +2294,6 @@ async function main() {
     return { emojiId, entry: entry || null, remark: cleanRemark };
   }
 
-  function saveSlangStore() {
-    if (!slangStoreWritable) {
-      log('⚠️ 黑话库处于只读降级状态（启动时加载失败），本次改动不落盘');
-      return;
-    }
-    try {
-      const result = saveSlang(SLANG_FILE, slangEntries);
-      if (result?.dropped > 0) {
-        slangEntries = result.entries;
-        log(`黑话库超过 ${SLANG_MAX_ENTRIES} 条上限，已按「已确认优先」丢弃 ${result.dropped} 条最不活跃的词条`);
-      }
-    } catch (error) { log('保存黑话库失败:', error?.message ?? error); }
-  }
-
-  function queueSlangTask(fn) {
-    slangTaskChain = slangTaskChain.then(fn).catch((error) => log('黑话学习任务异常:', error?.message ?? error));
-    return slangTaskChain;
-  }
-
-  async function ensureSlangLearnerSession() {
-    const preset = resolvePresetName(cfg.slang?.learnerPreset || cfg.agentPreset, { strict: true });
-    if (!preset) throw new Error('黑话学习缺少已验证的安全 preset，拒绝创建或复用会话');
-    const saved = readJsonSafe(SLANG_SESSION_FILE, null);
-    // 旧记录没有 preset 元数据，无法证明其权限，必须重新创建。
-    if (saved?.preset !== preset) invalidateSlangLearnerSession();
-    if (slangLearnerSessionId) {
-      learnerSessions.add(slangLearnerSessionId);
-      api.events.follow(slangLearnerSessionId);
-      return slangLearnerSessionId;
-    }
-    if (saved?.sessionId && saved.preset === preset) {
-      slangLearnerSessionId = String(saved.sessionId);
-      learnerSessions.add(slangLearnerSessionId);
-      api.events.follow(slangLearnerSessionId);
-      await ensureChatModel(slangLearnerSessionId);
-      return slangLearnerSessionId;
-    }
-    const dir = path.join(STATE_DIR, 'slang-agent');
-    fs.mkdirSync(dir, { recursive: true });
-    const wsValue = unwrap(await api.workspace.create({ path: dir }), 'slang workspace.create');
-    const workspaceTitle = cfg.slang?.workspaceTitle || 'QQ 黑话学习';
-    if (wsValue.created && workspaceTitle) {
-      try { await api.workspace.rename({ workspaceId: wsValue.workspace.workspaceId, title: workspaceTitle }); } catch {}
-    }
-    const params = { workspaceId: wsValue.workspace.workspaceId };
-    params.agentPreset = preset;
-    const value = unwrap(await api.sessions.create(params), 'slang session.create');
-    slangLearnerSessionId = value.sessionId;
-    learnerSessions.add(slangLearnerSessionId);
-    api.events.follow(slangLearnerSessionId);
-    await ensureChatModel(slangLearnerSessionId);
-    fs.mkdirSync(STATE_DIR, { recursive: true });
-    atomicWriteJson(SLANG_SESSION_FILE, { sessionId: slangLearnerSessionId, preset });
-    log(`黑话学习会话已创建：${slangLearnerSessionId}`);
-    return slangLearnerSessionId;
-  }
-
-  function invalidateSlangLearnerSession() {
-    // 如果在途任务仍在使用旧会话，先保留 learnerSessions 以便事件继续被消费；
-    // 没有等待/收集中的旧会话才从集合移除。
-    const oldId = slangLearnerSessionId;
-    slangLearnerSessionId = null;
-    if (oldId && !learnerWaiters.has(oldId) && !learnerCollectors.has(oldId)) {
-      learnerSessions.delete(oldId);
-    }
-    try { fs.unlinkSync(SLANG_SESSION_FILE); } catch {}
-  }
-
-  function waitLearnerTurn(sessionId, timeoutMs = 120000) {
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        const arr = learnerWaiters.get(sessionId) ?? [];
-        const idx = arr.findIndex((w) => w.timer === timer);
-        if (idx >= 0) arr.splice(idx, 1);
-        if (arr.length === 0) learnerWaiters.delete(sessionId);
-        reject(new Error(`等待学习会话 turn 超时(${timeoutMs}ms)`));
-      }, timeoutMs);
-      const waiter = { resolve, reject, timer };
-      const arr = learnerWaiters.get(sessionId) ?? [];
-      arr.push(waiter);
-      learnerWaiters.set(sessionId, arr);
-    });
-  }
-
-  async function runSlangExtraction(key) {
-    if (cfg.slang?.enabled === false) return;
-    if (!dshReady) return;
-    const messages = slangWindows.get(key) ?? [];
-    const min = Math.max(1, Number(cfg.slang?.extractMinMessages ?? 10));
-    if (messages.length < min) return;
-
-    let sessionId;
-    try {
-      sessionId = await ensureSlangLearnerSession();
-    } catch (error) {
-      log(`黑话学习会话创建失败 (${key}):`, error?.message ?? error);
-      return;
-    }
-
-    const promptText = buildExtractionPrompt(messages);
-    try {
-      const accepted = await api.sessions.prompt({ sessionId, mode: 'queue', content: [{ type: 'text', text: promptText }] });
-      if (!accepted.result.ok) {
-        log(`黑话提取被拒 (${key}): ${accepted.result.error.code}: ${accepted.result.error.message}`);
-        return;
-      }
-      const output = await waitLearnerTurn(sessionId);
-      const items = parseExtractionJson(output);
-      if (!items.length) {
-        log(`黑话提取：${key} 未发现候选`);
-        const win = slangWindows.get(key) ?? [];
-        slangWindows.set(key, win.slice(messages.length));
-        return;
-      }
-      let added = 0;
-      let updated = 0;
-      const researchCandidates = [];
-      const thresholds = Array.isArray(cfg.slang?.inferenceThresholds) ? cfg.slang.inferenceThresholds.map(Number).filter(Boolean) : [2, 4, 8];
-      const seenContents = new Set();
-      for (const item of items) {
-        if (seenContents.has(item.content)) continue;
-        seenContents.add(item.content);
-        const idx = Number(item.source_id) - 1;
-        const src = Number.isInteger(idx) && idx >= 0 && idx < messages.length ? messages[idx] : null;
-        const evidence = src ? [{ key, sender: src.sender, text: src.text, time: src.time }] : [];
-        const result = upsertSlangEntry(slangEntries, item.content, { evidence, countIncrement: 1 });
-        if (result.created) added += 1; else updated += 1;
-        if (result.entry && result.entry.status === SLANG_STATUS.CANDIDATE && thresholds.includes(result.entry.count) && result.entry.count > result.entry.lastInferenceCount) {
-          researchCandidates.push(result.entry);
-        }
-      }
-      const win = slangWindows.get(key) ?? [];
-      slangWindows.set(key, win.slice(messages.length));
-      saveSlangStore();
-      log(`黑话提取：${key} 新增 ${added} 条，更新 ${updated} 条`);
-      if (researchCandidates.length && cfg.slang?.autoResearch !== false) {
-        queueSlangTask(() => runSlangResearch(researchCandidates));
-      }
-    } catch (error) {
-      if (/会话|session|not found|404/i.test(String(error?.message ?? error))) {
-        invalidateSlangLearnerSession();
-      }
-      log(`黑话提取失败 (${key}):`, error?.message ?? error);
-    }
-  }
-
-  async function runSlangResearch(candidates) {
-    if (!candidates || !candidates.length) return;
-    if (cfg.slang?.enabled === false) return;
-    if (!dshReady) return;
-    // 过滤掉已经在研究队列里的候选，避免同一批被重复排队研究。
-    const targets = candidates.filter((e) => e && !slangResearchingIds.has(e.id));
-    if (!targets.length) return;
-    for (const e of targets) slangResearchingIds.add(e.id);
-    let sessionId;
-    try {
-      sessionId = await ensureSlangLearnerSession();
-    } catch (error) {
-      for (const e of targets) slangResearchingIds.delete(e.id);
-      log('黑话研究会话创建失败:', error?.message ?? error);
-      return;
-    }
-    const promptText = buildResearchPrompt(targets);
-    try {
-      const accepted = await api.sessions.prompt({ sessionId, mode: 'queue', content: [{ type: 'text', text: promptText }] });
-      if (!accepted.result.ok) {
-        log(`黑话研究被拒: ${accepted.result.error.code}: ${accepted.result.error.message}`);
-        return;
-      }
-      const output = await waitLearnerTurn(sessionId);
-      const results = parseResearchJson(output);
-      for (const r of results) {
-        const entry = slangEntries.find((e) => e.content === r.content);
-        if (!entry) continue;
-        // 只有明确确认（confirmed: true）的结果才写入解释字段；
-        // 不确定/未确认的结果保留原状，允许后续再次研究。
-        if (r.confirmed !== true) {
-          log(`黑话研究：${r.content} 未确认，保留候选待后续研究`);
-          continue;
-        }
-        if (r.meaning) entry.meaning = r.meaning;
-        if (r.usage) entry.usage = r.usage;
-        if (r.example) entry.example = r.example;
-        if (r.risk) entry.risk = r.risk;
-        if (Array.isArray(r.sources) && r.sources.length) entry.sources = r.sources.map((s) => String(s ?? '').trim()).filter(Boolean).slice(0, 10);
-        entry.lastInferenceCount = entry.count;
-        entry.updatedAt = new Date().toISOString();
-      }
-      saveSlangStore();
-      log(`黑话研究：已更新 ${results.length} 条候选解释`);
-    } catch (error) {
-      if (/会话|session|not found|404/i.test(String(error?.message ?? error))) {
-        invalidateSlangLearnerSession();
-      }
-      log('黑话研究失败:', error?.message ?? error);
-    } finally {
-      for (const e of targets) slangResearchingIds.delete(e.id);
-    }
-  }
-
-  function maybeQueueSlangExtraction(key) {
-    if (cfg.slang?.enabled === false) return;
-    if (!dshReady) return;
-    const cooldown = Number(cfg.slang?.extractCooldownMs ?? 300000);
-    const last = slangExtractionCooldowns.get(key) ?? 0;
-    if (Date.now() - last < cooldown) return;
-    const messages = slangWindows.get(key) ?? [];
-    const min = Math.max(1, Number(cfg.slang?.extractMinMessages ?? 10));
-    if (messages.length < min) return;
-    slangExtractionCooldowns.set(key, Date.now());
-    queueSlangTask(() => runSlangExtraction(key));
-  }
-
-  // 黑话学习素材入口：群聊普通消息进入滚动窗口（命令/角色控制语不学；
-  // 只学当前消息自己的文字，不学引用原文）。一代/二代共用。
-  function feedSlangWindow(key, sender, plainContent) {
-    if (cfg.slang?.enabled === false) return;
-    if (!key || !plainContent || typeof plainContent !== 'string') return;
-    const text = plainContent.trim();
-    if (!text || text.startsWith('/')) return;
-    if (/进入角色扮演|退出角色扮演|切换角色|设置角色|改角色|换角色|关闭角色扮演|开启角色扮演/.test(text)) return;
-    if (!slangWindows.has(key)) slangWindows.set(key, []);
-    const win = slangWindows.get(key);
-    win.push({ sender: String(sender || '未知'), text: truncateText(text, 200), time: Date.now() });
-    if (win.length > 80) win.splice(0, win.length - 80);
-    maybeQueueSlangExtraction(key);
-  }
-
-  // AI 提交黑话候选的限频：防止单个会话在短时间内刷大量候选。
-  function allowSlangSubmit(key) {
-    const now = Date.now();
-    const arr = (slangSubmitTimes.get(key) ?? []).filter((t) => now - t < 60 * 60 * 1000);
-    const recentMinute = arr.filter((t) => now - t < 60 * 1000).length;
-    const MAX_PER_MINUTE = 2;
-    const MAX_PER_HOUR = 10;
-    if (recentMinute >= MAX_PER_MINUTE || arr.length >= MAX_PER_HOUR) return false;
-    arr.push(now);
-    slangSubmitTimes.set(key, arr);
-    return true;
-  }
-
-  // 返回给 AI 的“公开黑话条目”（只含安全展示字段，不泄露内部字段）。
-  //
-  // 刻意**不含 evidence**：证据行的形状是 `{ key, sender, text, time }`，
-  // 其中 text 是提交该词条的那个会话里的消息片段、key 是那个会话的名字。
-  // 黑话库是全群共享的，带上 evidence 就等于让 A 群的 AI 读到 B 群的会话名和原话。
-  // 控制台要证据走 `GET /api/slang`（原始条目，含 evidence，仅控制台可达）。
-  function publicSlangEntry(e) {
-    return {
-      id: e?.id ?? '',
-      content: e?.content ?? '',
-      meaning: e?.meaning ?? '',
-      usage: e?.usage ?? '',
-      example: e?.example ?? '',
-      risk: e?.risk ?? '',
-      status: e?.status ?? SLANG_STATUS.CANDIDATE,
-      source: e?.source ?? 'ai',
-      count: Number(e?.count) || 0,
-      updatedAt: e?.updatedAt ?? ''
-    };
-  }
-
-  // 已确认黑话的公开列表（按出现次数排序，最多 injectMax 条）。
-  function confirmedSlangListV2() {
-    const max = Math.max(1, Math.min(30, Number(cfg.slang?.injectMax) || 8));
-    return slangEntries
-      .filter((e) => e.status === SLANG_STATUS.CONFIRMED && e.content && e.meaning)
-      .sort((a, b) => (Number(b.count) || 0) - (Number(a.count) || 0))
-      .slice(0, max)
-      .map(publicSlangEntry);
-  }
-
-  function withSlangContext(promptText) {
-    // 【当前时间】已移除：它每轮都变，而 user message 是最容易被缓存命中的前缀，
-    // 塞一个每秒都在变的时间进去等于每轮自废缓存。消息自带"多久前"，够模型判断
-    // 新鲜度；真需要绝对时间，用 qq_get_unread_messages 的返回。
-    const parts = [];
-    if (cfg.slang?.enabled !== false) {
-      const block = buildSlangContext(slangEntries, cfg.slang?.injectMax ?? 8);
-      if (block) parts.push(block);
-    }
-    if (!parts.length) return promptText;
-    return parts.join('\n\n') + '\n\n' + promptText;
-  }
 
   if (!cfg.allow.private.length && !cfg.allow.groups.length && cfg.allowAllWhenEmpty) {
     log('⚠️  白名单为空且 allowAllWhenEmpty=true：将转发所有私聊/群聊消息给 agent');
@@ -2625,7 +2309,6 @@ async function main() {
   if (cfg.socialV2?.voice?.allowAbsolutePath === true) {
     // 该开关曾经允许 AI 发送语音库之外的任意本机音频文件（prompt injection 可用来外发文件）。
     // 现在无论开关如何，AI 通道都只接受语音库内的文件；这里提示它已经不再放宽边界。
-    log('ℹ️  socialV2.voice.allowAbsolutePath=true 已不再放宽 AI 通道：AI 发的语音始终只允许来自语音库（库外文件请用语音工具/CLI 发送）');
   }
 
   // DSH 侧
@@ -2657,6 +2340,27 @@ async function main() {
   const collectors = new Map(); // sessionId -> turn collector
   const sendToolSucceededSessions = new Set(); // sessionId：当前 turn 内 MCP 发送类工具至少成功一次
   const v2TurnStartAt = new Map(); // sessionId -> timestamp：reserved2 turn 开始时间，用于判断是否“无行动”
+  // 共用组的「已排唤醒」登记（2026-11-13）。
+  // 键是组代表 key（sharedOwnerKeyOf）；成员排唤醒时加入，定时器触发/被取消时删除。
+  // 目的：私聊与群共用同一个 DSH 会话时，不要让两边各排一次唤醒（那会变成两个 turn）。
+  const groupHasPendingWake = new Set();
+  const groupPendingReason = new Map(); // 组代表 key -> 当前待发唤醒原因
+
+  /**
+   * 清掉「组内已排唤醒」的登记。
+   * 任何取消 pendingWakeTimer 的地方都必须调它 —— 否则那个组会被永久挡住，
+   * 之后组内所有人说话都排不出唤醒（比重复发更严重）。
+   */
+  function clearGroupPendingWake(key) {
+    try {
+      const pool = shareGroupOf(key);
+      if (pool.length <= 1) return;
+      const owner = sharedOwnerKeyOf(cfg, key);
+      const gk = canonicalV2Key(owner) || owner;
+      groupHasPendingWake.delete(gk);
+      groupPendingReason.delete(gk);
+    } catch { /* 拿不到组就忽略 */ }
+  }
   const toolCallNames = new Map(); // sessionId -> Map<callId, toolName>：用于结果日志关联工具名
   const pendingSendToolCalls = new Map(); // sessionId -> Set<callId>：等待 tool/result 的发送类调用
   // reserved2 防“忘记设置唤醒条件”：key -> 当前是否等待 AI 处理唤醒回合 / 本回合已更新唤醒配置 / 连续未设置次数
@@ -2682,12 +2386,142 @@ async function main() {
   const wakeConfigUpdatedKeys = new Set();
   const markReadCalledKeys = new Set();
   const wakeConfigMissCount = new Map();
-  const reverse = new Map(); // sessionId -> conv key
+  // qq_report_feedback 的限频时间戳：key -> [timestamp]。上限 100 条/key（见下方写回处）。
+  // ⚠️ 这行曾经缺失：forgetConversationCaches() 与反馈接口都在用它，但声明被删了，
+  //    于是每次会话退役都抛 `ReferenceError: feedbackTimes is not defined`，
+  //    retireSession 直接中断 —— 表现为旧会话退役不掉、reconcileSessionPolicies 反复重试。
+  const feedbackTimes = new Map();
+  const reverse = new Map(); // sessionId -> conv key（主 key；共用会话时是组内代表 key）
   for (const [key, sessionId] of Object.entries(state.sessions)) reverse.set(sessionId, key);
+  // 共用会话：一个 sessionId 可能同时挂在多个 QQ key 上（私聊 + 群）。
+  // reverse 只能记住一个，所以回复路由改为看「这一轮是谁投递的」——见 turnKeyQueue。
+  const keysForSession = new Map(); // sessionId -> Set<key>
+  for (const [key, sessionId] of Object.entries(state.sessions)) {
+    if (!keysForSession.has(sessionId)) keysForSession.set(sessionId, new Set());
+    keysForSession.get(sessionId).add(key);
+  }
+  // sessionId -> [key]：按投递顺序记下"第 N 个 prompt 是替哪个聊天发的"。
+  // turn 结束时 shift 掉一个，回复就发回它自己的聊天 —— 共用会话下这是唯一可靠的路由依据，
+  // 因为 reverse 在共用时是共享的，单看 sessionId 已经分不出私聊还是群。
+  const turnKeyQueue = new Map();
+  function pushTurnKey(sessionId, key) {
+    if (!sessionId || !key) return;
+    const arr = turnKeyQueue.get(sessionId) ?? [];
+    arr.push(key);
+    turnKeyQueue.set(sessionId, arr);
+  }
+  function shiftTurnKey(sessionId) {
+    const arr = turnKeyQueue.get(sessionId);
+    if (!arr || arr.length === 0) return null;
+    const key = arr.shift();
+    if (arr.length === 0) turnKeyQueue.delete(sessionId);
+    return key;
+  }
+  const turnKeyLatch = new Map(); // sessionId -> key：本轮归属锁存，turn/start 时定，turn/end 时清
+  // 黑话学习会话的三件套。黑话学习功能（slang-learner.js / qq_slang_* 工具）已下线，
+  // 但事件流分支里仍在读它们 —— 删功能时只删了定义、留下了使用处，
+  // 结果是每次收到 session/event 都抛 ReferenceError，pumpMux 整条流崩掉、3 秒循环重连
+  //（现象：AI 完全不回消息、日志刷 "事件流中断: learnerSessions is not defined"）。
+  // 保留空集合：学习会话永远不会成立（没人往里塞 id），这些分支就是纯粹的 no-op，
+  // 既不会误吞正常回合，也不会再抛。
+  const learnerSessions = new Set();
+  const learnerCollectors = new Map();
+  const learnerWaiters = new Map();
+
   // 新版 DSH 事件流需要显式 follow；启动时为已持久化的 QQ 会话补上。
   for (const sessionId of Object.values(state.sessions)) api.events.follow(sessionId);
   const sessionPromises = new Map(); // key -> create promise（防并发重复创建）
-  const promptQueues = new Map(); // key -> { queue: [], running: false }：每个 QQ 会话串行投递 DSH prompt，保证 turn 顺序
+  // 串行投递队列。**按会话串行，不是按 QQ key**：共用会话时私聊与群用的是同一条 DSH 会话，
+  // 若两个 key 各自并发投递，两轮会交错，回复必然串号。所以队列键统一取 sharedOwnerKeyOf。
+  const promptQueues = new Map(); // queueKey -> { queue: [], running: false }
+  const queueKeyOf = (key) => {
+    const owner = sharedOwnerKeyOf(cfg, key);
+    return canonicalV2Key(owner) || owner;
+  };
+  // ── 记忆归属 ─────────────────────────────────────────────────────────────
+  //
+  // 2026-11-10 操作者定稿（照这个来，别再改回按共用组）：
+  //   · **全局**（所有会话共用一份）：
+  //       memberImpression —— 对某个人的印象，按 **QQ 号** 记（不按昵称：
+  //                           同一个人换群名片/改昵称不会变成两条）。
+  //       selfNote         —— 她对自己的认识，全局就一份。
+  //       longTerm(facts)  —— 长期事实，全局一份。
+  //   · **按会话**（各聊各的，会串味）：
+  //       activeTopic      —— 这会儿在聊什么。
+  //       pendingThought   —— 想对这个人说还没说的话。
+  //
+  // 为什么不再按「共用组」算：组只解决"私聊+某个群共用"，但同一个群友可能出现在
+  // 好几个群里，按组记仍然会一人多条。按 QQ 号 + 全局存储才是真正的一份。
+  //
+  // 老数据是按 key 存的（且 sender 里有「私聊」这种非人名），
+  // 迁移脚本见 scripts/migrate-global-memory.mjs。
+
+  /** 全局记忆的存储 key（facts 库的文件名靠它）。 */
+  const GLOBAL_MEMORY_KEY = 'global';
+
+  // todo（待办）的常量必须定义在所有使用点之前 —— loadSocialV2State 在文件后面
+  // 就要用到 TODO_MAX，而 JS 的 const 有 TDZ：定义在使用之后会直接 ReferenceError。
+  /** todo 默认有效期：48 小时。一两天后还没兑现的事，基本也就不用记了。 */
+  const TODO_DEFAULT_TTL_MS = 48 * 60 * 60 * 1000;
+  /** todo 上限：待办堆太多就变成噪音，留 20 条够用。 */
+  const TODO_MAX = 20;
+
+  /**
+   * 全局记忆（长期三类 + todo）的存储。
+   *
+   * 2026-11-10 操作者定稿：
+   *   memberImpression / selfNote / longTerm 是**全局一份**，跟会话无关；
+   *   activeTopic / pendingThought 仍然按会话存（各聊各的，会串味）。
+   *
+   * 2026-11-12 新增 todo（待办）：
+   *   「明天再讲那张卡片」「六点十分提醒他拿快递」这类**一两天内要兑现**的事，
+   *   既不是长期事实（几个月后不成立），也不是 pendingThought（那是"想说没说出口的话"，
+   *   不是"要做的事"）。实测她就把它塞进 longTerm 了 —— 长期记忆被短期事项污染。
+   *
+   *   todo 也放全局：事情本身不按聊天分（私聊提到的快递，群里也该知道），
+   *   但**必须带到期时间**，到期自动消失 —— 这是它和 longTerm 的根本区别。
+   *
+   * 为什么单独一个对象而不是塞进 conversations['global']：
+   *   conversations 的每个 key 都会被当成"一个 QQ 聊天"去遍历（唤醒调度、未读队列、
+   *   定时器、token 轮换、白名单校验…），而且 getSocialV2State 只接受 `group:|private:`
+   *   格式。塞一个 'global' 进去会在十几处遍历里炸掉或产生假的"会话"。
+   *   这里照 affinities 的先例：顶层单独一块，活过「清上下文 / 重置」。
+   */
+  const globalMemory = {
+    // 只放"长期三类"里靠 social-v2.json 存的两类；facts 走独立的 jsonl 文件。
+    memberImpressions: {},
+    selfNotes: [],
+    // 待办：一两天内要兑现的事。结构见 appendMemoryV2 的 todo 分支。
+    todos: [],
+    // 下面这几个是给 appendMemoryV2 / formatMemoryV2 复用的空容器：
+    // 它们会顺手清理 activeTopics / pendingThoughts，全局存储里不该有这两类，
+    // 给空数组既能满足形状，也保证"全局永远不会有进行中话题"。
+    activeTopics: [],
+    pendingThoughts: [],
+    // 形如会话状态的最小字段：不是会话，但被当成状态对象传进通用函数时不该炸。
+    key: GLOBAL_MEMORY_KEY
+  };
+
+  /** 读写全局记忆对象（长期三类 + todo）。 */
+  const globalMemoryOf = () => globalMemory;
+
+  /** 某一类记忆该落在哪个 key 上：长期三类 + todo → 全局；短期两类 → 会话自己。 */
+  const memoryKeyFor = (category, key) => {
+    const canonical = canonicalV2Key(key) || key;
+    if (category === 'selfNote' || category === 'memberImpression'
+      || category === 'longTerm' || category === 'todo') {
+      return GLOBAL_MEMORY_KEY;
+    }
+    return canonical;
+  };
+
+  /**
+   * 长期记忆的归属 key（facts 库用）。
+   * 保留这个函数名是因为它在多处被调用（facts 注入、差集、控制台查询…），
+   * 语义统一成「长期记忆一律全局」。
+   * ⚠️ 只用于**记忆**，不能用来取会话运行时状态。
+   */
+  const memoryKeyOf = () => GLOBAL_MEMORY_KEY;
 
   // ── Token 用量账本（控制台「令牌与花费」） ───────────────────────────────
   // 权威总量取 DSH 的 tokenUsage 投影（整条会话日志累计，含桥接启动前的历史），
@@ -2697,11 +2531,8 @@ async function main() {
     file: TOKEN_USAGE_FILE,
     log: (...args) => log(...args),
     priceTable,
-    // 会话 → QQ 会话归属：学习会话单独记账，其余未知会话归入「未归属」。
+    // 会话 → QQ 会话归属：未知会话归入「未归属」。
     resolveKey: (sessionId) => reverse.get(sessionId)
-      ?? (learnerSessions.has(sessionId) || (slangLearnerSessionId && sessionId === slangLearnerSessionId)
-        ? 'internal:黑话学习'
-        : undefined)
   });
 
   /** sessionId -> 最近一次已知的实际模型。切换模型会让单价差好几倍，所以按会话记。 */
@@ -2825,6 +2656,8 @@ async function main() {
   // DSH 重启期间收到的 QQ 消息先入队（不丢），DSH 恢复后按序补投。
   let dshReady = false;
   let dshCheckStarted = false;
+  // 上次「DSH 掉线后重新跟随端口」的时刻（毫秒）。见 checkDsh 里的冷却说明。
+  let lastDshFollowAt = 0;
   let snowlumaWatchStarted = false; // SnowLuma 上游健康探测只启动一次（见 startSnowlumaWatch）
   let currentMode = 'chat'; // chat | closed-agent | reserved（仿真模式，由 DSH settings / state/mode.json 驱动）
   let lastMode = currentMode;
@@ -2834,7 +2667,9 @@ async function main() {
   let closedAgentPreset = '';
   // DSH 侧真实的 preset 清单与默认 preset：旧版本这里是硬编码的 'router-standard'，
   // 但 DSH 0.1.5 已不存在该 preset，硬编码会让 closed-agent 模式永远挂不上 preset。
-  let dshPresetIds = [];        // 当前 DSH 可用的 preset id 列表（agentPresets/list）
+  // dshPresetIds 已提升为**模块级**变量（见 presetStatus 上方的说明）：
+  // 模块级的 presetStatus() / isPresetInstalledInDsh() 要读它，声明在这里会变成
+  // 另一个作用域，运行时抛 ReferenceError。这里不再重复声明。
   let dshDefaultPreset = '';    // DSH settings `agent-presets.default`，取不到时用列表里的 isDefault
   const queued = new Map(); // key -> { promptText }[]
   const queuedHintAt = new Map(); // key -> timestamp（冷却提示）
@@ -2843,10 +2678,14 @@ async function main() {
   const queueRetries = new Map(); // key -> 连续补投失败次数（用于退避/暂停恢复）
 
   // reset 竞态导致 ensureSession 抛「会话创建期间已重置」时，把消息放回队列稍后重试。
-  // 已在队列中的相同文本不重复入队。
+  // 已在队列中的相同内容不重复入队。
+  //
+  // ⚠️ 去重键必须带 wakeReason：唤醒类投递的 promptText 是空串（渲染挪到了
+  // deliverPromptNow，见 §冷启动引导），只比文本会把"两次不同的唤醒"当成同一条。
   const enqueueForRetry = (key, promptText, opts = {}) => {
     const items = queued.get(key) ?? [];
-    if (!items.some((it) => it.promptText === promptText)) {
+    const wakeReason = String(opts.wakeReason ?? '');
+    if (!items.some((it) => it.promptText === promptText && String(it.wakeReason ?? '') === wakeReason)) {
       if (items.length >= QUEUE_MAX) {
         items.shift();
         log(`队列满（${QUEUE_MAX}），丢弃最旧消息 (${key})`);
@@ -2974,6 +2813,25 @@ async function main() {
     return mode === 'reserved2' ? (cfg.socialV2?.agentPreset || cfg.agentPreset) : cfg.agentPreset;
   }
 
+  /**
+   * 共用会话的 preset：组内**最低权限**那一档。
+   *
+   * 为什么不是"取第一个"或"取群那档"：一个 DSH 会话只能挂一个 preset，而共用组成员可能
+   * 横跨 owner（能读写本机）与 readonly（只能读）两档。取高档等于把本机交给群里任何人
+   * —— 这是 RULES.md「群里没有本地工具」的直接违反。所以宁可让 owner 也降级为 readonly：
+   * 少几个本地工具是体验问题，多给群友本地工具是安全事故。
+   */
+  function sharedPresetName(pool, mode, cfg) {
+    const explicit = String(cfg?.sessionSharing?.preset ?? '').trim();
+    if (explicit) return explicit;
+    const order = [TIER_PRESETS.READONLY, cfg.socialV2?.agentPreset || cfg.agentPreset || '', TIER_PRESETS.OWNER];
+    const wanted = new Set(pool.map((k) => wantedPresetName(k, mode, cfg)).filter(Boolean));
+    for (const candidate of order) {
+      if (candidate && wanted.has(candidate)) return candidate;
+    }
+    return [...wanted][0] ?? '';
+  }
+
   /** 当前模式/权限档位下的会话预设；返回 undefined 表示「没有可安全使用的 preset」 */
   function modePreset(key, mode, cfg) {
     const wanted = wantedPresetName(key, mode, cfg);
@@ -2996,13 +2854,142 @@ async function main() {
     return modeAllowed(key, m[1], Number(m[2]), cfg, currentMode);
   }
 
+  /**
+   * 会话共享组：返回与 key 同组的所有 QQ key（含自己）。
+   *
+   * 不开共享时恒返回 [key]，全部旧行为不变。开了共享、但这个 key 不在任何组里时同样返回 [key]。
+   * 组内成员一起决定 preset（取最低档）与记忆归属（取组内代表 key）。
+   */
+  /**
+   * 构造【会话令牌】那一行。
+   *
+   * 单会话（不共用）时输出与历史完全一致的一行；**只有共用会话**（私聊与群共用一个
+   * DSH 会话）时才按 key 逐行列出各自的令牌。
+   *
+   * 为什么必须按 key 分开写：两个 QQ 会话各有独立的 agentToken，模型用错一个就 403。
+   * 实测事故：提示词写「你已接入 私聊 x、群 y」却只给一个令牌，模型只能盲试，
+   * 于是出现「标记已读失败：agent token 无效」，还会在思考链里反复纠结哪个是对的。
+   *
+   * @param {string} key 当前唤醒的 QQ 会话 key
+   * @param {string} fallbackToken 无法取到成员状态时用的令牌（保持旧行为）
+   */
+  function sessionTokenLineV2(key, fallbackToken) {
+    const members = (() => {
+      try { return shareGroupOf(key); } catch { return [key]; }
+    })();
+    if (members.length <= 1) {
+      // 单聊天也要给 key：标签可能已经简化成「群」，光有令牌没法发言。
+      const only = members[0] ?? key;
+      const canonical = canonicalV2Key(only) || only;
+      return `【令牌】${chatLabelForV2(canonical)} → key "${canonical}"，token ${fallbackToken}`;
+    }
+    // 2026-11-10 合并成一行：原版是「群 20001 → 38721c0c…」+「调用工具时把 key 和令牌
+    // 配成一对…」共 5 行约 220 字，每轮唤醒都进历史并随每一步重发。
+    //
+    // ⚠️ key 必须显式写出来：标签简化成「群」之后，模型光看标签推不出 `group:20001`
+    // 这个要塞进 qq_send_message 的字面值。这一行给全「标签 → key → 令牌」三元组，
+    // 也顺带替代了原来的【当前场景】段和「怎么回」那段解释。
+    const lines = members.map((k) => {
+      const canonical = canonicalV2Key(k) || k;
+      const st = getSocialV2State(k);
+      return `${chatLabelForV2(canonical)} → key "${canonical}"，token ${st.agentToken}`;
+    });
+    return `【令牌】${lines.join(' ｜ ')}`;
+  }
+
+  function shareGroupOf(key) {
+    const ownerKey = sharedOwnerKeyOf(cfg, key);
+    if (ownerKey === key) {
+      const sharing = cfg?.sessionSharing;
+      const groups = sharing?.enabled === true && sharing.groups && typeof sharing.groups === 'object' ? sharing.groups : null;
+      if (!groups) return [key];
+      // key 可能本身就是组里的 leader：把它自己那一组成员收齐。
+      const canonical = canonicalV2Key(key) || key;
+      for (const [leaderRaw, memberRaw] of Object.entries(groups)) {
+        const leader = canonicalV2Key(leaderRaw) || String(leaderRaw);
+        const members = Array.isArray(memberRaw) ? memberRaw : [memberRaw];
+        const pool = [leader, ...members.map((m) => canonicalV2Key(m) || String(m))];
+        if (pool.includes(canonical)) return [...new Set(pool)];
+      }
+      return [key];
+    }
+    // key 是组里的非代表成员：整组都在同一个共享会话里。
+    const sharing = cfg?.sessionSharing;
+    const groups = sharing?.groups && typeof sharing.groups === 'object' ? sharing.groups : {};
+    const canonical = canonicalV2Key(key) || key;
+    for (const [leaderRaw, memberRaw] of Object.entries(groups)) {
+      const leader = canonicalV2Key(leaderRaw) || String(leaderRaw);
+      const members = Array.isArray(memberRaw) ? memberRaw : [memberRaw];
+      const pool = [leader, ...members.map((m) => canonicalV2Key(m) || String(m))];
+      if (pool.includes(canonical)) return [...new Set(pool)];
+    }
+    return [key];
+  }
+
   function sessionPolicy(key) {
-    return JSON.stringify([currentMode, modePreset(key, currentMode, cfg) ?? '', currentMode === 'closed-agent' ? cfg.ownerQQ : null]);
+    // 共用会话：策略必须由**整组**算出同一个值，否则成员之间会互相把对方判定成
+    // "权限已变化"，reconcileSessionPolicies 每轮都会把正在用的会话退役掉。
+    const pool = shareGroupOf(key);
+    const preset = pool.length > 1
+      ? sharedPresetName(pool, currentMode, cfg)
+      : modePreset(key, currentMode, cfg);
+    return JSON.stringify([currentMode, preset ?? '', currentMode === 'closed-agent' ? cfg.ownerQQ : null]);
   }
 
   function isCurrentSession(key, sessionId) {
     return isSessionAllowedInCurrentMode(key) && state.sessions[key] === sessionId
       && state.sessionPolicies[key] === sessionPolicy(key);
+  }
+
+  /**
+   * 这个会话（或它所在的共用组）是否已经注入过【初始提示词】。
+   *
+   * ⚠️ 2026-11-13：它**不再**是"要不要发那两句冷启动提示"的判据。
+   * 那个判据只有一个：coldStartRegistry（按 DSH sessionId，见 §冷启动引导）。
+   * bootstrapSent 现在只管一件事 —— 操作者为会话预写的初始提示词有没有注入过。
+   * 两件事分开的理由：初始提示词是"这个群是什么地方"，与上下文丢没丢无关；
+   * 而冷启动提示问的是"她脑子里还有没有东西"。把它们绑在一起时，任何一边的
+   * 漏判/重复都会污染另一边（旧实现里正是这么发重、发漏的）。
+   *
+   * 为什么按组算：`bootstrapSent` 原本是**按 QQ key 各自存**的，而共用会话下
+   * private 和 group 共用一个 DSH 会话、一套记忆、一模一样的引导词。
+   * 于是只要两个 key 的 bootstrapSent 不一致（典型：只清了私聊的上下文，
+   * 群的还是初始 false），两个 key 就会各发一次 bootstrap —— 同一段引导词
+   * 发进同一个会话里两遍。2026-11-10 实测踩过（22:52:09 与 22:52:21）。
+   *
+   * 判定用「组内任意一个 key 已发过就算发过」：宁可少发（她本来就已经在
+   * 同一个会话里被引导过了），也不要重复发（每条都是 token）。
+   */
+  function groupBootstrapSent(key) {
+    const pool = (() => {
+      try { return shareGroupOf(key); } catch { return [key]; }
+    })();
+    // 单聊（不在任何共用组）时 pool 就是 [key]，行为与旧版完全一致。
+    for (const k of pool) {
+      const st = socialV2.conversations.get(canonicalV2Key(k) || k);
+      if (st && st.bootstrapSent) return true;
+    }
+    return false;
+  }
+
+  /**
+   * 把「已发过引导」记到组内**所有** key 上。
+   *
+   * 只置当前 key 是不够的：下一个 key 第一次收到消息时又会走一遍判断，
+   * 那时组里其它 key 还是 false，于是又发一次。整组一起置才能压住重复。
+   * 组内还没建过状态的 key 也要顺手建出来（getSocialV2State 会建），
+   * 否则它之后第一次说话时仍然是 false。
+   */
+  function markGroupBootstrapSent(key) {
+    const pool = (() => {
+      try { return shareGroupOf(key); } catch { return [key]; }
+    })();
+    for (const k of pool) {
+      try {
+        const st = getSocialV2State(k);
+        if (!st.bootstrapSent) st.bootstrapSent = true;
+      } catch { /* 非法 key 忽略：不能因为组里有个坏 key 就阻断引导 */ }
+    }
   }
 
   /**
@@ -3033,7 +3020,6 @@ async function main() {
     lastSendFailed.delete(key);
     activeWaits.delete(key);
     queuedHintAt.delete(key);
-    slangSubmitTimes.delete(key);
     feedbackTimes.delete(key);
     wakeConfigMissCount.delete(key);
     wakeConfigUpdatedKeys.delete(key);
@@ -3044,6 +3030,18 @@ async function main() {
     const sessionId = state.sessions[key];
     delete state.sessions[key];
     delete state.sessionPolicies[key];
+    // 共用会话：这个 sessionId 还挂着别的 QQ key，就不能归档 —— 否则一个成员出问题
+    // 会把另一个正在用的聊天一起废掉（表现为"私聊好好的，群突然不回了"）。
+    if (sessionId && keysForSession.has(sessionId)) {
+      const members = keysForSession.get(sessionId);
+      members.delete(key);
+      if (members.size > 0) {
+        forgetConversationCaches(key);
+        log(`共用会话：${key} 退役，但 ${sessionId} 仍被 ${[...members].join(', ')} 使用，保留会话不归档`);
+        return;
+      }
+      keysForSession.delete(sessionId);
+    }
     // 按 key 记账的内存态在**有映射和无映射时都要清**：一条被移出白名单、
     // 但从未成功建过会话的 key 同样会留下限流时间戳与失败标记。
     forgetConversationCaches(key);
@@ -3075,6 +3073,15 @@ async function main() {
       st.agentToken = crypto.randomBytes(24).toString('hex');
       rememberAgentToken(key, st.agentToken);
       st.bootstrapSent = false;
+      // 共用会话：整组一起复位。只复位自己会让组里其它 key 仍然「已引导」，
+      // 而它们的会话映射已经被 retire —— 结果下一个 key 醒来时既不补发引导，
+      // 也拿不到新的引导上下文。整组复位 = 大家一起重新引导一次（本来就该如此，
+      // 因为组共用一个 DSH 会话，旧会话已经退役了）。
+      for (const memberKey of (() => { try { return shareGroupOf(key); } catch { return [key]; } })()) {
+        if (memberKey === key) continue;
+        const memberSt = socialV2.conversations.get(canonicalV2Key(memberKey) || memberKey);
+        if (memberSt) memberSt.bootstrapSent = false;
+      }
       st.modelSeenSeqs = new Set();
     }
     saveState();
@@ -3191,12 +3198,12 @@ async function main() {
           for (const key of socialV2.conversations.keys()) {
             setupSleepTimerV2(key);
             scheduleProactiveCheckV2(key);
+            setupTodoTimerV2(key);
           }
           log('桥接模式已确定为 reserved2，恢复有限睡眠定时器');
         }
         try { await flushQueue(); } catch (error) { log('补投队列异常:', error?.message ?? error); }
         // DSH 恢复后，把离线期间攒下的黑话学习窗口补触发
-        for (const key of [...slangWindows.keys()]) maybeQueueSlangExtraction(key);
       } else if (currentMode !== lastMode) {
         if (lastMode === 'reserved' && currentMode !== 'reserved') {
           cleanupSocialForModeChange();
@@ -3211,6 +3218,7 @@ async function main() {
           for (const key of socialV2.conversations.keys()) {
             setupSleepTimerV2(key);
             scheduleProactiveCheckV2(key);
+            setupTodoTimerV2(key);
           }
           log('桥接模式已进入二代仿真模式，重建有限睡眠定时器');
         }
@@ -3221,6 +3229,19 @@ async function main() {
       dshReady = false;
       log('⚠️ DSH 不可用（重启中？），QQ 消息将入队等待');
     }
+    // 这里**刻意不做**「掉线后自动重新跟随端口」。
+    //
+    // 曾经有过一段：探测到 DSH 连不上且距上次跟随超过 60 秒，就重新扫一遍端口。
+    // 后来去掉了，原因：
+    //   ① 桌面版 DSH 每次启动都换端口，而桥接的这份"掉线重探"是靠 5 秒轮询驱动的，
+    //      冷却窗口内要等、冷却外又要扫端口，行为不可预期；
+    //   ② 现在有更明确的两个时机去对齐端口 ——
+    //      · **DSH 启动时**（DSH 自己的启动流程会调 /api/dsh/follow-endpoint）；
+    //      · 使用者在小面板点「启动 SnowLuma」（也会顺带促一次对齐）。
+    //      这两个时机都是"人刚动完手"，比在后台盲猜更可靠。
+    //   ③ 真的需要手动对齐时，控制台还有现成的按钮和接口。
+    //
+    // 换句话说：端口对齐从"后台自动"改成"事件驱动"，少一份周期性副作用。
   };
   function startDshWatch() {
     if (dshCheckStarted) return;
@@ -3642,8 +3663,10 @@ async function main() {
         // 管理端专用 v2 接口：带 agent token 的请求一律拒绝，防止 MCP 工具越权访问控制台功能
         // /api/socialV2/initial-prompt 也在这里：它是操作者写给 AI 的"环境背景"，
         // 让 AI 自己读/改等于把控制台的管理输入（以及未来可能写入的其它群信息）交给会话主体。
+        // /api/socialV2/affinity 的 **POST** 同样列进来：GET 是 AI 查"跟这个人多近"（qq_affinity 要用），
+        // 但 POST 是操作者撬动关系的旋钮，绝不能让被评价的那一方自己转。
         const adminOnlyV2Paths = ['/api/socialV2/config', '/api/socialV2/activity', '/api/socialV2/reset', '/api/socialV2/states', '/api/socialV2/wake', '/api/socialV2/initial-prompt'];
-        if (req.headers['x-agent-token'] && (adminOnlyV2Paths.includes(url.pathname) || (url.pathname === '/api/socialV2/feedback' && req.method === 'GET') || (url.pathname === '/api/socialV2/tool-log' && req.method === 'GET'))) {
+        if (req.headers['x-agent-token'] && (adminOnlyV2Paths.includes(url.pathname) || (url.pathname === '/api/socialV2/feedback' && req.method === 'GET') || (url.pathname === '/api/socialV2/tool-log' && req.method === 'GET') || (url.pathname === '/api/socialV2/affinity' && req.method === 'POST'))) {
           sendJson({ ok: false, error: '该接口仅控制台可用' }, 403);
           return;
         }
@@ -3666,17 +3689,11 @@ async function main() {
             return;
           }
         }
-        // 只读降级：黑话库/表情库在启动时加载失败时，写接口必须**明确失败**。
+        // 只读降级：表情库在启动时加载失败时，写接口必须**明确失败**。
         // 旧行为是 save 函数里只打一行日志就 return，而接口照样回 {ok:true}：
         // 控制台显示"✅ 已保存"，实际只改在内存里，重启后全部消失。
         if (req.method !== 'GET') {
-          const readonlyStore = (!slangStoreWritable && (url.pathname === '/api/slang'
-            || url.pathname === '/api/slang/clear'
-            || url.pathname === '/api/slang/extract'
-            || url.pathname === '/api/slang/research'
-            || url.pathname.startsWith('/api/slang/batch-')
-            || url.pathname === '/api/socialV2/slang/submit')) ? '黑话库'
-            : (!stickerStoreWritable && (url.pathname === '/api/stickers/sync'
+          const readonlyStore = (!stickerStoreWritable && (url.pathname === '/api/stickers/sync'
               || url.pathname === '/api/stickers/note'
               || url.pathname === '/api/stickers/remark'
               || url.pathname === '/api/socialV2/sticker-note'
@@ -3719,6 +3736,17 @@ async function main() {
           sendJson({
             mode: currentMode,
             closedAgentPreset,
+            // 当前模式**配置**的 agent preset（不是某个具体会话解析后的结果 ——
+            // /api/status 是全局视角，没有会话 key，不能调 modePreset(key, ...)）。
+            //
+            // 为什么必须回这个字段：面板「诊断」页要判断「配置的 preset 装没装」，
+            // 读的就是它。之前 status 里没有该字段，那段判断永远拿不到值，
+            // 只能走兜底分支，显示成
+            //   「qq-chat preset 已装：未配置具体 preset；可用：standard, ...」
+            // —— 一条看着像警告、其实是假告警的信息（config 里明明有值）。
+            agentPreset: currentMode === 'closed-agent'
+              ? String(closedAgentPreset || dshDefaultPreset || '')
+              : String(cfg.socialV2?.agentPreset || cfg.agentPreset || ''),
             role: rs.role ?? null,
             roleMode: rs.mode ?? 'active',
             dshReady,
@@ -3802,7 +3830,7 @@ async function main() {
         if (req.method === 'POST' && url.pathname === '/api/role') {
           const body = await readBody();
           const rs = readRoleState();
-          // 入参兼容：桥接原生用 `{ role }`，dsh-thinking-zh 的设置页传的是 `{ name }`。
+          // 入参兼容：桥接原生用 `{ role }`，qq-dsh-panel 的设置页传的是 `{ name }`。
           // 历史坑：旧代码只认 `role`，那边传 { name: '傲娇助手' } 时 rawRole 是
           // undefined，于是走进下面的「清除」分支 —— 用户点「设为当前角色」实际把
           // 角色清空了，接口还回 ok:true，界面提示"已切换"，下拉框随即变空。
@@ -3981,9 +4009,11 @@ async function main() {
           try {
             sourceBackup = backupPresetFile(preset);
             atomicWriteText(presetSourceYaml(preset), nextText);
-            // 同步到 DSH 实际读取的安装目录。
-            // 注意：安装副本**不做仓库内备份**——它的内容与刚写好的源文件一致，
-            // 备份它等于把含本机绝对路径的快照塞进仓库工作区，没有额外价值。
+            // 同步到旧版安装副本（DSH 0.1.5 的 ~/.dsh/.agent-presets/<名>/）。
+            // ⚠️ DSH 0.1.7 起**完全不读这个目录**，它通常根本不存在，所以这里只是
+            // 兼容旧部署的尽力而为；真正生效的是 profile 里的 preset 行，改完**必须重启 DSH**。
+            // 安装副本**不做仓库内备份**——内容与刚写好的源文件一致，备份它等于把含
+            // 本机绝对路径的快照塞进仓库工作区，没有额外价值。
             const installed = installedPresetYaml(preset);
             if (fs.existsSync(installed)) {
               fs.copyFileSync(presetSourceYaml(preset), installed);
@@ -4001,7 +4031,10 @@ async function main() {
             ok: true,
             chars: String(body.content ?? '').length,
             warnings,
+            // 旧字段：只反映 0.1.5 的旧目录有没有同步成功。0.1.7 上它必然是 false，
+            // 别把它读成"失败"——看 installedInDsh / requiresRestart 才准。
             synced: fs.existsSync(installedPresetYaml(preset)),
+            installedInDsh: isPresetInstalledInDsh(preset),
             requiresRestart: true,
             status: presetStatus(preset),
           });
@@ -4053,261 +4086,6 @@ async function main() {
         }
 
         // ── 黑话库管理 ──────────────────────────────────────────────────────
-        if (req.method === 'GET' && url.pathname === '/api/slang') {
-          const status = url.searchParams.get('status') || '';
-          const list = status ? slangEntries.filter((e) => e.status === status) : slangEntries;
-          sendJson({ entries: list, config: cfg.slang, writable: slangStoreWritable });
-          return;
-        }
-        if (req.method === 'POST' && url.pathname === '/api/slang') {
-          const body = await readBody();
-          const content = String(body.content ?? '').trim();
-          if (!content) { sendJson({ ok: false, error: '黑话内容不能为空' }, 400); return; }
-          if (slangEntries.some((e) => e.content === content)) { sendJson({ ok: false, error: `黑话「${content}」已存在` }, 400); return; }
-          const entry = createSlangEntry({
-            content,
-            meaning: String(body.meaning ?? '').trim(),
-            usage: String(body.usage ?? '').trim(),
-            example: String(body.example ?? '').trim(),
-            risk: String(body.risk ?? '').trim(),
-            sources: Array.isArray(body.sources) ? body.sources.map(String).filter(Boolean) : [],
-            status: body.status === SLANG_STATUS.CANDIDATE ? SLANG_STATUS.CANDIDATE : SLANG_STATUS.CONFIRMED,
-            source: 'manual',
-            evidence: Array.isArray(body.evidence) ? body.evidence : []
-          });
-          slangEntries.push(entry);
-          saveSlangStore();
-          log(`控制台：新增黑话「${content}」`);
-          sendJson({ ok: true, entry });
-          return;
-        }
-        if (req.method === 'POST' && url.pathname === '/api/slang/clear') {
-          const body = await readBody();
-          const status = String(body.status ?? '').trim();
-          if (status && ![SLANG_STATUS.CANDIDATE, SLANG_STATUS.CONFIRMED, SLANG_STATUS.REJECTED].includes(status)) {
-            sendJson({ ok: false, error: `无效的 status：${status}，仅支持 candidate/confirmed/rejected 或留空全部删除` }, 400);
-            return;
-          }
-          let removedCount = 0;
-          if (status) {
-            removedCount = slangEntries.filter((e) => e.status === status).length;
-            slangEntries = slangEntries.filter((e) => e.status !== status);
-          } else {
-            removedCount = slangEntries.length;
-            slangEntries = [];
-            // 清空所有时同步清掉待提取窗口和冷却，避免“删了又回来”
-            slangWindows.clear();
-            slangExtractionCooldowns.clear();
-            slangSubmitTimes.clear();
-            slangResearchingIds.clear();
-          }
-          saveSlangStore();
-          log(`控制台：清空黑话 ${removedCount} 条${status ? `（${status}）` : ''}`);
-          sendJson({ ok: true, removedCount });
-          return;
-        }
-        if (req.method === 'POST' && url.pathname === '/api/slang/batch-delete') {
-          const body = await readBody();
-          const ids = Array.isArray(body.ids) ? body.ids.map(String).filter(Boolean) : [];
-          const status = String(body.status ?? '').trim();
-          if (ids.length) {
-            const idSet = new Set(ids);
-            const before = slangEntries.length;
-            slangEntries = slangEntries.filter((e) => !idSet.has(e.id));
-            const removedCount = before - slangEntries.length;
-            if (!removedCount) { sendJson({ ok: false, error: '没有匹配到要删除的黑话' }, 404); return; }
-            saveSlangStore();
-            log(`控制台：批量删除黑话 ${removedCount} 条`);
-            sendJson({ ok: true, removedCount });
-            return;
-          }
-          if (status && ![SLANG_STATUS.CANDIDATE, SLANG_STATUS.CONFIRMED, SLANG_STATUS.REJECTED].includes(status)) {
-            sendJson({ ok: false, error: `无效的 status：${status}` }, 400);
-            return;
-          }
-          if (!status) { sendJson({ ok: false, error: '请提供 ids 或 status' }, 400); return; }
-          const removedCount = slangEntries.filter((e) => e.status === status).length;
-          slangEntries = slangEntries.filter((e) => e.status !== status);
-          saveSlangStore();
-          log(`控制台：批量删除黑话 ${removedCount} 条（${status}）`);
-          sendJson({ ok: true, removedCount });
-          return;
-        }
-        if (req.method === 'POST' && url.pathname === '/api/slang/batch-confirm') {
-          const body = await readBody();
-          const ids = Array.isArray(body.ids) ? body.ids.map(String).filter(Boolean) : [];
-          if (!ids.length) { sendJson({ ok: false, error: '请选择要确认的黑话' }, 400); return; }
-          let confirmedCount = 0;
-          let skippedCount = 0;
-          const skipped = [];
-          for (const id of ids) {
-            const idx = slangEntries.findIndex((e) => e.id === id);
-            if (idx < 0) { skippedCount++; skipped.push({ id, reason: '不存在' }); continue; }
-            const entry = slangEntries[idx];
-            if (entry.status !== SLANG_STATUS.CANDIDATE) { skippedCount++; skipped.push({ id, content: entry.content, reason: '不是候选' }); continue; }
-            if (!entry.meaning || !String(entry.meaning).trim()) { skippedCount++; skipped.push({ id, content: entry.content, reason: '缺少含义' }); continue; }
-            entry.status = SLANG_STATUS.CONFIRMED;
-            entry.updatedAt = new Date().toISOString();
-            confirmedCount++;
-          }
-          if (confirmedCount) saveSlangStore();
-          log(`控制台：批量确认黑话 ${confirmedCount} 条，跳过 ${skippedCount} 条`);
-          sendJson({ ok: true, confirmedCount, skippedCount, skipped: skipped.slice(0, 20) });
-          return;
-        }
-        if (req.method === 'POST' && url.pathname === '/api/slang/batch-reject') {
-          const body = await readBody();
-          const ids = Array.isArray(body.ids) ? body.ids.map(String).filter(Boolean) : [];
-          if (!ids.length) { sendJson({ ok: false, error: '请选择要拒绝的黑话' }, 400); return; }
-          let rejectedCount = 0;
-          for (const id of ids) {
-            const idx = slangEntries.findIndex((e) => e.id === id);
-            if (idx < 0) continue;
-            const entry = slangEntries[idx];
-            if (entry.status === SLANG_STATUS.REJECTED) continue;
-            entry.status = SLANG_STATUS.REJECTED;
-            entry.updatedAt = new Date().toISOString();
-            rejectedCount++;
-          }
-          if (rejectedCount) saveSlangStore();
-          log(`控制台：批量拒绝黑话 ${rejectedCount} 条`);
-          sendJson({ ok: true, rejectedCount });
-          return;
-        }
-        const slangMatch = url.pathname.match(/^\/api\/slang\/([^/]+)(?:\/(confirm|reject))?$/);
-        if (req.method === 'PATCH' && slangMatch && !slangMatch[2]) {
-          const id = slangMatch[1];
-          const idx = slangEntries.findIndex((e) => e.id === id);
-          if (idx < 0) { sendJson({ ok: false, error: '黑话不存在' }, 404); return; }
-          const body = await readBody();
-          const entry = { ...slangEntries[idx] };
-          if (body.content !== undefined) entry.content = String(body.content ?? '').trim();
-          if (body.content !== undefined && slangEntries.some((e) => e.id !== id && e.content === entry.content)) {
-            sendJson({ ok: false, error: `黑话「${entry.content}」已存在` }, 400);
-            return;
-          }
-          if (body.meaning !== undefined) entry.meaning = String(body.meaning ?? '').trim();
-          if (body.usage !== undefined) entry.usage = String(body.usage ?? '').trim();
-          if (body.example !== undefined) entry.example = String(body.example ?? '').trim();
-          if (body.risk !== undefined) entry.risk = String(body.risk ?? '').trim();
-          if (body.sources !== undefined) entry.sources = Array.isArray(body.sources) ? body.sources.map(String).filter(Boolean).slice(0, 10) : [];
-          if (body.status !== undefined && [SLANG_STATUS.CANDIDATE, SLANG_STATUS.CONFIRMED, SLANG_STATUS.REJECTED].includes(body.status)) entry.status = body.status;
-          if (!entry.content) { sendJson({ ok: false, error: '黑话内容不能为空' }, 400); return; }
-          entry.updatedAt = new Date().toISOString();
-          slangEntries[idx] = entry;
-          saveSlangStore();
-          log(`控制台：更新黑话「${entry.content}」`);
-          sendJson({ ok: true, entry });
-          return;
-        }
-        if (req.method === 'POST' && slangMatch && slangMatch[2] === 'confirm') {
-          const id = slangMatch[1];
-          const idx = slangEntries.findIndex((e) => e.id === id);
-          if (idx < 0) { sendJson({ ok: false, error: '黑话不存在' }, 404); return; }
-          const body = await readBody();
-          const entry = slangEntries[idx];
-          if (body.meaning !== undefined) entry.meaning = String(body.meaning ?? '').trim();
-          if (body.usage !== undefined) entry.usage = String(body.usage ?? '').trim();
-          if (body.example !== undefined) entry.example = String(body.example ?? '').trim();
-          if (body.risk !== undefined) entry.risk = String(body.risk ?? '').trim();
-          if (body.sources !== undefined) entry.sources = Array.isArray(body.sources) ? body.sources.map(String).filter(Boolean).slice(0, 10) : [];
-          if (!entry.meaning) {
-            sendJson({ ok: false, error: '请先填写含义再确认，否则不会注入 AI 上下文' }, 400);
-            return;
-          }
-          entry.status = SLANG_STATUS.CONFIRMED;
-          entry.updatedAt = new Date().toISOString();
-          saveSlangStore();
-          log(`控制台：确认黑话「${entry.content}」`);
-          sendJson({ ok: true, entry });
-          return;
-        }
-        if (req.method === 'POST' && slangMatch && slangMatch[2] === 'reject') {
-          const id = slangMatch[1];
-          const idx = slangEntries.findIndex((e) => e.id === id);
-          if (idx < 0) { sendJson({ ok: false, error: '黑话不存在' }, 404); return; }
-          const entry = slangEntries[idx];
-          entry.status = SLANG_STATUS.REJECTED;
-          entry.updatedAt = new Date().toISOString();
-          saveSlangStore();
-          log(`控制台：拒绝黑话「${entry.content}」`);
-          sendJson({ ok: true, entry });
-          return;
-        }
-        if (req.method === 'DELETE' && slangMatch && !slangMatch[2]) {
-          const id = slangMatch[1];
-          const idx = slangEntries.findIndex((e) => e.id === id);
-          if (idx < 0) { sendJson({ ok: false, error: '黑话不存在' }, 404); return; }
-          const [removed] = slangEntries.splice(idx, 1);
-          saveSlangStore();
-          log(`控制台：删除黑话「${removed.content}」`);
-          sendJson({ ok: true, removed });
-          return;
-        }
-        if (req.method === 'POST' && url.pathname === '/api/slang/extract') {
-          if (cfg.slang?.enabled === false) { sendJson({ ok: false, error: '黑话学习已关闭（slang.enabled=false）' }, 400); return; }
-          const body = await readBody();
-          const key = String(body.key ?? '').trim();
-          if (key && slangWindows.has(key)) {
-            queueSlangTask(() => runSlangExtraction(key));
-            sendJson({ ok: true, key });
-          } else {
-            const firstKey = slangWindows.keys().next().value;
-            if (!firstKey) { sendJson({ ok: false, error: '当前没有可学习消息窗口' }, 400); return; }
-            queueSlangTask(() => runSlangExtraction(firstKey));
-            sendJson({ ok: true, key: firstKey });
-          }
-          return;
-        }
-        if (req.method === 'POST' && url.pathname === '/api/slang/research') {
-          if (cfg.slang?.enabled === false) { sendJson({ ok: false, error: '黑话学习已关闭（slang.enabled=false）' }, 400); return; }
-          const body = await readBody();
-          const ids = Array.isArray(body.ids) ? body.ids.map(String) : [];
-          const candidates = ids.length
-            ? slangEntries.filter((e) => ids.includes(e.id) && e.status === SLANG_STATUS.CANDIDATE)
-            : slangEntries.filter((e) => e.status === SLANG_STATUS.CANDIDATE);
-          if (!candidates.length) { sendJson({ ok: false, error: '没有可研究的候选黑话' }, 400); return; }
-          queueSlangTask(() => runSlangResearch(candidates));
-          sendJson({ ok: true, count: candidates.length });
-          return;
-        }
-        if (req.method === 'POST' && url.pathname === '/api/slang/config') {
-          const body = await readBody();
-          const oldPreset = cfg.slang?.learnerPreset;
-          const oldWorkspaceTitle = cfg.slang?.workspaceTitle;
-          const configFile = path.join(ROOT, 'config.json');
-          const file = readConfigObject(configFile);
-          const merged = { ...(file.slang ?? {}), ...body };
-          if (typeof merged.enabled === 'boolean') merged.enabled = merged.enabled;
-          else if (merged.enabled !== undefined) merged.enabled = merged.enabled === true;
-          if (merged.extractMinMessages !== undefined) merged.extractMinMessages = Math.max(1, Math.round(Number(merged.extractMinMessages) || 1));
-          if (merged.extractCooldownMs !== undefined) merged.extractCooldownMs = Math.max(0, Math.round(Number(merged.extractCooldownMs) || 0));
-          if (merged.injectMax !== undefined) merged.injectMax = Math.min(30, Math.max(1, Math.round(Number(merged.injectMax) || 1)));
-          if (merged.autoResearch !== undefined) merged.autoResearch = merged.autoResearch === true;
-          if (merged.learnerPreset !== undefined) merged.learnerPreset = String(merged.learnerPreset ?? '').trim();
-          if (merged.workspaceTitle !== undefined) merged.workspaceTitle = String(merged.workspaceTitle ?? '').trim() || 'QQ 黑话学习';
-          if (body.inferenceThresholds !== undefined) {
-            const raw = Array.isArray(body.inferenceThresholds)
-              ? body.inferenceThresholds
-              : String(body.inferenceThresholds).split(/[,，\s]+/);
-            merged.inferenceThresholds = [...new Set(raw.map((n) => Math.max(1, Math.round(Number(n) || 1))))].sort((a, b) => a - b);
-            if (!merged.inferenceThresholds.length) merged.inferenceThresholds = [2, 4, 8];
-          }
-          file.slang = merged;
-          atomicWriteJson(configFile, file);
-          cfg.slang = { ...cfg.slang, ...merged };
-          if (body.learnerPreset !== undefined && String(body.learnerPreset ?? '').trim() !== String(oldPreset ?? '')) {
-            invalidateSlangLearnerSession();
-            log('黑话学习 preset 已变更，已重置学习会话');
-          } else if (body.workspaceTitle !== undefined && String(body.workspaceTitle ?? '').trim() !== String(oldWorkspaceTitle ?? '')) {
-            invalidateSlangLearnerSession();
-            log('黑话学习工作区名已变更，已重置学习会话');
-          }
-          log('控制台：黑话系统配置已更新');
-          sendJson({ ok: true, config: cfg.slang });
-          return;
-        }
-        // ── 会话查看 ──────────────────────────────────────────────────────────
         if (req.method === 'GET' && url.pathname === '/api/sessions') {
           const list = [];
           for (const [key, sessionId] of Object.entries(state.sessions)) {
@@ -4698,7 +4476,7 @@ async function main() {
           let tokenLine = '';
           if (isV2) {
             const stV2 = getSocialV2State(key);
-            tokenLine = `【会话令牌】${stV2.agentToken}（调用二代状态/发送工具时请在参数中带上此令牌）\n\n`;
+            tokenLine = `${sessionTokenLineV2(key, stV2.agentToken)}\n\n`;
           }
           const promptText = `${roleLine}${tokenLine}【后台控制端提醒】（来自控制台/管理端，不是群友消息）\n${message}\n\n这是后台给你的引导或提醒，请据此调整你的行为。绝对不要复述、转发或原样发送这条后台提醒，也不要发送其中的会话令牌；它只用于你内部调整行为。${isV2 ? '当前是二代仿真模式：你的文本输出不会自动发送到 QQ；如果需要在群里发言，请使用发送工具（qq_send_message / qq_reply）。如果不需要发言，可以 qq_mark_read 或 qq_set_wake_config 收尾。' : '如果不需要在群里发言，请不要输出会发到 QQ 的内容。'}`;
           let sessionId = null;
@@ -4744,7 +4522,7 @@ async function main() {
           // `current.xxx ?? 默认` 的兜底全部落空，并把只剩本次提交字段的段落盘。最危险的一处是工具开关
           // 归一化：`typeof merged.tools[k] !== 'boolean'` 时写的是 `current.tools?.[k] !== false` ——
           // current 为空 → undefined !== false → true，于是**一次控制台保存就把默认关闭的
-          // setStickerRemark / sendVoice 静默打开**（它们默认 false 是有意的：一个是风险操作，
+          // setStickerRemark 静默打开**（它们默认 false 是有意的：一个是风险操作，
           // 一个是需要先准备语音库的强表达）。cfg.socialV2 是「文件 + 默认值」深度合并后的运行时配置，
           // 用它兜底才和真正生效的设置一致（也就不会再出现"文件里没有 → 保存一次就变了"）。
           const fileV2 = (file.socialV2 && typeof file.socialV2 === 'object' && !Array.isArray(file.socialV2))
@@ -4763,7 +4541,9 @@ async function main() {
             merged.autoReplyCheckMs = Number.isFinite(n) ? Math.max(1000, Math.round(n)) : (current.autoReplyCheckMs ?? 30000);
           }
           // tools：只接受布尔开关
-          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'fact', 'sendVoice', 'sendFile'];
+          // 注意 'fact' 已移除（2026-11-10）：长期事实并入 qq_memory_append 的 longTerm 类别，
+          // 写入闸门走 'memory'。留在这里会让旧配置的 tools.fact 被重新写回。
+          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'sendFile'];
           if (body.tools && typeof body.tools === 'object') {
             merged.tools = { ...(current.tools ?? {}), ...body.tools };
             for (const k of toolFlags) {
@@ -4872,7 +4652,7 @@ async function main() {
                 merged.context[k] = Number.isFinite(n) ? Math.max(1, Math.round(n)) : current.context?.[k] ?? 20;
               }
             }
-            for (const [name, fallback, min, max] of [['wakeMessageLimit', 12, 1, 100], ['wakeRecentLimit', 4, 0, 20], ['wakeMaxChars', 6000, 500, 20000]]) {
+            for (const [name, fallback, min, max] of [['wakeMessageLimit', 12, 1, 100], ['wakeRecentLimit', 4, 0, 20], ['wakeMaxChars', 6500, 500, 20000]]) {
               const n = Number(merged.context[name] ?? fallback);
               merged.context[name] = Number.isFinite(n) ? Math.min(max, Math.max(min, Math.round(n))) : fallback;
             }
@@ -4921,6 +4701,92 @@ async function main() {
         if (req.method === 'GET' && url.pathname === '/api/socialV2/activity') {
           sendJson({ ok: true, paused: socialV2.paused });
           return;
+        }
+        // ── 纯语音（文字 → 睦的声音）──────────────────────────────────────
+        // GET  ：读当前开关 + 推理服务是否就绪（控制台打开页面时用来画状态）
+        // POST ：切换开关。**打开时**如果推理服务没在跑，自动拉起并等它就绪。
+        //        拉起失败不阻断开关本身（仍然记住"想开"），但会把原因回给控制台，
+        //        避免出现"开关是开的、其实一直发文字"这种没人知道的静默降级。
+        // ── 纯语音（智能体通道）──────────────────────────────────────────
+        // 她能自己开关纯语音，但**只有跟主人私聊时才能开**。
+        //
+        // 身份判定不靠她传参数（2026-11-13 操作者：消息行末尾已有「（主人）」标记，
+        // 她本来就知道谁是主人），而是桥接自己看当前 key：
+        //   · private:<ownerQQ> → 就是主人，允许开
+        //   · 群里 / 其他人的私聊 → 一律拒绝
+        // 这样即使她在群里被某人要求"开语音"，也开不起来 —— 纯语音是熟人在私聊里用的东西，
+        // 不是群里谁喊一声就能触发的开关。
+        if (url.pathname === '/api/socialV2/tts' && req.headers['x-agent-token']) {
+          const body = req.method === 'POST' ? await readBody() : {};
+          const ownerQQ = String(cfg.ownerQQ ?? '');
+          // 当前会话是不是"跟主人在私聊"
+          const ownerPrivateKey = ownerQQ ? `private:${ownerQQ}` : '';
+          const keyRaw = String(body.key ?? url.searchParams.get('key') ?? '').trim();
+          const talkingToOwner = ownerPrivateKey && canonicalV2Key(keyRaw) === ownerPrivateKey;
+
+          if (req.method === 'POST') {
+            const want = body.enabled === true;
+            // 2026-11-13：**开关都只有主人能动**（原来只有"开"校验，"关"谁都可以）。
+            // 对齐预设里的「只有主人能开关」——操作者选择严格一致，不接受"谁都能关"。
+            // 想恢复"谁都能关"：把条件改回 `if (want && !talkingToOwner)`。
+            if (!talkingToOwner) {
+              sendJson({ ok: false, error: '只有主人能开关纯语音', enabled: socialV2.tts?.enabled === true }, 403);
+              return;
+            }
+            const cur = normalizeTtsConfig(socialV2.tts ?? {});
+            let started = false;
+            let ready = await ttsServerReady(cur.baseUrl);
+            let detail = ready ? '已在运行' : '';
+            if (want && !ready) {
+              const r = await ensureTtsServer(cur, { log, logFile: path.join(STATE_DIR, 'tts-server.log') });
+              started = r.started;
+              ready = r.ready;
+              detail = r.detail;
+            }
+            socialV2.tts = { ...cur, enabled: want };
+            saveSocialV2State();
+            log(`[tts] 智能体切换纯语音：${want ? '开' : '关'}（key=${keyRaw}，服务${ready ? '就绪' : '未就绪'}）`);
+            appendActivity(`[tts] 智能体切换纯语音 ${want ? '开启' : '关闭'}`);
+            // 只回最少的信息：她要的是一句话，不是状态面板。
+            sendJson({ ok: true, enabled: want, ready, started, detail });
+            return;
+          }
+          if (req.method === 'GET') {
+            const cur = normalizeTtsConfig(socialV2.tts ?? {});
+            sendJson({ ok: true, enabled: cur.enabled === true });
+            return;
+          }
+        }
+        if (url.pathname === '/api/socialV2/tts') {
+          if (req.method === 'GET') {
+            const cur = normalizeTtsConfig(socialV2.tts ?? {});
+            const ready = await ttsServerReady(cur.baseUrl);
+            sendJson({ ok: true, enabled: cur.enabled === true, ready, baseUrl: cur.baseUrl });
+            return;
+          }
+          if (req.method === 'POST') {
+            const body = await readBody();
+            const want = body.enabled === true;
+            const cur = normalizeTtsConfig(socialV2.tts ?? {});
+            let started = false;
+            let ready = await ttsServerReady(cur.baseUrl);
+            let detail = ready ? '已在运行' : '';
+            if (want && !ready) {
+              log('[tts] 开关打开，但推理服务没在跑，尝试自动拉起…');
+              // 窗口是隐藏的，所以给它的输出留一份日志（state/tts-server.log）。
+              const r = await ensureTtsServer(cur, { log, logFile: path.join(STATE_DIR, 'tts-server.log') });
+              started = r.started;
+              ready = r.ready;
+              detail = r.detail;
+              log(`[tts] 自动拉起结果：started=${started} ready=${ready} ${detail}`);
+            }
+            socialV2.tts = { ...cur, enabled: want };
+            saveSocialV2State();
+            log(`控制台：纯语音${want ? '已开启' : '已关闭'}（推理服务${ready ? '就绪' : '未就绪'}）`);
+            appendActivity(`[tts] 纯语音${want ? '开启' : '关闭'}；服务${ready ? '就绪' : '未就绪'}${started ? '（已自动拉起）' : ''}`);
+            sendJson({ ok: true, enabled: want, ready, started, detail });
+            return;
+          }
         }
         if (req.method === 'POST' && url.pathname === '/api/socialV2/activity') {
           const body = await readBody();
@@ -5027,13 +4893,10 @@ async function main() {
             feedback: 'qq_report_feedback',
             getMyRecent: 'qq_get_my_recent_messages',
             getMessageDetail: 'qq_get_message_detail',
-            getActiveMembers: 'qq_get_active_members',
+            getActiveMembers: 'qq_get_userid',
             setWakeConfig: 'qq_set_wake_config',
             markRead: 'qq_mark_read',
-            memory: 'qq_memory_append / qq_memory_query / qq_memory_remove / qq_memory_clear',
-            fact: 'qq_fact_add（长期事实，每轮注入）',
-            slangQuery: 'qq_slang_query',
-            slangSubmit: 'qq_slang_submit',
+            memory: 'qq_memory_append / qq_memory_query / qq_memory_remove / qq_memory_clear（长期记忆用 qq_memory_append 的 longTerm 类别）',
             getImages: 'qq_get_message_images',
             getForwardMsg: 'qq_get_forward_msg',
             sendPoke: 'qq_send_poke',
@@ -5043,7 +4906,6 @@ async function main() {
             setStickerRemark: 'qq_set_sticker_remark',
             stickerNote: 'qq_sticker_note',
             collectSticker: 'qq_collect_sticker',
-            sendVoice: 'qq_send_voice / qq_list_voices',
             // 发文件：只有 Owner 档（管理员私聊）真能调通，见 /api/socialV2/send-file 的档位闸门。
             sendFile: 'qq_send_file（仅管理员私聊）'
           };
@@ -5080,26 +4942,29 @@ async function main() {
             recentCount: st.recentMessages.length,
             currentWakeConfig: st.wakeConfig,
             wakeSafety: computeWakeSafetyV2(st.wakeConfig),
-            memory: formatMemoryV2(st),
+            // 记忆：长期三类 + todo 在全局，短期两类在本会话。
+            // 2026-11-12 修：这里原来传的是 `st`（当前会话对象），
+            // 而 selfNote / memberImpression / todo 现在都存在 globalMemory 里，
+            // 于是 qq_get_prompt 返回的 memory 永远是空的 —— 预设却写着
+            // 「记忆会随 qq_get_prompt 出现」，两边对不上。
+            // 现在按归属分开取，和 /api/socialV2/memory 的口径一致。
+            memory: formatMemoryV2({
+              activeTopics: st.activeTopics,
+              pendingThoughts: st.pendingThoughts,
+              memberImpressions: getSocialV2State(GLOBAL_MEMORY_KEY).memberImpressions,
+              selfNotes: getSocialV2State(GLOBAL_MEMORY_KEY).selfNotes,
+              todos: getSocialV2State(GLOBAL_MEMORY_KEY).todos,
+            }, key),
             participation: formatParticipationV2(st),
-            slang: {
-              enabled: cfg.slang?.enabled !== false,
-              entries: confirmedSlangListV2(),
-              block: buildSlangContext(slangEntries, cfg.slang?.injectMax ?? 8)
-            },
             stickers: {
               enabled: cfg.socialV2?.sticker?.enabled !== false,
               total: stickerEntries.length,
               context: cfg.socialV2?.sticker?.includeInPrompt !== false ? buildStickerContext(stickerEntries, cfg.socialV2?.sticker?.promptMaxStickers ?? 8) : '',
               strategy: cfg.socialV2?.sticker?.includeInPrompt !== false ? buildStickerStrategyHint() : ''
             },
-            // 语音库摘要：让 AI 一开始就知道有哪些语音可发（真发之前用 qq_list_voices 看详情）。
             voices: cfg.socialV2?.voice?.enabled === false ? { enabled: false } : {
               enabled: true,
-              total: voiceLibrary().length,
-              names: voiceLibrary().slice(0, 12).map((v) => v.name),
               maxSeconds: voiceCfg().maxSeconds,
-              hint: '可用 qq_list_voices 查看语音库，再用 qq_send_voice 把其中一个当语音发出去'
             }
           });
           return;
@@ -5169,8 +5034,8 @@ async function main() {
             idleMs: Date.now() - (runSt.lastIncomingAt || 0),
             ctxTokens: currentContextTokensV2(runKey)
           };
-          // 验证/重试时不想重复烧一次「写记忆」的模型调用，就直接只测压缩本身。
-          if (body.skipSummarize === true) effective.skipSummarize = true;
+          // body.skipSummarize 已失效：压缩前不再有「记忆整理」这一步模型调用，
+          // 现在压缩只是一次 /compact。参数保留但不影响行为（老调用方不会因此报错）。
           void idleCompactV2(runKey, effective).catch((error) => log(`[compaction] 手动触发异常 ${runKey}: ${error?.message ?? error}`));
           sendJson({ ok: true, started: true, forced: !decision, key: runKey, contextTokensBefore: effective.ctxTokens });
           return;
@@ -5192,7 +5057,7 @@ async function main() {
           const parts = [];
           const idText = selfIdentityTextV2();
           if (idText) parts.push(idText.trim());
-          parts.push(`【会话令牌】${acSt.agentToken}（调用二代状态工具时请在参数中带上此令牌）`);
+          parts.push(sessionTokenLineV2(key, acSt.agentToken));
           if (acStickerCfg.enabled !== false && acStickerCfg.includeInPrompt !== false) {
             const stickerText = buildStickerContext(stickerEntries, acStickerCfg.promptMaxStickers ?? 8);
             if (stickerText) parts.push(stickerText);
@@ -5362,12 +5227,70 @@ async function main() {
             return;
           }
           const st = getSocialV2State(key);
+          // 2026-11-10 增量语义：**只返回还没展示给模型的那些**。
+          //
+          // 原来的现象：唤醒包已经内联了最近 12 条未读，模型紧接着调 get_unread，
+          // 又拿回同一批消息的完整 JSON（实测 466 条返回里有 235 条是唤醒包刚给过的），
+          // 单次最长 5359 字符，全会话白烧约 43k token。
+          //
+          // 判定口径复用 modelSeenSeqs —— 它就是"已经出现在模型上下文里"的回执集合，
+          // 唤醒包投递成功后会把这批 seq 记进去（见 sendWakePromptV2 里的 noteModelMessagesV2）。
+          //
+          // 水位安全性：readThroughSeqV2 只在 `seen.has(seq)` 时才放行水位，
+          // 而被这里过滤掉的消息**本来就在 seen 里**，该推的水位照样推得上去；
+          // 真正没看过的消息依然不在 seen 里，水位不会越过它们。
+          //
+          // 兜底：includeSeen=1 强制返回全部（排查用）。想重看某条已展示过的消息应该用
+          // qq_get_recent_messages / qq_get_message_detail，不要靠这个工具翻旧账。
+          const includeSeen = url.searchParams.get('includeSeen') === '1';
+          const seenSet = st.modelSeenSeqs instanceof Set ? st.modelSeenSeqs : new Set(st.modelSeenSeqs || []);
+          const pool = includeSeen ? st.unread : st.unread.filter((m) => !seenSet.has(m.seq));
+          const skippedSeen = st.unread.length - pool.length;
           // Preserve the old tail read by default; cursor paging lets a backlog
           // larger than one response be read completely, even outside recent.
-          const messages = afterSeq === null ? st.unread.slice(-limit)
-            : st.unread.filter((m) => Number.isSafeInteger(m.seq) && m.seq > afterSeq).slice(0, limit);
+          const messages = afterSeq === null ? pool.slice(-limit)
+            : pool.filter((m) => Number.isSafeInteger(m.seq) && m.seq > afterSeq).slice(0, limit);
           const readThroughSeq = req.headers['x-agent-token'] ? noteModelMessagesV2(st, messages) : readThroughSeqV2(st);
-          sendJson({ ok: true, key, unreadCount: st.unread.length, messages, readThroughSeq });
+          // 全部已在上下文里时给一句明确的话：否则模型看到 unreadCount>0 却拿到空数组，会反复重试。
+          const allSeenHint = messages.length === 0 && skippedSeen > 0
+            ? '剩下的未读都已经在【本轮消息】里了；不用再读，直接收尾即可。'
+            : undefined;
+          // 2026-11-11：返回**纯文本行**，与【本轮消息】同一套渲染（renderOneMessageLine）。
+          // 原来返回原始消息对象数组，单条约 190 字符；同样信息一行约 60 字符。
+          // 实测一次 15 条的积压：2850 字符 → 约 950 字符。
+          //
+          // 为什么不再返回结构化 messages：模型读它只是为了知道「谁、何时、说了什么」，
+          // 不需要 isOwner/ownerLabel/media[].subType 这些字段名；而它们会逐字进历史、
+          // 之后每一步都随上下文重发一遍。需要结构化字段的场景（看图要 messageId、
+          // 查转发要 forwardIds）已经内联进文本行（`图id=` / `转发id=`）。
+          //
+          // 兼容：includeRaw=1 返回旧的 messages 数组（排查/外部脚本用，模型用不到）。
+          const wantRaw = url.searchParams.get('includeRaw') === '1';
+          const now = Date.now();
+          const label = chatLabelForV2(key);
+          const lines = messages.map((m) => renderOneMessageLine(compactModelMessage(m, { now }), { label }));
+          // 2026-11-12：首行把「总数 / 已给过 / 本次新增」三个数字讲清楚。
+          // 之前只写「1 条（另有 2 条已在【本轮消息】里）」，而 unreadCount 字段是 3，
+          // 模型看到 3 却只读到 1 条会以为工具漏了，于是反复重读。
+          const totalUnread = (st.unread || []).length;
+          const head = messages.length
+            ? `【未读】本次给你 ${messages.length} 条新的`
+              + (skippedSeen > 0
+                ? `（未读总数 ${totalUnread} 条，另外 ${skippedSeen} 条之前已在【本轮消息】里给过、不重复给），`
+                : `（未读总数 ${totalUnread} 条），`)
+              + `读到 #${readThroughSeq}`
+            : skippedSeen > 0
+              ? `【未读】本次没有新内容 —— 未读总数 ${totalUnread} 条，但全部 ${skippedSeen} 条都已经在【本轮消息】里给过你了，不用再读，直接收尾即可，读到 #${readThroughSeq}`
+              : `【未读】没有未读消息，读到 #${readThroughSeq}`;
+          const text = [head, ...lines].join('\n');
+          sendJson({
+            ok: true, key, unreadCount: st.unread.length, readThroughSeq,
+            // 文本行是主输出；模型直接读它。
+            text,
+            ...(skippedSeen > 0 ? { skippedSeen } : {}),
+            ...(allSeenHint ? { hint: allSeenHint } : {}),
+            ...(wantRaw ? { messages } : {})
+          });
           return;
         }
         if (req.method === 'GET' && url.pathname === '/api/socialV2/recent') {
@@ -5383,7 +5306,19 @@ async function main() {
           const end = Math.max(0, st.recentMessages.length - offset);
           const messages = st.recentMessages.slice(start, end);
           const readThroughSeq = req.headers['x-agent-token'] ? noteModelMessagesV2(st, messages) : readThroughSeqV2(st);
-          sendJson({ ok: true, key, messages, readThroughSeq });
+          // 2026-11-12：和 /api/socialV2/unread 保持同一种返回格式 —— 纯文本行。
+          //
+          // 原来直接回 messages 数组，每条 20 个字段（messageId / quoteTargetIsSelf /
+          // isOwner / media / forwardIds / hasForward / kind / tail …），limit=20 时
+          // 单次能到 6000+ 字符，其中绝大多数字段她从来不看。
+          // unread 早就是文本行了（"[群] #seq 谁·多久前：内容"），这里跟着改，两边一致。
+          const now = Date.now();
+          const label = chatLabelForV2(key);
+          const lines = messages.map((m) => renderOneMessageLine(compactModelMessage(m, { now }), { label }));
+          const head = messages.length
+            ? `【最近 ${messages.length} 条】`
+            : '（这个会话还没有消息）';
+          sendJson({ ok: true, key, text: [head, ...lines].join('\n'), readThroughSeq });
           return;
         }
         if (req.method === 'POST' && url.pathname === '/api/socialV2/mark-read') {
@@ -5398,6 +5333,19 @@ async function main() {
           // （旧 preset 与「没有水位」的收尾调用；见 acknowledgeMessagesV2 的注释与
           // test-token-economy 的 legacy 用例）。当前 preset 会明确要求带上 readThroughSeq 水位。
           const throughSeq = requestedReadThroughSeqV2(st, body, !!req.headers['x-agent-token']);
+          // ── 收尾前观望 10 秒（2026-11-12）──────────────────────────────────
+          // 操作者方案：即使没返回新消息，也先空转 10 秒；
+          // 这期间桥接收到新消息，就把那几条给她，让她决定接不接。
+          // 没来消息就照常收尾。
+          //
+          // 放在算 uncovered 之前：等完再统计，才能把观望期间到的消息算进去。
+          // 只在"她打算收尾"时才等（有 throughSeq，或唤醒配置是潜水），
+          // 控制台的普通调用不付这个延迟。
+          if (req.headers['x-agent-token'] && !body.skipObserve) {
+            // 观望：等 10 秒看有没有新消息。来了就继续往下（下面的 uncovered
+            // 分支会把它们贴给她），不再单独回一次 —— 否则同一批消息会被写两遍。
+            await observeBeforeSleepV2(st, key, Number(cfg.socialV2?.observeBeforeSleepMs ?? 10000));
+          }
           // 如果当前已经是“潜水”唤醒配置，且还有**模型没看过**的消息，不允许用 mark_read 直接收尾，
           // 避免把没看到的消息一起标成已读。
           //
@@ -5406,19 +5354,47 @@ async function main() {
           // 等于给收尾凭空加一次工具往返 —— 私聊连续来消息时，这一来一回正好把后续消息全堵在
           // 「会话繁忙」里，用户体感就是「回得特别慢」。
           const seenSet = st.modelSeenSeqs instanceof Set ? st.modelSeenSeqs : new Set(st.modelSeenSeqs || []);
-          const uncoveredSeq = (st.unread || [])
-            .filter((m) => !seenSet.has(m.seq))
-            .reduce((mx, m) => Math.max(mx, Number(m.seq) || 0), 0);
+          const uncovered = (st.unread || []).filter((m) => !seenSet.has(m.seq));
+          const uncoveredSeq = uncovered.reduce((mx, m) => Math.max(mx, Number(m.seq) || 0), 0);
           const coverAll = Number.isSafeInteger(throughSeq) && throughSeq >= uncoveredSeq;
           if (isSleepingConfigV2(st.wakeConfig) && preSleepWaitBlockedV2(st, key) && !coverAll) {
-            const preSleepMs = preSleepWaitMsForV2(key);
-            const remaining = Math.max(0, preSleepMs - ((st.lastIncomingAt || 0) ? Date.now() - st.lastIncomingAt : 0));
-            const remainMin = Math.ceil(remaining / 60000);
+            // ── 2026-11-12：不再返回"错误"，直接把没读的消息给她 ────────────────
+            //
+            // 原来的行为是 400 + 一段错误文案，让她「自己去调 get_unread 再回来」。
+            // 两个问题：
+            //   ① 那个文案写的是「还需等待约 X 分钟」（观察窗口早已退役，纯属误导），
+            //      而 wait_for_messages 立刻返回 ⇒ 她陷入 mark_read ↔ wait 的死循环；
+            //   ② 本来就是「她没看到这几条」这么简单的事，让模型为此多跑一轮
+            //      往返、再自己拼一次请求 —— 每一步都要重发整段历史。
+            //
+            // 现在：一次调用直接把**没读的那几条**按【本轮消息】的同一套格式贴回来，
+            // 并告诉她「读完照常再 mark_read 一次就收尾了」。省掉一轮工具往返。
+            //
+            // 仍然返回 ok:false（因为它确实没标成功，不能骗它说收尾了），
+            // 但把内容放在 `text` 里，模型直接读即可。
+            const now = Date.now();
+            const label = chatLabelForV2(key);
+            const lines = uncovered.map((m) => renderOneMessageLine(compactModelMessage(m, { now }), { label }));
+            const maxSeq = uncoveredSeq;
+            const totalUnread = (st.unread || []).length;
+            const seenCount = Math.max(0, totalUnread - uncovered.length);
+            // ⚠️ 关键（2026-11-12 修重复）：**贴出去就等于她看过了**。
+            // 以前不记这一笔，于是 she 立刻再调 mark_read / set_wake_config 时，
+            // 这批消息仍被判为"没读过"，又被完整贴一遍 —— 实测连着三轮同一条消息。
+            // 记进 modelSeenSeqs 之后，下一次调用只会贴「这之后新到的」。
+            try { noteModelMessagesV2(st, uncovered); } catch { /* 记录失败不影响本次返回 */ }
+            // 2026-11-12：不再报"未读总数 / 另外 N 条已在【本轮消息】里"。
+            // 那两个数字每次调用都在变（群友在持续说话、她已经看过一部分），
+            // 既解释不清也没有决策价值 —— 她只需要知道「下面这几条是新的」。
+            const head = `【${uncovered.length} 条新消息】`;
+            const text = [head, ...lines].join('\n');
             sendJson({
               ok: false,
-              error: `还不能通过 qq_mark_read 直接回到潜水：还需等待约 ${remainMin} 分钟无新消息，或调用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成一次沉睡前观察。如果等待期间有人发新消息，请先查看返回的 newMessages；判断不需要你参与就可以直接收尾沉睡，若你参与了则需下次再等观察窗口。`,
-              preSleepWaitMs: preSleepMs,
-              preSleepWaitRemainingMs: remaining
+              error: `还有 ${uncovered.length} 条没读，已经贴在下面了。`,
+              text,
+              uncoveredCount: uncovered.length,
+              uncoveredSeq: maxSeq,
+              suggestedThroughSeq: maxSeq
             }, 400);
             return;
           }
@@ -5431,11 +5407,38 @@ async function main() {
           }
           ensureWakeableV2(st, { key });
           st.wakeConfig.confirmedAt = Date.now();
-          st.wakeConfig.confirmedBy = 'mark_read';
+          // ⚠️ 2026-11-11 修：这里原来写 confirmedBy = 'mark_read'，
+          // 而 refreshDefaultWakeConfigV2() 只刷新 confirmedBy === 'default' 的会话 ——
+          // 于是「她收尾过一次」就永久冻结了这个会话的唤醒配置，控制台的
+          // 「推荐值」（比如关掉提问唤醒）从此再也管不到它。
+          //
+          // 实测症状：操作者把控制台的"推荐提问唤醒"取消勾选，群里一个问号仍然叫醒她，
+          // 因为该会话的 triggers.question 早在某次 mark_read 时就被冻成 true 了。
+          //
+          // 语义上 mark_read 只是"我看完了"，不是"我改过唤醒配置"。所以这里**不动**
+          // confirmedBy：让它保持 'default'，继续跟随全局推荐值。
+          // 真正表示"我显式设置过"的只有 qq_set_wake_config（那边会写 'set_wake_config'）。
+          if (!st.wakeConfig.confirmedBy) st.wakeConfig.confirmedBy = 'default';
           markReadCalledKeys.add(key);
           saveSocialV2State();
           log(`[reserved2] 控制台/工具标记 ${key} 未读已读：${markedCount} 条，已确认下一次唤醒配置`);
-          sendJson({ ok: true, key, markedCount, unreadCount: st.unread.length, readThroughSeq: readThroughSeqV2(st), wakeGuaranteed: computeWakeSafetyV2(st.wakeConfig).guaranteed, wakeSafety: computeWakeSafetyV2(st.wakeConfig), wakeConfig: st.wakeConfig });
+          // 2026-11-10 瘦身：原来回显 wakeGuaranteed + wakeSafety + 完整 wakeConfig，
+          // 单次 441 字符，全会话 268 次调用累计约 118k 字符（≈66k token）。
+          // 那些字段是**常驻不变**的配置快照，模型第一次看过就够了；要查实时配置有
+          // qq_social_state / qq_set_wake_config，不必每次收尾都回放。
+          // 保留的四个字段是收尾真正会用到的：是否成功、标了几条、下一步水位、还剩多少未读。
+          // 2026-11-12 精简：只回一行纯文本。
+          // 砍掉的字段：
+          //   · key —— 她传进来的，原样返回纯噪音
+          //   · markedCount / readThroughSeq —— 那句话里已经说了数字
+          //   · unreadCount —— **没用**：还有未读时走上面的拦截分支把正文贴给她，
+          //     能走到这里的成功分支，未读一定是 0。这个字段永远说同一件事。
+          sendJson({
+            ok: true,
+            text: markedCount > 0
+              ? `✅ 收尾完成：标记 ${markedCount} 条已读，读到 #${readThroughSeqV2(st)}。`
+              : `✅ 收尾完成：读到 #${readThroughSeqV2(st)}（没有新的要标记）。`
+          });
           return;
         }
         if (req.method === 'POST' && url.pathname === '/api/socialV2/wake-config') {
@@ -5545,16 +5548,46 @@ async function main() {
               return;
             }
           }
-          // 沉睡前强制观察窗口：除非对方明确结束、或已经安静/等待足够时间，否则不允许 AI 聊两句就设置潜水。
+          // ── 设置潜水前观望 10 秒（2026-11-12）────────────────────────────
+          // 操作者方案：这一步也空转 10 秒。如果这期间来了新消息，
+          // 就**退回 mark_read 那一步** —— 把那几条贴给她，让她看完再决定：
+          // 要么回话（回到 mark_read 循环），要么明确放弃（抬高 throughSeq）。
+          //
+          // 这样"收尾前还有人在说话"就变成同一个回合内的事，
+          // 不会像回复窗口那样每句话触发一次独立唤醒。
+          if (req.headers['x-agent-token'] && !body.skipObserve && isSleepingConfigV2(next)) {
+            // 观望 10 秒。来了新消息就交给下面的 uncovered 分支统一贴出，
+            // 不在这里单独回一次 —— 否则同一批消息会被写两遍。
+            await observeBeforeSleepV2(st, key, Number(cfg.socialV2?.observeBeforeSleepMs ?? 10000));
+          }
+          // ── 沉睡前拦截（2026-11-12：改成"直接贴出没读的消息"）──────────────
+          // 与 mark_read 用同一个 preSleepWaitBlockedV2，判定只有三条：
+          //   ① preSleepWaitEnabled !== false ② 最近没有结束语 ③ st.unread 里有没展示的
+          // 只要 ③ 成立就拦。**没有任何时间条件**（观察窗口已退役）。
+          //
+          // 原来返回 400 + 「还需等待约 X 分钟」的文案：那个数字是假的，
+          // 而 wait_for_messages 立刻返回 ⇒ 模型只会白转一圈再撞同一面墙。
+          // 现在直接把没读的几条贴出来，读完即可重新设置。
           if (isSleepingConfigV2(next) && preSleepWaitBlockedV2(st, key)) {
-            const preSleepMs = preSleepWaitMsForV2(key);
-            const remaining = Math.max(0, preSleepMs - ((st.lastIncomingAt || 0) ? Date.now() - st.lastIncomingAt : 0));
-            const remainMin = Math.ceil(remaining / 60000);
+            const seenSet = st.modelSeenSeqs instanceof Set ? st.modelSeenSeqs : new Set(st.modelSeenSeqs || []);
+            const uncovered = (st.unread || []).filter((m) => !seenSet.has(m.seq));
+            const uncoveredSeq = uncovered.reduce((mx, m) => Math.max(mx, Number(m.seq) || 0), 0);
+            const now = Date.now();
+            const label = chatLabelForV2(key);
+            const lines = uncovered.map((m) => renderOneMessageLine(compactModelMessage(m, { now }), { label }));
+            const totalUnread = (st.unread || []).length;
+            const seenCount = Math.max(0, totalUnread - uncovered.length);
+            // 同上：贴出即视为看过，避免下一次调用重复贴同一批。
+            try { noteModelMessagesV2(st, uncovered); } catch { /* ignore */ }
+            // 同上：不报总数之类的动态数字，只说「下面这几条是新的」。
+            const head = `【${uncovered.length} 条新消息】`;
             sendJson({
               ok: false,
-              error: `还不能立刻设置潜水/下一次唤醒：还需等待约 ${remainMin} 分钟无新消息，或调用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成一次沉睡前观察。如果等待期间有人发新消息，请先查看返回的 newMessages；判断不需要你参与就可以直接设置并沉睡，若你参与了则需下次再等观察窗口。`,
-              preSleepWaitMs: preSleepMs,
-              preSleepWaitRemainingMs: remaining
+              error: `还没设置潜水：下面这 ${uncovered.length} 条你还没读过，已经直接贴给你了。`,
+              text: [head, ...lines].join('\n'),
+              uncoveredCount: uncovered.length,
+              uncoveredSeq,
+              suggestedThroughSeq: uncoveredSeq
             }, 400);
             return;
           }
@@ -5577,10 +5610,31 @@ async function main() {
             clearTimeout(st.pendingWakeTimer);
             st.pendingWakeTimer = null;
           }
+          clearGroupPendingWake(key);
           cancelReplyCheckV2(key); // AI 已主动设置新的唤醒配置，取消回复检查
           setupSleepTimerV2(key);
           log(`[reserved2] 更新唤醒配置 ${key}: mode=${next.mode} infinite=${next.infinite} sleepUntil=${next.sleepUntil ?? 'null'}`);
-          sendJson({ ok: true, key, markedCount, unreadCount: st.unread.length, readThroughSeq: readThroughSeqV2(st), wakeConfig: next, wakeSafety: computeWakeSafetyV2(next) });
+          // 2026-11-12 精简：成功回执只给一行纯文本。
+          //   · key / ok —— 她自己传的、成功时恒定 true，纯噪音
+          //   · markedCount / readThroughSeq —— 下面那句话里已经说了
+          //   · unreadCount —— **没用**：还有未读时根本走不到这个分支
+          //     （上面的拦截分支会把正文直接贴给她），能走到这里就一定是 0
+          // 她只需要知道"收尾成功了 + 现在是什么唤醒状态"。
+          const modeText = next.infinite ? '无限期潜水' : '有限期潜水';
+          const tr = next.triggers || {};
+          const onOff = (v) => (v ? '✓' : '✗');
+          const kwText = Array.isArray(tr.keywords) && tr.keywords.length
+            ? `[${tr.keywords.join('/')}]`
+            : '[无]';
+          const probPct = Math.round((Number(tr.probability) || 0) * 100);
+          const wakeSummary = `@${onOff(tr.atMention)} 名字${onOff(tr.nameMention)} 关键词${kwText} `
+            + `拍一拍${onOff(tr.poke)} 概率${probPct}%`
+            + (Array.isArray(tr.speakerIds) && tr.speakerIds.length ? ` 只等${tr.speakerIds.length}人` : '');
+          sendJson({
+            ok: true,
+            text: `✅ 收尾完成：标记 ${markedCount} 条已读，${modeText}，读到 #${readThroughSeqV2(st)}。`
+              + `\n当前唤醒：${wakeSummary}`
+          });
           return;
         }
         if (req.method === 'GET' && url.pathname === '/api/socialV2/states') {
@@ -5618,11 +5672,15 @@ async function main() {
             clearTimeout(st.pendingWakeTimer);
             st.pendingWakeTimer = null;
           }
-          // 第一次唤醒必须走 bootstrap：那条 prompt 里带着「二代协议说明 + 操作者为这个会话
-          // 预写的初始提示词（群环境/氛围）」。若用手动唤醒的 admin 文案顶掉它，这个会话就
-          // 永远拿不到引导 —— 而 bootstrapSent 一旦置真，后续再也不会补发。
-          const firstWake = !st.bootstrapSent;
-          if (firstWake) st.bootstrapSent = true;
+          clearGroupPendingWake(key);
+          // 第一次唤醒必须走 bootstrap：只有 bootstrap 那条 prompt 会带上操作者为这个会话
+          // 预写的初始提示词（群环境/氛围，见 formatInitialPromptV2）。若用手动唤醒的
+          // admin 文案顶掉它，这个会话就永远拿不到那段背景了。
+          //
+          // ⚠️ 这跟"要不要给冷启动那两句提示"**无关** —— 那个只看 coldStartRegistry。
+          // 这里保留组级判定只是因为初始提示词同样"整组只该注入一次"。
+          const firstWake = !groupBootstrapSent(key);
+          if (firstWake) markGroupBootstrapSent(key);
           const effectiveReason = firstWake ? 'bootstrap' : reason;
           saveSocialV2State();
           // 和其它唤醒入口保持一致：sendWakePromptV2 是异步的，这里不 await（不能让 HTTP 回复
@@ -5781,6 +5839,7 @@ async function main() {
             }
             // 先预占发送额度，避免并发绕过限频
             for (let i = 0; i < messages.length; i++) st.sendTimes.push(now);
+            noteSendCallV2(st, now);  // 节流按"调用"记账，不按条数
             if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
             const delays = computeGapsV2(messages, 'auto', undefined, undefined, sendCfg);
             const sentMessages = await sendMessagesV2(key, messages, delays);
@@ -5789,13 +5848,14 @@ async function main() {
             st.lastActionAt = now;
             st.wakeConfig.noActionCount = 0;
             saveSocialV2State();
+            // 发送后空转：代替"节流拦截"，只让这次调用慢一点，不产生额外回合。
+            if (sentMessages.length > 0) await paceAfterSendV2(st, Date.now());
             log(`[reserved2] 工具分条发送 ${key}: 成功 ${sentMessages.length}/${messages.length} 条`);
             appendActivity(`${key} [reserved2] 工具分条发送：成功 ${sentMessages.length}/${messages.length} 条`);
             if (sentMessages.length > 0) scheduleReplyCheckV2(key);
-            const burstHint = messages.length >= 3 ? '你已经连发了多条，确认是必要的吗？真人很少一口气补完。' : undefined;
             const spaceWarn = findCjkSpaceWarning(messages);
             const splitWarn = findSplitBoundaryWarning(messages);
-            sendJson({ ok: true, key, sent: sentMessages.length, failed: messages.length - sentMessages.length, ...(burstHint ? { hint: burstHint } : {}), ...(spaceWarn ? { warn: spaceWarn } : {}), ...(splitWarn ? { splitWarn } : {}) });
+            sendJson({ ok: true, key, sent: sentMessages.length, failed: messages.length - sentMessages.length, ...(spaceWarn ? { warn: spaceWarn } : {}), ...(splitWarn ? { splitWarn } : {}) });
           } catch (error) {
             if (error?.sent?.length) {
               recordSentMessagesV2(key, error.sent);
@@ -5912,8 +5972,10 @@ async function main() {
             sendJson({ ok: false, error: '发送频率超限，请稍后再试' }, 429);
             return;
           }
+
           // 先预占发送额度，避免并发绕过限频
           for (let i = 0; i < messages.length; i++) st.sendTimes.push(now);
+          noteSendCallV2(st, now);  // 节流按"调用"记账，不按条数
           if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
           let quotedInfo = null;
           let actualReplyToMessageId = replyToMessageId;
@@ -5939,13 +6001,14 @@ async function main() {
             st.lastActionAt = now;
             st.wakeConfig.noActionCount = 0;
             saveSocialV2State();
+            // 发送后空转：代替"节流拦截"，只让这次调用慢一点，不产生额外回合。
+            if (sentMessages.length > 0) await paceAfterSendV2(st, Date.now());
             log(`[reserved2] 工具统一发送 ${key}: 成功 ${sentMessages.length}/${messages.length} 条`);
             appendActivity(`${key} [reserved2] 工具统一发送：成功 ${sentMessages.length}/${messages.length} 条`);
             if (sentMessages.length > 0) scheduleReplyCheckV2(key);
-            const burstHint = messages.length >= 3 ? '你已经连发了多条，确认是必要的吗？真人很少一口气补完。' : undefined;
             const spaceWarn = findCjkSpaceWarning(messages);
             const splitWarn = findSplitBoundaryWarning(messages);
-            sendJson({ ok: true, key, sent: sentMessages.length, failed: messages.length - sentMessages.length, delays, quoted: quotedInfo, ...(burstHint ? { hint: burstHint } : {}), ...(spaceWarn ? { warn: spaceWarn } : {}), ...(splitWarn ? { splitWarn } : {}) });
+            sendJson({ ok: true, key, sent: sentMessages.length, failed: messages.length - sentMessages.length, delays, quoted: quotedInfo, ...(spaceWarn ? { warn: spaceWarn } : {}), ...(splitWarn ? { splitWarn } : {}) });
           } catch (error) {
             if (error?.sent?.length) {
               recordSentMessagesV2(key, error.sent);
@@ -6008,7 +6071,9 @@ async function main() {
             sendJson({ ok: false, error: '发送频率超限，请稍后再试' }, 429);
             return;
           }
+
           st.sendTimes.push(now);
+          noteSendCallV2(st, now);  // 节流按"调用"记账，不按条数
           if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
           // 成员校验是异步的（要问 OneBot）；期间操作者可能切模式/改白名单/开静默。
           // 拍一拍此前完全没有发送守卫，这里补上：真正发之前再确认一次。
@@ -6058,7 +6123,13 @@ async function main() {
             saveSocialV2State();
             log(`[reserved2] 工具拍一拍 ${key}${kind === 'group' ? ' -> ' + targetUserId : ''}`);
             appendActivity(`${key} [reserved2] 工具拍一拍${kind === 'group' ? ' -> ' + targetUserId : ''}`);
-            sendJson({ ok: true, key, kind, targetUserId: targetUserId || String(id) });
+            // 2026-11-12 精简：原来回 {ok, key, kind, targetUserId} —— 四个字段全是回显。
+            //   ok            成功时恒 true
+            //   key           她自己传的
+            //   kind          group/private，她本来就知道自己在哪个会话
+            //   targetUserId  她自己传的（私聊时是 id）
+            // 她真正需要知道的只有一件事：拍到了没有。失败走 error 分支。
+            sendJson({ ok: true, text: kind === 'group' ? '✅ 已拍一拍。' : '✅ 已拍了拍对方。' });
           } catch (error) {
             const idx = st.sendTimes.indexOf(now);
             if (idx >= 0) st.sendTimes.splice(idx, 1);
@@ -6146,197 +6217,6 @@ async function main() {
           }
           return;
         }
-        // ── 语音发送（操作者通道：CLI / 控制台，凭 consoleToken） ──────────────
-        //
-        // 与 /api/send/* 的 agent 通道分开：操作者可能不在任何 QQ 会话里，
-        // 所以不套「会话/模式」闸门，但白名单 + 语音限流 + 文件名审计一个都不少。
-        if (req.method === 'POST' && (url.pathname === '/api/voice/send' || url.pathname === '/api/send/voice')) {
-          const body = await readBody();
-          const agentToken = String(req.headers['x-agent-token'] ?? '').trim();
-          const voice = voiceCfg();
-          // 注意：这里是**操作者通道**（CLI / 控制台面板 / 图形界面），由控制台令牌鉴权。
-          // socialV2.voice.enabled 是「AI 能不能发语音」的总闸，不该连你手动试发一起关掉——
-          // 否则"默认不启用"会变成"谁都发不了"，连放音频试一下都做不到。
-          // AI 通道的开关在 /api/socialV2/send-voice 里单独判定。
-          // /api/send/voice 是 AI 工具入口：带 agent token 时一律按 agent 规则走，
-          // 避免 AI 借用操作者通道绕过「只能发自己会话」的限制。
-          if (url.pathname === '/api/send/voice' && agentToken) {
-            sendJson({
-              ok: false,
-              error: 'AI 请改用 /api/socialV2/send-voice（带 key + token）'
-            }, 403);
-            return;
-          }
-          const key = String(body.target ?? body.key ?? '').trim();
-          const parsedTarget = parseTargetKey(key);
-          if (!parsedTarget) { sendJson({ ok: false, error: 'target 格式应为 group:群号 或 private:QQ号' }, 400); return; }
-          if (!modeAllowed(key, parsedTarget.kind, Number(parsedTarget.id), cfg, currentMode)) {
-            const a = cfg.allow ?? {};
-            sendJson({
-              ok: false,
-              error: `目标 ${key} 不在白名单内（config.json allow.groups / allow.private：群 ${(a.groups ?? []).join(', ') || '空'}；私聊 ${(a.private ?? []).join(', ') || '空'}）`
-            }, 403);
-            return;
-          }
-          let resolved;
-          try {
-            resolved = resolveVoicePathForOperator(body.file ?? body.path ?? '');
-          } catch (error) {
-            sendJson({ ok: false, error: error?.message ?? String(error) }, 400);
-            return;
-          }
-          // 音量参数先校验（写错了当场告诉你，不要等到发的时候才炸）
-          try {
-            resolveAudioProcessing({
-              volume: body.volume ?? voice.defaultVolume,
-              normalize: body.normalize === true,
-              loudness: body.loudness ?? voice.loudness
-            });
-          } catch (error) {
-            sendJson({ ok: false, error: error.message }, 400);
-            return;
-          }
-          const probe = await inspectAudio(resolved.path, { maxBytes: voice.maxBytes, maxSeconds: voice.maxSeconds });
-          if (!probe.ok) { sendJson({ ok: false, error: probe.error }, 400); return; }
-          const preview = {
-            key,
-            file: resolved.path,
-            via: resolved.via,
-            bytes: probe.size,
-            duration: probe.duration,
-            codec: probe.codec,
-            detail: describeAudio(probe),
-            warnings: probe.warnings ?? [],
-            limits: { maxSeconds: voice.maxSeconds, maxBytes: voice.maxBytes, maxPerMinute: voice.maxPerMinute, maxPerHour: voice.maxPerHour }
-          };
-          if (body.dryRun === true) { sendJson({ ok: true, dryRun: true, ...preview }); return; }
-          const now = Date.now();
-          try {
-            voiceBudgetCheck('operator:cli', voice);
-            const sent = await sendVoiceV2(key, resolved.path, {
-              guard: false,
-              audit: true,
-              audio: {
-                volume: body.volume ?? voice.defaultVolume,
-                normalize: body.normalize === true,
-                loudness: body.loudness ?? voice.loudness
-              }
-            });
-            voiceBudgetCommit('operator:cli', now);
-            log(`[voice] (操作者) ${key} 已发送语音 ${path.basename(resolved.path)} (${sent.detail}${sent.audioMode === 'original' ? '' : '，' + sent.audioProcessing}, messageId=${sent.messageId ?? '?'})`);
-            appendActivity(`${key} [voice] (操作者) 发送语音 ${path.basename(resolved.path)} (${sent.detail})`);
-            // CLI 默认要落地校验（--verify 之外也能给出可信证据）；readback 仅在做"收到的语音"实验时用。
-            const verification = body.verify === false ? null : await verifyVoiceMessageSent(sent.messageId);
-            let readbackText = null;
-            if (body.readback === true && sent.messageId) {
-              try {
-                const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
-                const res = await fetch(`${httpUrl}/fetch_ptt_text`, {
-                  method: 'POST',
-                  headers: {
-                    'content-type': 'application/json',
-                    ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {})
-                  },
-                  body: JSON.stringify({ message_id: String(sent.messageId) }),
-                  signal: AbortSignal.timeout(30000)
-                });
-                const rb = await res.json().catch(() => ({}));
-                if (res.ok && rb.status === 'ok' && rb.retcode === 0) readbackText = rb.data?.text ?? '';
-              } catch (error) {
-                log(`[voice] 转写回读失败：${error?.message ?? error}`);
-              }
-            }
-            sendJson({
-              ok: true,
-              ...preview,
-              messageId: sent.messageId,
-              verified: verification?.confirmed === true,
-              readback: readbackText,
-              audioProcessing: sent.audioProcessing,
-              volume: sent.volume,
-              loudness: sent.loudness
-            });
-          } catch (error) {
-            sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
-          }
-          return;
-        }
-
-        // ── 语音发送（AI 通道：reserved2 + agent token，只能发自己那个会话） ────
-        if (req.method === 'POST' && url.pathname === '/api/socialV2/send-voice') {
-          const body = await readBody();
-          const token = String(body.token ?? req.headers['x-agent-token'] ?? '').trim();
-          const key = String(body.key ?? body.target ?? '').trim();
-          const voice = voiceCfg();
-          if (!voice.enabled) { sendJson({ ok: false, error: '语音功能已关闭' }, 403); return; }
-          if (!key) { sendJson({ ok: false, error: 'key 不能为空（格式 group:群号 或 private:QQ号）' }, 400); return; }
-          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
-          if (!token) { sendJson({ ok: false, error: 'reserved2 模式发送必须携带 agent token' }, 403); return; }
-          if (!agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
-          if (!v2ToolEnabled('sendVoice')) { sendJson({ ok: false, error: '工具未启用：qq_send_voice' }, 403); return; }
-          if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (shouldBlockSilentReply(key)) { sendJson({ ok: false, error: '静默模式已开启，当前不允许发送' }, 403); return; }
-          const keyMatch = /^(group|private):(\d+)$/.exec(key);
-          if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
-          const kind = keyMatch[1];
-          const id = Number(keyMatch[2]);
-          if (!Number.isFinite(id) || id <= 0 || !modeAllowed(key, kind, id, cfg, currentMode)) {
-            sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403);
-            return;
-          }
-          // 只要名字（解析）不要内容（预览）：dry-run 也必须经过与真发相同的解析与校验。
-          let resolved;
-          try {
-            resolved = resolveVoicePathForV2(body.voice ?? body.file ?? '');
-          } catch (error) {
-            sendJson({ ok: false, error: error?.message ?? String(error) }, 400);
-            return;
-          }
-          try {
-            voiceBudgetCheck(key, voice);
-            if (body.dryRun === true) {
-              const probe = await inspectAudio(resolved.path, { maxBytes: voice.maxBytes, maxSeconds: voice.maxSeconds });
-              if (!probe.ok) { sendJson({ ok: false, error: probe.error }, 400); return; }
-              sendJson({ ok: true, dryRun: true, key, file: resolved.path, detail: describeAudio(probe) });
-              return;
-            }
-            const sent = await sendVoiceForV2(key, body.voice ?? body.file, {
-              label: body.label ? String(body.label).slice(0, 100) : '',
-              verify: body.verify,
-              readback: body.readback === true,
-              // AI 也可以调音量（默认走 config 的 defaultVolume）
-              audio: (body.volume !== undefined || body.normalize === true || body.loudness !== undefined)
-                ? { volume: body.volume, normalize: body.normalize === true, loudness: body.loudness }
-                : null
-            });
-            sendJson({
-              ok: true,
-              key,
-              messageId: sent.messageId,
-              file: path.basename(sent.file),
-              detail: sent.detail,
-              audioProcessing: sent.audioProcessing,
-              // verified=true 表示已用 get_msg 回读到这条消息的 record 段（"真的发出去了"的硬证据）
-              verified: sent.verification?.confirmed === true,
-              readback: sent.readback,
-              warnings: sent.warnings
-            });
-          } catch (error) {
-            // 额度只在真正发出后才记账（voiceBudgetCommit），所以失败路径无需回滚。
-            sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
-          }
-          return;
-        }
-
-        // ── 发文件（AI 通道：**仅 Owner 档** = private:<ownerQQ>） ──────────────
-        //
-        // 三档分级里最危险的一个工具，闸门必须在这里、而且必须是**档位**判定：
-        //   · 群聊（group:*）与白名单会话一律 403 —— 即使只读档能看文件，也绝不允许外发；
-        //   · ownerQQ 未配置时没人能发（fail-closed）；
-        //   · 路径/类型/体积由 src/send-file-lib.js 把关：敏感路径（凭据、密钥、桥接 state、
-        //     系统目录）与可执行/脚本/配置类文件一律拒绝。
-        // 为什么不做成"按会话隐藏 MCP 工具"：MCP 工具是**进程级注册**的，schema 对所有
-        // 会话可见，桥接无法按会话裁剪；所以唯一的真闸门就是这里。
         if (req.method === 'POST' && url.pathname === '/api/socialV2/send-file') {
           const body = await readBody();
           const token = String(body.token ?? req.headers['x-agent-token'] ?? '').trim();
@@ -6516,54 +6396,9 @@ async function main() {
           return;
         }
         // 语音库列表。两条通道共用：
-        //   - 带 agent token（AI 的 qq_list_voices）→ 必须带 key，校验会话白名单/工具开关；
+        //   - 带 agent token（AI 通道）→ 必须带 key，校验会话白名单/工具开关；
         //   - 不带 agent token（控制台调试面板 / CLI）→ 只需控制台令牌，不需要 key。
         // 返回一律只有文件名/大小/时长，**不含绝对路径**（AI 侧防路径外泄，控制台侧由试发接口解析）。
-        if (req.method === 'GET' && (url.pathname === '/api/socialV2/voices' || url.pathname === '/api/voice/list')) {
-          const key = String(url.searchParams.get('key') ?? '').trim();
-          const voice = voiceCfg();
-          const agentCall = Boolean(req.headers['x-agent-token']);
-          // 与发送接口同样的分层：voice.enabled 只关 AI 通道；操作者（控制台面板）仍可列语音库。
-          if (agentCall && !voice.enabled) { sendJson({ ok: false, error: '语音功能已关闭' }, 403); return; }
-          if (agentCall && !key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
-          if (agentCall && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
-          if (agentCall && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (agentCall && !v2ToolEnabled('sendVoice')) { sendJson({ ok: false, error: '工具未启用：qq_send_voice' }, 403); return; }
-          const wantProbe = url.searchParams.get('probe') !== '0';
-          try {
-            const files = listAudioFiles(voice.dir);
-            const items = [];
-            for (const f of files.slice(0, 100)) {
-              const entry = { name: path.relative(voice.dir, f).split(path.sep).join('/') };
-              if (wantProbe) {
-                const info = await inspectAudio(f, { maxBytes: voice.maxBytes, maxSeconds: voice.maxSeconds });
-                entry.ok = info.ok;
-                entry.bytes = info.size;
-                entry.detail = info.ok ? describeAudio(info) : null;
-                entry.seconds = info.duration ?? null;
-                if (!info.ok) entry.error = info.error;
-              }
-              items.push(entry);
-            }
-            sendJson({
-              ok: true,
-              key: key || null,
-              dir: agentCall ? undefined : voice.dir,
-              count: items.length,
-              voices: items,
-              limits: { maxSeconds: voice.maxSeconds, maxBytes: voice.maxBytes, maxPerMinute: voice.maxPerMinute, maxPerHour: voice.maxPerHour },
-              // ⚠️ 提示语里也不能出现绝对路径：AI 通道下同样要脱敏（dir 字段已经抑制了，
-              // 但这里的模板字符串曾无条件插值 voice.dir —— 等于从旁边的字段又漏出去一次）。
-              hint: items.length
-                ? '用 qq_send_voice 传 name 即可把其中一个当语音发出去'
-                : (agentCall ? '语音库为空：请让管理员先把音频放进语音库' : `语音库为空：把音频文件放进 ${voice.dir} 后重试`)
-            });
-          } catch (error) {
-            sendJson({ ok: false, error: `读取语音库失败：${error?.message ?? error}` }, 500);
-          }
-          return;
-        }
-
         if (req.method === 'GET' && url.pathname === '/api/socialV2/sticker-list') {
           if (!stickerEnabled()) { sendJson({ ok: false, error: '表情包体系已关闭' }, 403); return; }
           const key = String(url.searchParams.get('key') ?? '').trim();
@@ -6581,7 +6416,7 @@ async function main() {
           try {
             const synced = await syncStickerLibrary(force);
             const list = formatStickerList(synced?.entries ?? stickerEntries, query, count);
-            sendJson({ ok: true, key, ...list, syncedAt: synced?.syncedAt ?? stickerSyncedAt, fromCache: synced?.fromCache ?? false });
+            sendJson({ ok: true, key, ...list, text: renderStickerListText({ ...list, query }), syncedAt: synced?.syncedAt ?? stickerSyncedAt, fromCache: synced?.fromCache ?? false });
           } catch (error) {
             sendJson({ ok: false, error: `获取表情列表失败：${error?.message ?? error}` }, 500);
           }
@@ -6608,7 +6443,7 @@ async function main() {
           try {
             const synced = await syncStickerLibrary(force);
             const list = formatStickerList(synced?.entries ?? stickerEntries, query, count);
-            sendJson({ ok: true, key, ...list, syncedAt: synced?.syncedAt ?? stickerSyncedAt, fromCache: synced?.fromCache ?? false });
+            sendJson({ ok: true, key, ...list, text: renderStickerListText({ ...list, query }), syncedAt: synced?.syncedAt ?? stickerSyncedAt, fromCache: synced?.fromCache ?? false });
           } catch (error) {
             sendJson({ ok: false, error: `获取表情列表失败：${error?.message ?? error}` }, 500);
           }
@@ -6763,20 +6598,24 @@ async function main() {
           const maxMs = Math.max(minMs, Number(waitCfg.maxMs) || 600000);
           const timeoutMs = Math.min(maxMs, Math.max(minMs, Math.round(Number(body.timeoutMs) || defaultMs)));
           const st = getSocialV2State(key);
-          // ── 长等待不再阻塞 ────────────────────────────────────────────────
-          // 模型不该在一个 HTTP 请求里干等 30~120 秒（实测 wait 占工具总耗时的 96%）。
-          // 发消息后桥接已经挂了「回复窗口」：有指向 AI 的新消息会立刻唤醒，没有就不叫。
-          // 所以这里直接返回"没等到"，让模型立刻收尾。只有 purpose="reply" 的短静默
-          //（≤10 秒，合批用）才真的等。
-          if (!replyWait && timeoutMs > 10000) {
-            armReplyWindowV2(key);
-            sendJson({
-              ok: true, key, paused: false, arrived: false, timeout: true, passive: true, waitedMs: 0,
-              newMessages: [], readThroughSeq: readThroughSeqV2(st), unreadCount: st.unread.length,
-              hint: '长等待已改成后台盯：有指向你的新消息会立刻叫你，没有就不叫。现在直接收尾即可（qq_mark_read 或 qq_set_wake_config），不用再等。'
-            });
-            return;
-          }
+          // ── 等待的真实语义（2026-11-12 重写）─────────────────────────────
+          //
+          // 旧行为：purpose="messages" 且 timeout>10s 时**直接返回**（passive），
+          // 理由是"不该在 HTTP 里干等"。副作用是她几乎从不真正等 ——
+          // 实测 73 次调用里 40 次走这条路，等于"发一句马上接下一句"，
+          // 对方还没打完字她就回了。
+          //
+          // 现在两种 purpose 都真的等，只是等的目标不同：
+          //   · reply    —— 等对方**把话说完**（静默窗口），然后她才回；
+          //   · messages —— 等**下一条消息**（或静默窗口耗尽）。
+          // 上限仍受 timeoutMs 约束，不会无限挂起；有租约防并发。
+          //
+          // 唯一保留的"秒回"情形：timeoutMs 被传到 ≤10 秒（她自己要求短等）。
+          // ── 等待真的等（2026-11-12 重写）───────────────────────────────
+          // 旧行为：purpose="messages" 且 timeout>10s 时直接返回（passive），
+          // 副作用是她几乎从不真正等 —— 实测 73 次调用里 40 次走这条路，
+          // 等于"发一句马上接下一句"，对方还没打完字她就回了。
+          // 现在两种 purpose 都真的等，只把上限夹到 60 秒防占死 handler。
           // 同一会话只允许一个长轮询等待，避免并发挂起耗尽 HTTP handler。
           // 租约按**归一后的** key 记账：`group:0123` 与 `group:123` 是同一个会话，
           // 用原始 key 会给出两个租约槽（同一会话并发多个 5~10 分钟等待、互相踩水位）。
@@ -6806,6 +6645,7 @@ async function main() {
             clearTimeout(st.pendingWakeTimer);
             st.pendingWakeTimer = null;
           }
+          clearGroupPendingWake(key);
           cancelReplyCheckV2(key); // AI 正在主动等待，取消回复检查定时器避免重复唤醒
           // A reply wait must also include messages received while the model
           // was reading/thinking after its snapshot, before this HTTP request.
@@ -6938,42 +6778,37 @@ async function main() {
             : replyWait ? [...st.recentMessages].reverse().find((m) => m && !m.isSelf) : null;
           const lastMessageUnfinished = lastNew ? looksLikeUnfinished(String(lastNew.tail || lastNew.plain || lastNew.text || '')) : false;
           finishWait();
+          // ── 2026-11-13：整块返回压成纯文本 ──────────────────────────────
+          //
+          // 原来回 21 个字段（purpose/quiet/quietMs/suggestedQuietMs/speakerLikelyDone/
+          // timeout/waitedMs/preSleepWaitSatisfied/preSleepWaitObserved/preSleepWaitMs/
+          // preSleepWaitRemainingMs/canSleepNow/countsAsObservation/hint/…），
+          // 其中 5 个是**已退役的观察窗口**遗留，其余大多是内部状态。
+          // 她真正需要的只有三样：有没有等到、等到了什么、水位到哪。
+          //
+          // 现在与 get_unread 统一成同一套文本行，引导写进末尾。
+          const nowMs = Date.now();
+          const label = chatLabelForV2(key);
+          const lines = newMessages.map((m) => renderOneMessageLine(compactModelMessage(m, { now: nowMs }), { label }));
+          const head = newMessages.length
+            ? `【等到了 ${newMessages.length} 条】，读到 #${readThroughSeq}`
+            : `【没等到新消息】，读到 #${readThroughSeq}`;
+          const tailBits = [];
+          if (replyWait) {
+            // 回复前静默：告诉她对方大概说完了没有，决定要不要现在回。
+            tailBits.push(quiet ? '对方大概说完了，可以回。' : '对方可能还没说完。');
+            if (lastMessageUnfinished) tailBits.push('最后一句像是没说完。');
+          } else if (preSleepBlocked) {
+            tailBits.push(`还有 ${(st.unread || []).length} 条没读过，读完再收尾。`);
+          } else {
+            tailBits.push('可以直接收尾：qq_mark_read 或 qq_set_wake_config。');
+          }
+          if (pendingTruncated) tailBits.push('（更早的消息没显示完，可用 qq_get_unread_messages 继续读）');
+          const text = [head, ...lines, tailBits.join(' ')].filter(Boolean).join('\n');
           sendJson({
-            ok: true,
-            key,
-            purpose: replyWait ? 'reply' : 'messages',
-            arrived,
-            quiet,
-            quietMs,
-            suggestedQuietMs,
-            speakerLikelyDone: quiet,
-            lastMessageUnfinished,
-            timeout: replyWait ? !quiet : !arrived || (quietMs > 0 && !quiet && Date.now() - start >= timeoutMs),
-            waitedMs,
-            preSleepWaitSatisfied: preSleepSatisfiedNow,
-            preSleepWaitObserved: !replyWait && !!st.preSleepWaitObservedAt,
-            // 补发被上限截断时告诉模型「还有更老的没给」，它才知道要用 unread(afterSeq=readThroughSeq) 续读。
-            ...(pendingTruncated ? { partial: true } : {}),
-            // A reply check has no sleep countdown; showing one here suggests
-            // the model should complete sleep observation before its first reply.
-            ...(!replyWait ? { preSleepWaitMs, preSleepWaitRemainingMs: preSleepRemainingMs } : {}),
-            // ── 直接说「现在能不能收尾、该怎么收」 ────────────────────────────
-            //
-            // 为什么不能只给 preSleepWaitRemainingMs 让模型自己解读：实测它会用一次
-            // timeoutMs=90000 的等待去凑 180 秒的观察窗口（闸门根本不认），然后再补一次 180 秒，
-            // 白花一轮。这里把闸门的判断结果和**该发的参数**直接写给它，
-            // 并且**只在闸门真的放行时**才说「可以收尾」——绝不诱导它提前设置潜水
-            // （那会被桥接 400 拒绝，反而更慢）。
-            ...(!replyWait ? {
-              canSleepNow: !preSleepBlocked,
-              countsAsObservation: preSleepCountsAsObservation,
-              hint: preSleepBlocked
-                ? `还不能收尾：还有 ${(st.unread || []).length} 条未读没看过。先用快照或 qq_get_unread_messages 读完，再带 readThroughSeq 收尾。`
-                : '现在可以直接收尾：qq_mark_read(throughSeq=已读水位) 或 qq_set_wake_config(throughSeq=已读水位, config=…)。不用再等一轮。'
-            } : {}),
-            newMessages,
-            readThroughSeq,
-            unreadCount: st.unread.length
+            ok: true, key, arrived, newMessages, readThroughSeq,
+            unreadCount: st.unread.length,
+            text
           });
           return;
         }
@@ -7170,9 +7005,97 @@ async function main() {
           return;
         }
         // ── 合并转发消息查询端点（MCP qq_get_forward_msg 走这里） ────────────
+        // 单条消息完整原文：本地 social-v2.json / events 里的 text 都只存前 200 字，
+        // 长消息（剧情、长吐槽）会被截断且看不出被截断。这里直接向 QQ 重新 get_msg，
+        // 拿服务端的完整 message 段，把里面的 text 拼起来返回。
+        // 安全边界：只允许查本会话确实收到过的 messageId（recent / unread 里出现过的）。
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/message-full') {
+          const key = String(url.searchParams.get('key') ?? '').trim();
+          const messageId = String(url.searchParams.get('messageId') ?? '').trim();
+          const agentToken = String(req.headers['x-agent-token'] ?? '').trim();
+          const keyMatch = /^(group|private):(\d+)$/.exec(key);
+          if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
+          if (!messageId) { sendJson({ ok: false, error: 'messageId 不能为空' }, 400); return; }
+          if (currentMode !== 'reserved2') {
+            sendJson({ ok: false, error: '该功能仅 reserved2 模式可用' }, 403);
+            return;
+          }
+          if (!agentToken) {
+            sendJson({ ok: false, error: '必须携带 agent token' }, 403);
+            return;
+          }
+          if (!agentTokenOk(key, agentToken)) {
+            sendJson({ ok: false, error: 'agent token 无效' }, 403);
+            return;
+          }
+          if (!v2ToolEnabled('getMessageDetail')) {
+            sendJson({ ok: false, error: '工具未启用：qq_get_message_detail' }, 403);
+            return;
+          }
+          // 只允许查本会话见过的那条，防止 AI 拿任意 messageId 去探测别人的消息。
+          const stFull = getSocialV2State(key);
+          const known = [...(stFull.recentMessages || []), ...(stFull.unread || [])]
+            .some((m) => m && String(m.messageId ?? '') === messageId);
+          if (!known) {
+            sendJson({ ok: false, error: '该 messageId 不在当前会话可见范围内，拒绝读取' }, 404);
+            return;
+          }
+          try {
+            const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+            const res = await fetch(`${httpUrl}/get_msg`, {
+              method: 'POST',
+              headers: {
+                'content-type': 'application/json',
+                ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {})
+              },
+              body: JSON.stringify({ message_id: Number(messageId) }),
+              signal: AbortSignal.timeout(30000)
+            });
+            const body = await res.json().catch(() => ({}));
+            if (!res.ok || body.status !== 'ok' || body.retcode !== 0) {
+              sendJson({ ok: false, error: `QQ 拒绝读取该消息（retcode ${body.retcode ?? '?'}）` }, 502);
+              return;
+            }
+            const segments = Array.isArray(body.data?.message) ? body.data.message : [];
+            // 只取文本段；图片/语音/文件只报类型，不回传路径（避免把本机路径写进上下文）。
+            const parts = [];
+            const mediaKinds = [];
+            for (const seg of segments) {
+              const type = String(seg?.type || '');
+              if (type === 'text') {
+                const raw = seg?.data?.text;
+                if (raw) parts.push(String(raw));
+              } else if (type && !['reply', 'at'].includes(type)) {
+                mediaKinds.push(type);
+              }
+            }
+            const fullText = parts.join('');
+            sendJson({
+              ok: true,
+              key,
+              messageId,
+              length: fullText.length,
+              text: fullText,
+              ...(mediaKinds.length ? { mediaKinds } : {}),
+              note: fullText.length > 200
+                ? '这是 QQ 服务端的完整原文（本地存储只保留前 200 字）。'
+                : undefined
+            });
+          } catch (error) {
+            sendJson({ ok: false, error: `读取完整原文失败：${error?.message ?? error}` }, 502);
+          }
+          return;
+        }
+
+
         if (req.method === 'GET' && url.pathname === '/api/socialV2/forward-message') {
           const key = String(url.searchParams.get('key') ?? '').trim();
           const id = String(url.searchParams.get('id') ?? '').trim();
+          // 可选上限：让模型在默认返回被截断时能主动要全文（qq_get_forward_msg 的 full 模式）。
+          // 不传则维持上游默认（500 字 / 50 条）。
+          const reqMaxChars = Number(url.searchParams.get('maxCharsPerMessage'));
+          const reqMaxMsgs = Number(url.searchParams.get('maxMessages'));
+          const skipMedia = url.searchParams.get('skipMedia') === '1';
           const agentToken = String(req.headers['x-agent-token'] ?? '').trim();
           const keyMatch = /^(group|private):(\d+)$/.exec(key);
           if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
@@ -7210,7 +7133,10 @@ async function main() {
           }
           try {
             const data = await bot.raw('get_forward_msg', { id });
-            const formatted = formatForwardResponse(data);
+            const formatted = formatForwardResponse(data, {
+              ...(Number.isFinite(reqMaxChars) && reqMaxChars > 0 ? { maxCharsPerMessage: reqMaxChars } : {}),
+              ...(Number.isFinite(reqMaxMsgs) && reqMaxMsgs > 0 ? { maxMessages: reqMaxMsgs } : {})
+            });
             const remember = (fid) => {
               if (!fid) return;
               let set = seenForwardIds.get(key);
@@ -7255,7 +7181,38 @@ async function main() {
                 nestedPreviews.push({ id: fid, error: error?.message ?? '嵌套转发读取失败' });
               }
             }
-            sendJson({ ok: true, key, id, ...formatted, nestedPreviews });
+            // 截断提示写进返回体：模型看到的是序列化 JSON，一个布尔字段在长列表末尾
+            // 很容易被忽略，实测它会把 500 字当成全文并据此判断「对方只写了这么多」。
+            // 这里只说明事实和可选项，不强推——要不要读全文由它自己决定。
+            const hints = [];
+            if (formatted.textTruncated) {
+              hints.push('正文被截断（每条上限 ' + (Number.isFinite(reqMaxChars) && reqMaxChars > 0 ? reqMaxChars : 500) + ' 字），后面还有内容没返回。');
+            }
+            if (formatted.truncated) {
+              hints.push('共 ' + formatted.total + ' 条，本次只返回前 ' + (formatted.messages || []).length + ' 条。');
+            }
+            const truncationNote = hints.length
+              ? hints.join(' ')
+                + ' 读不读剩下那些，取决于你自己的感受：如果这段文本让你恶心、冒犯、不适，就别读了，'
+                + '没必要勉强自己把别人的东西看完。确实想读完，才传 full:true 再调一次（每条最多 2000 字）。'
+              : '';
+            // skipMedia：不返回图片元数据，省 token
+            if (skipMedia) {
+              for (const m of formatted.messages || []) { if (m && typeof m === 'object') m.media = []; }
+              for (const np of nestedPreviews || []) {
+                for (const m of (np && np.messages) || []) { if (m && typeof m === 'object') m.media = []; }
+              }
+            }
+            sendJson({
+              ok: true, key, id, ...formatted,
+              // 2026-11-11：主输出改成纯文本行（与【本轮消息】同风格）。
+              // 原来整个 JSON 里带 media[].url（单条 400~600 字符的签名长链），
+              // 40 条转发光 URL 就 2 万字符。模型只需要知道「这里有一张图」。
+              text: renderForwardText(formatted),
+              ...(truncationNote ? { truncationNote } : {}),
+              ...(skipMedia ? { mediaSkipped: true } : {}),
+              nestedPreviews
+            });
           } catch (error) {
             log(`合并转发查询失败 ${key} ${id}: ${error?.message ?? error}`);
             sendJson({ ok: false, error: `合并转发查询失败：${error?.message ?? error}` }, 500);
@@ -7283,12 +7240,48 @@ async function main() {
         }
         if (req.method === 'GET' && url.pathname === '/api/socialV2/active-members') {
           const key = String(url.searchParams.get('key') ?? '').trim();
-          const limit = Math.min(20, Math.max(1, Number(url.searchParams.get('limit')) || 10));
+          const limit = Math.min(200, Math.max(1, Number(url.searchParams.get('limit')) || 10));
+          // 2026-11-12：新增 query —— **按昵称反查 QQ 号**。
+          // 背景：消息行不再带 userId（那样每条多 18 字符），模型需要号时来这查。
+          // 不带 query 时行为不变（返回最近活跃的人），只是现在多了别名表和更大的上限。
+          const query = String(url.searchParams.get('query') ?? '').trim();
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('getActiveMembers')) { sendJson({ ok: false, error: '工具未启用：qq_get_active_members' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('getActiveMembers')) { sendJson({ ok: false, error: '工具未启用：qq_get_userid' }, 403); return; }
           const st = getSocialV2State(key);
+          // 优先用别名表（跨会话全量，包含所有见过的号）；
+          // 没有别名记录的老数据再从 recentMessages 兜底。
+          const aliasRows = (() => { try { return lookupAliasV2(query); } catch { return []; } })();
+          if (aliasRows.length) {
+            const rows = aliasRows.slice(0, limit).map((r) => ({
+              userId: r.userId,
+              name: r.primary,
+              aliases: r.names.filter((n) => n !== r.primary),
+              lastAt: r.lastAt
+            }));
+            // 纯文本一行一条（操作者指定格式 `昵称：userId:号码`）。
+            const head = query
+              ? `【查人】「${query}」命中 ${rows.length} 个`
+              : `【已知的人】${rows.length} 个`;
+            const lines = rows.map((r) => {
+              const alias = r.aliases.length ? `（也叫 ${r.aliases.join('、')}）` : '';
+              return `${r.name}：userId:${r.userId}${alias}`;
+            });
+            sendJson({
+              ok: true, key, matched: rows.length, members: rows,
+              text: [head, ...lines].join('\n')
+            });
+            return;
+          }
+          if (query) {
+            // 别名表里没有：说明是没说过话、或者历史数据还没建表的人。
+            sendJson({
+              ok: true, key, matched: 0, members: [],
+              text: `【查人】「${query}」没查到。可能他从没在这说过话；可以试试不带 query 列出全部已知的人。`
+            });
+            return;
+          }
           const map = new Map();
           for (const m of st.recentMessages) {
             if (!m || m.isSelf) continue;
@@ -7302,7 +7295,10 @@ async function main() {
             map.set(key2, cur);
           }
           const members = [...map.values()].sort((a, b) => b.count - a.count || b.lastTime - a.lastTime).slice(0, limit);
-          sendJson({ ok: true, key, members });
+          const text = members.length
+            ? ['【最近活跃】' + members.length + ' 人', ...members.map((r) => `${r.sender}：userId:${r.userId || '未知'}`)].join('\n')
+            : '【最近活跃】还没有人说过话';
+          sendJson({ ok: true, key, members, text });
           return;
         }
         // ── 群成员列表（v2 读工具；替代只有 closed-agent 才能用的旧只读工具）────────
@@ -7356,22 +7352,55 @@ async function main() {
         }
         // 群友印象查询：给控制台面板用。只读，按最近互动时间降序。
         // 不传 key 时返回所有会话；面板默认只看群聊。
-        if (req.method === 'GET' && url.pathname === '/api/socialV2/impressions') {
-          const wantKey = String(url.searchParams.get('key') ?? '').trim();
+        // 自我认知（selfNote）查询：给控制台面板用。只读。
+        // selfNote 是模型写的"我对这段关系的认识"，按时间顺序返回（旧的在前）。
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/self-notes') {
           try {
-            const keys = wantKey ? [wantKey] : [...socialV2.conversations.keys()].filter(Boolean);
+            // 2026-11-12 修：selfNote 已经迁到 globalMemory（全局一份），
+            // 但这里还在按会话遍历 conversations —— 于是 DSH 面板的「自我」页永远是空的。
+            // 现在直接读全局；key 参数保留但只作为展示用（数据不按会话分）。
+            const wantKey = String(url.searchParams.get('key') ?? '').trim();
+            const st = getSocialV2State(GLOBAL_MEMORY_KEY);
+            const list = Array.isArray(st?.selfNotes) ? st.selfNotes : [];
             const out = [];
-            for (const k of keys) {
-              const st = socialV2.conversations.get(k);
-              const mi = st?.memberImpressions;
-              if (!mi || typeof mi !== 'object') continue;
-              for (const [name, im] of Object.entries(mi)) {
+            for (const n of list) {
+              if (!n || typeof n !== 'object') continue;
+              const text = String(n.text ?? '').trim();
+              if (!text) continue;
+              out.push({
+                key: wantKey || GLOBAL_MEMORY_KEY,
+                text,
+                createdAt: Number(n.createdAt) || 0,
+                lastTouchedAt: Number(n.lastTouchedAt) || 0,
+              });
+            }
+            out.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+            sendJson({ ok: true, key: wantKey || null, total: out.length, notes: out });
+          } catch (error) {
+            sendJson({ ok: false, error: `读取自我认知失败：${error?.message ?? error}` }, 500);
+          }
+          return;
+        }
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/impressions') {
+          try {
+            // 同上：印象已经按 QQ 号存进 globalMemory，不再按会话分裂。
+            // 展示名现取自别名表（桥接每条消息都会写，是名字的唯一真相）；
+            // impression 里不再存 name 副本，避免昵称改了以后显示旧名字。
+            const wantKey = String(url.searchParams.get('key') ?? '').trim();
+            const st = getSocialV2State(GLOBAL_MEMORY_KEY);
+            const mi = st?.memberImpressions;
+            const out = [];
+            if (mi && typeof mi === 'object') {
+              for (const [uid, im] of Object.entries(mi)) {
                 if (!im || typeof im !== 'object') continue;
                 const traits = Array.isArray(im.traits) ? im.traits.filter(Boolean) : [];
                 if (!traits.length) continue;
                 out.push({
-                  key: k,
-                  name,
+                  key: wantKey || GLOBAL_MEMORY_KEY,
+                  // 展示名现取自别名表（名字的唯一真相），impression 不再存副本。
+                  // 拿不到名字才退回 QQ 号。
+                  name: String(displayNameOfV2(uid, '') || '').trim() || uid,
+                  userId: uid,
                   traits,
                   interactionCount: Number(im.interactionCount) || 0,
                   lastSeenAt: Number(im.lastSeenAt) || 0,
@@ -7385,26 +7414,74 @@ async function main() {
           }
           return;
         }
+        // 待办（2026-11-12 新增）：给 DSH 面板的「待办」页用。
+        // 和 selfNote / impressions 一样是**全局一份**，不按会话分。
+        // 只返回还没过期的 —— 过期的不该占用面板，也不该让她再看见。
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/todos') {
+          try {
+            const wantKey = String(url.searchParams.get('key') ?? '').trim();
+            const st = getSocialV2State(GLOBAL_MEMORY_KEY);
+            const list = Array.isArray(st?.todos) ? st.todos : [];
+            const now = Date.now();
+            const out = [];
+            for (const t of list) {
+              if (!t || typeof t !== 'object') continue;
+              const text = String(t.text ?? '').trim();
+              if (!text) continue;
+              if (t.expiresAt && now >= Number(t.expiresAt)) continue;
+              out.push({
+                key: wantKey || GLOBAL_MEMORY_KEY,
+                text,
+                done: t.done === true,
+                createdAt: Number(t.createdAt) || 0,
+                lastMentionAt: Number(t.lastMentionAt) || 0,
+                expiresAt: Number(t.expiresAt) || 0,
+              });
+            }
+            // 排序：没做完的在前，再按到期时间近的在前。
+            out.sort((a, b) => {
+              if (a.done !== b.done) return a.done ? 1 : -1;
+              return (a.expiresAt || 0) - (b.expiresAt || 0);
+            });
+            sendJson({ ok: true, key: wantKey || null, total: out.length, todos: out });
+          } catch (error) {
+            sendJson({ ok: false, error: `读取待办失败：${error?.message ?? error}` }, 500);
+          }
+          return;
+        }
         // 群友印象编辑：按 (key, name, traitIndex) 精确定位。
         // 面板的「编辑」用。traitIndex 是 traits 数组下标；传 -1 表示改动整个 traits 数组。
         if (req.method === 'POST' && url.pathname === '/api/socialV2/impression-update') {
           const body = await readBody();
           const key = String(body.key ?? '').trim();
-          const name = String(body.name ?? '').trim();
-          if (!key || !name) { sendJson({ ok: false, error: 'key/name 不能为空' }, 400); return; }
-          if (['__proto__', 'constructor', 'prototype'].includes(name)) { sendJson({ ok: false, error: '非法的群友名字' }, 400); return; }
+          // 2026-11-12 修：印象存在 globalMemory（全局一份），这里原来还在
+          // getSocialV2State(key) 查**某个会话**，于是面板编辑永远 404。
+          const rawName = String(body.name ?? '').trim();
+          if (!rawName) { sendJson({ ok: false, error: 'name 不能为空' }, 400); return; }
+          if (['__proto__', 'constructor', 'prototype'].includes(rawName)) { sendJson({ ok: false, error: '非法的群友名字' }, 400); return; }
           try {
-            const st = getSocialV2State(key);
-            const im = st.memberImpressions?.[name];
+            const st = getSocialV2State(GLOBAL_MEMORY_KEY);
+            if (!st.memberImpressions || typeof st.memberImpressions !== 'object') st.memberImpressions = {};
+            const mi = st.memberImpressions;
+            // 展示名 → QQ 号（键）。传 QQ 号则直接用。
+            const resolveKey = (raw) => {
+              const t = String(raw || '').trim();
+              if (!t) return null;
+              if (Object.prototype.hasOwnProperty.call(mi, t)) return t;
+              for (const uid of Object.keys(mi)) {
+                const shown = String(displayNameOfV2(uid, '') || '').trim() || uid;
+                if (shown === t) return uid;
+              }
+              return null;
+            };
+            const target = resolveKey(rawName);
+            if (!target) { sendJson({ ok: false, error: `没有这条印象：${rawName}` }, 404); return; }
+            const im = mi[target];
             if (!im || typeof im !== 'object') { sendJson({ ok: false, error: '没有这条印象' }, 404); return; }
             const traits = Array.isArray(im.traits) ? im.traits.slice() : [];
 
-            // 改名（可选）
-            const newName = body.newName !== undefined ? String(body.newName).trim() : '';
-            if (newName && newName !== name) {
-              if (['__proto__', 'constructor', 'prototype'].includes(newName)) { sendJson({ ok: false, error: '非法的群友名字' }, 400); return; }
-              if (Object.prototype.hasOwnProperty.call(st.memberImpressions, newName)) { sendJson({ ok: false, error: '该名字已存在' }, 409); return; }
-            }
+            // 不支持改名：键是 QQ 号、名字由别名表提供，改名字不属于印象编辑的职责。
+            // 只改 traits。
 
             // 改某一条 trait
             if (body.traitIndex !== undefined && body.traitIndex !== null) {
@@ -7413,7 +7490,7 @@ async function main() {
               if (!Number.isInteger(idx) || idx < 0) { sendJson({ ok: false, error: 'traitIndex 非法' }, 400); return; }
               if (idx >= traits.length) { sendJson({ ok: false, error: 'traitIndex 越界' }, 400); return; }
               if (!text) { sendJson({ ok: false, error: 'text 不能为空' }, 400); return; }
-              traits[idx] = text.slice(0, 50);   // 与 appendMemoryV2 的单条上限一致
+              traits[idx] = text.slice(0, 50);
             } else if (Array.isArray(body.traits)) {
               // 整组替换
               const next = body.traits.map((t) => String(t ?? '').trim()).filter(Boolean).slice(0, 10);
@@ -7422,17 +7499,13 @@ async function main() {
               for (const t of next) traits.push(t.slice(0, 50));
             }
 
-            st.memberImpressions[name] = {
+            mi[target] = {
               traits,
               interactionCount: Number(im.interactionCount) || 0,
               lastSeenAt: Number(im.lastSeenAt) || Date.now(),
             };
-            if (newName && newName !== name) {
-              st.memberImpressions[newName] = st.memberImpressions[name];
-              delete st.memberImpressions[name];
-            }
             saveSocialV2State();
-            sendJson({ ok: true, key, name: newName || name });
+            sendJson({ ok: true, key, name: rawName, userId: target });
           } catch (error) {
             sendJson({ ok: false, error: `编辑失败：${error?.message ?? error}` }, 500);
           }
@@ -7442,17 +7515,35 @@ async function main() {
         if (req.method === 'POST' && url.pathname === '/api/socialV2/impression-remove') {
           const body = await readBody();
           const key = String(body.key ?? '').trim();
-          const name = String(body.name ?? '').trim();
-          if (!key || !name) { sendJson({ ok: false, error: 'key/name 不能为空' }, 400); return; }
+          // 2026-11-12 修：印象已经存进 globalMemory（全局一份），但这里还在用
+          // getSocialV2State(key) 查**某个会话**，于是面板删的时候永远 404
+          // 「没有这条印象」—— 数据其实在全局那份里。
+          //
+          // name 现在可能是「展示名」或「QQ 号」（面板两种都可能传），
+          // 所以两种都认：先按展示名反查 QQ 号，找不到再当 QQ 号/键直接用。
+          const rawName = String(body.name ?? '').trim();
+          if (!rawName) { sendJson({ ok: false, error: 'name 不能为空' }, 400); return; }
           try {
-            const st = getSocialV2State(key);
-            if (!st.memberImpressions || !Object.prototype.hasOwnProperty.call(st.memberImpressions, name)) {
-              sendJson({ ok: false, error: '没有这条印象' }, 404);
+            const st = getSocialV2State(GLOBAL_MEMORY_KEY);
+            const mi = st.memberImpressions && typeof st.memberImpressions === 'object' ? st.memberImpressions : {};
+            let target = null;
+            if (Object.prototype.hasOwnProperty.call(mi, rawName)) {
+              target = rawName;
+            } else {
+              // 传的是展示名：在所有印象里找别名表解析后能对上的那个。
+              for (const uid of Object.keys(mi)) {
+                const shown = String(displayNameOfV2(uid, '') || '').trim() || uid;
+                if (shown === rawName) { target = uid; break; }
+              }
+            }
+            if (!target) {
+              sendJson({ ok: false, error: `没有这条印象：${rawName}` }, 404);
               return;
             }
-            delete st.memberImpressions[name];
+            delete mi[target];
+            st.memberImpressions = mi;
             saveSocialV2State();
-            sendJson({ ok: true, key, name });
+            sendJson({ ok: true, key, name: rawName, userId: target });
           } catch (error) {
             sendJson({ ok: false, error: `删除失败：${error?.message ?? error}` }, 500);
           }
@@ -7460,13 +7551,387 @@ async function main() {
         }
         // 长期事实（L2）查询：给控制台面板用。只读，按权重降序返回。
         // 不传 key 时返回所有会话的事实（面板要跨会话展示）。
-        if (req.method === 'GET' && url.pathname === '/api/socialV2/facts') {
+        // ── 好感度查询（MCP qq_affinity 走这里）─────────────────────────────
+        // 为什么单独给个端点，而不是塞进 qq_social_state：
+        //   唤醒包只注入一行极简状态，完整细节（互动几次、认识多久）要给的时候
+        //   才查 —— 这才是"想不起来才查"的真人模式，也避免每轮白烧 token。
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/affinity') {
           const wantKey = String(url.searchParams.get('key') ?? '').trim();
+          const wantUser = String(url.searchParams.get('userId') ?? '').trim();
+          // scope=global：控制台面板用。好感度现在是全局一份，不再需要具体会话 key。
+          // 仍然允许传 key（旧调用方/AI 工具都这么用），只是不强制。
+          const scopeGlobal = String(url.searchParams.get('scope') ?? '') === 'global';
+          if (!scopeGlobal && !canonicalV2Key(wantKey)) {
+            sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号（或传 scope=global）' }, 400);
+            return;
+          }
           try {
             const now = Date.now();
+
+            // ── 按名字反查（2026-11-13）────────────────────────────────
+            // 她常把**人名**直接当 userId 传（消息行里显示的是名字，号码只在
+            // qq_get_unread_messages 里）。以前把名字当号码查，得到"没聊过"，
+            // 她就以为不认识这个人 —— 其实是同一个人，只是键错了。
+            let wantUserResolved = wantUser;
+            if (wantUser && !/^\d{1,20}$/.test(wantUserResolved)) {
+              const aliasMap = socialV2.aliases && typeof socialV2.aliases === 'object' ? socialV2.aliases : {};
+              const norm = (s) => String(s ?? '').replace(/\s+/g, '').toLowerCase();
+              const target = norm(wantUserResolved);
+              const exact = [];
+              const partial = [];
+              for (const [uid, info] of Object.entries(aliasMap)) {
+                const names = Array.isArray(info?.names) ? info.names : [];
+                const primary = String(info?.primary ?? '');
+                const all = [...names, primary].filter(Boolean);
+                const label = primary || names[0] || uid;
+                if (all.some((n) => norm(n) === target)) { exact.push([uid, label]); continue; }
+                if (all.some((n) => norm(n).includes(target) || target.includes(norm(n)))) partial.push([uid, label]);
+              }
+              const pool = exact.length ? exact : partial;
+              if (pool.length === 1) {
+                wantUserResolved = pool[0][0];
+              } else if (pool.length > 1) {
+                // 对上多个人：把候选给她自己挑，不猜。
+                const lines2 = pool.slice(0, 6).map(([uid, nm]) => `- ${nm}：${uid}`).join('\n');
+                sendJson({
+                  ok: true, userId: null, label: wantUser,
+                  stage: 'ambiguous', stageLabel: '重名', count: 0,
+                  text: `「${wantUser}」对上好几个人，你要查哪个？\n${lines2}\n把对应的 QQ 号填进 userId 再查一次。`,
+                });
+                return;
+              }
+            }
+
+            // 好感度现在是**全局按 QQ 号**存的（socialV2.affinities），不再是每个会话一份。
+            // 这里仍然扫一遍会话，只为了**回收昵称**（名字来自 recentMessages），
+            // 分数与档位直接取全局表 —— 这样清空会话/重置上下文都不会再让关系归零。
+            // 全局模式下（控制台面板）要扫**所有**会话来找昵称，因为没有指定 key。
+            const pool = scopeGlobal ? [] : shareGroupOf(canonicalV2Key(wantKey));
+            const keysToScan = scopeGlobal
+              ? [...socialV2.conversations.keys()]
+              : (pool.length > 1 ? pool : [canonicalV2Key(wantKey)]);
+            const merged = new Map();
+            const globalAff = socialV2.affinities && typeof socialV2.affinities === 'object'
+              ? socialV2.affinities : {};
+            for (const [uid, rec] of Object.entries(globalAff)) {
+              if (!rec || !(Number(rec.count) > 0)) continue;
+              merged.set(uid, decayAffinity(rec));
+            }
+            // 兼容：万一还有一些没迁移干净的会话内旧数据，也并进来（取高的那份）。
+            // 迁移函数会在启动时处理，这里只是兜底，保证"数据不会凭空消失"。
+            for (const ck of keysToScan) {
+              let cst;
+              try { cst = getSocialV2State(ck); } catch { continue; }
+              const map = cst.affinities && typeof cst.affinities === 'object' ? cst.affinities : {};
+              for (const [uid, rec] of Object.entries(map)) {
+                if (!rec || !(Number(rec.count) > 0)) continue;
+                const decayed = decayAffinity(rec);
+                const prev = merged.get(uid);
+                if (!prev || Number(decayed.score) > Number(prev.score)) merged.set(uid, decayed);
+              }
+            }
+            // ── 昵称：从消息记录里回收，不额外调 OneBot API ──────────────────
+            // 好感度表只存 userId（那是身份，不会变）。昵称是"展示用"的东西，
+            // 每个人说话时桥接已经把 sender（群名片优先、其次昵称）存进 recentMessages 了，
+            // 这里倒着扫一遍就能拼出 userId → 名字，比每个用户调一次 get_group_member_info
+            // 快得多（12 个人就是 12 次 HTTP 往返，面板会明显卡）。
+            // 取**最近**的那条：群名片会改，旧名字不该盖掉新名字。
+            //
+            // 清洗是必须的，不是洁癖：实测有的 sender 里混进了控制字符
+            // （"\n\u0005\u0012\u0003小\n\u0005\n\u0003刀\u0010\u0000"，本该是"小刀"），
+            // 那是 SnowLuma 解码 @ 段时漏出来的字节。直接渲染会撑坏卡片布局，
+            // 也可能把零宽字符/方向控制符带进页面。
+            const cleanName = (raw) => {
+              let s = String(raw ?? '');
+              // 去掉所有 C0/C1 控制字符、零宽字符与双向控制符；换行也一并压平。
+              s = s.replace(/[\u0000-\u001F\u007F-\u009F\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g, '');
+              // 压掉多余空白（控制符删掉后常在中间留下空档）。
+              s = s.replace(/\s+/g, ' ').trim();
+              // 纯符号/纯数字的组合不像名字，交给调用方决定要不要用。
+              return s.slice(0, 40);
+            };
+            // 私聊消息的 sender 固定写"私聊"/"我"，那不是人名，别拿来当昵称。
+            const NON_NAME = new Set(['私聊', '我', '未知', '群友', '管理员']);
+            const usableName = (nm, uid) => {
+              const s = cleanName(nm);
+              if (!s || s === String(uid) || NON_NAME.has(s)) return '';
+              // 清洗后至少要剩一个字母、数字或汉字，否则视为脏数据。
+              return /[\p{L}\p{N}]/u.test(s) ? s : '';
+            };
+            const nameOf = new Map();
+            for (const ck of keysToScan) {
+              let cst;
+              try { cst = getSocialV2State(ck); } catch { continue; }
+              const msgs = Array.isArray(cst.recentMessages) ? cst.recentMessages : [];
+              for (let i = msgs.length - 1; i >= 0; i -= 1) {
+                const m = msgs[i];
+                const uid = m?.userId != null ? String(m.userId) : '';
+                if (!uid || nameOf.has(uid)) continue;
+                const nm = usableName(m?.sender, uid);
+                if (!nm) continue;
+                nameOf.set(uid, nm);
+              }
+            }
+            // 私聊的对方没有"群名片"概念，名字就是私聊对象本身；补一条兜底。
+            for (const ck of keysToScan) {
+              const m = /^private:(\d+)$/.exec(ck);
+              if (!m) continue;
+              const uid = m[1];
+              if (nameOf.has(uid) || uid === String(cfg.ownerQQ ?? '')) continue;
+              const cst = (() => { try { return getSocialV2State(ck); } catch { return null; } })();
+              const own = Array.isArray(cst?.recentMessages) ? cst.recentMessages : [];
+              for (let i = own.length - 1; i >= 0; i -= 1) {
+                const nm = usableName(own[i]?.sender, uid);
+                if (nm) { nameOf.set(uid, nm); break; }
+              }
+            }
+            // 一个人在群里可能用过多个名字，全量收一次当别名（面板 hover 里能看全）。
+            const aliasesOf = new Map();
+            for (const ck of keysToScan) {
+              let cst;
+              try { cst = getSocialV2State(ck); } catch { continue; }
+              const msgs = Array.isArray(cst.recentMessages) ? cst.recentMessages : [];
+              for (const m of msgs) {
+                const uid = m?.userId != null ? String(m.userId) : '';
+                if (!uid) continue;
+                const nm = usableName(m?.sender, uid);
+                if (!nm) continue;
+                if (!aliasesOf.has(uid)) aliasesOf.set(uid, new Set());
+                aliasesOf.get(uid).add(nm);
+              }
+            }
+            // 展示名：主人优先叫"主人"，其次群名片/昵称，最后才退回 QQ 号。
+            const displayNameOf = (uid) => {
+              if (uid === String(cfg.ownerQQ ?? '')) return '主人';
+              return nameOf.get(uid) || uid;
+            };
+            // 兜底：recentMessages 只留最近 200 条，久没说话的人名字会被轮转掉。
+            // 这时才去问网关要（有 10 分钟缓存，且有并发上限），别为 12 个人打 12 个请求。
+            const missing = [...merged.keys()].filter((uid) => !nameOf.has(uid) && uid !== String(cfg.ownerQQ ?? ''));
+            if (missing.length && missing.length <= 20) {
+              const groupIds = [...new Set(keysToScan.map((k) => /^group:(\d+)$/.exec(k)?.[1]).filter(Boolean))];
+              // 并发拉取，失败静默（面板不该因为网关抽风而报错）。
+              await Promise.all(missing.map(async (uid) => {
+                for (const gid of groupIds) {
+                  try {
+                    const nm = await resolveGroupMemberName(gid, uid);
+                    const ok = usableName(nm, uid);
+                    if (ok) { nameOf.set(uid, ok); return; }
+                  } catch {}
+                }
+              }));
+            }
+            // 面板要画档位刻度尺，所以把四档边界一起下发（唯一真源仍是 affinity.js）。
+            const stages = AFFINITY_STAGES.map((s) => ({
+              id: s.id,
+              label: s.label,
+              min: Number.isFinite(s.min) ? s.min : -20,
+            }));
+            if (wantUserResolved) {
+              const rec = merged.get(wantUserResolved) || null;
+              const label = displayNameOf(wantUserResolved);
+              // 她查过了 —— 把"档位变了"的提醒**清掉**。
+              // 不清的话，那条提醒会在之后每一轮唤醒里重复出现，等于又变回"每轮都在说这事"，
+              // 而且会误导她以为关系还在变。
+              try {
+                // 提醒现在在**全局**表里（按 QQ 号），清除时也清全局那一份。
+                if (socialV2.affinityStageChanges?.[wantUserResolved]) {
+                  delete socialV2.affinityStageChanges[wantUserResolved];
+                  saveSocialV2State();
+                }
+              } catch {}
+              // ⚠️ 给**模型**的返回必须精简（2026-11-10 操作者要求）：
+              //   这个端点的每一行都会进上下文，而 stages（五档边界表）、aliases、
+              //   nickname、manualAt 这些字段模型一个都用不上 —— 但它们占了返回体积的大头。
+              //   stages 尤其明显：5 个对象 × 3 个字段，每查一次就重复一遍。
+              //   控制台面板要刻度尺数据，走的是同一个 URI 但由浏览器读，
+              //   它有自己的 AFF_STAGE_FALLBACK，不依赖这里（见 console.html）。
+              // ⚠️ isOwner 必须传：偏爱档对主人允许露骨描写，对其他人不。
+              //   这个判断只能在这里做 —— affinity.js 不知道谁是主人（那是桥接的 cfg）。
+              //   用 userId 和 cfg.ownerQQ 比，不依赖请求里的 key（同一个主人在群和私聊都是主人）。
+              const isOwnerUser = wantUserResolved === String(cfg.ownerQQ ?? '');
+              sendJson({
+                ok: true,
+                userId: wantUserResolved,
+                label,
+                stage: rec ? affinityStageOf(rec.score).id : 'new',
+                stageLabel: rec ? affinityStageOf(rec.score).label : '没聊过',
+                count: rec ? Number(rec.count) || 0 : 0,
+                text: describeAffinity(rec || null, label, now, { isOwner: isOwnerUser }),
+              });
+              return;
+            }
+            const list = [...merged.entries()]
+              .map(([uid, rec]) => {
+                const label = displayNameOf(uid);
+                return {
+                  userId: uid,
+                  label,
+                  nickname: nameOf.get(uid) || '',
+                  aliases: [...(aliasesOf.get(uid) || [])].slice(-6),
+                  stage: affinityStageOf(rec.score).id,
+                  stageLabel: affinityStageOf(rec.score).label,
+                  score: rec.score,
+                  count: Number(rec.count) || 0,
+                  lastAt: Number(rec.lastAt) || 0,
+                  createdAt: Number(rec.createdAt) || 0,
+                  manualAt: Number(rec.manualAt) || 0,
+                };
+              })
+              .sort((a, b) => b.score - a.score || b.lastAt - a.lastAt);
+            // 列表形态也带上 createdAt：否则同一个人的"认识 N 天"在单人查询里有、
+            // 在列表里没有，她会以为是两个人。
+            const text = list.length
+              ? list.map((it) => describeAffinity({
+                score: it.score, count: it.count, lastAt: it.lastAt, createdAt: it.createdAt,
+              }, it.label, now)).join('\n')
+              : '还没有任何互动记录。';
+            sendJson({ ok: true, key: wantKey, total: list.length, people: list, stages, text });
+          } catch (error) {
+            sendJson({ ok: false, error: `读取好感度失败：${error?.message ?? error}` }, 500);
+          }
+          return;
+        }
+        // ── 好感度手工调整（仅控制台）──────────────────────────────────────
+        // 操作者拖动滑条直接改分。为什么需要这个入口：好感度本来只由聊天自动累积，
+        // 但"刚认识就被当老朋友"或"想验证某个档位的表现"这类需求没法靠聊天凑出来。
+        //
+        // 三条硬约束：
+        //   1. **只允许控制台**：带 agent token 的一律 403（已在上面的 adminOnlyV2Paths 拦下），
+        //      否则 AI 能给自己刷好感度 —— 那等于把关系交给被评价的一方。
+        //   2. **写入共享组内所有聊天**：同一个人只有一份关系（和 appendSocialV2Message 同口径），
+        //      只写当前 key 的话私聊改完群聊还是旧分数。
+        //   3. **保留 count/createdAt**：这里调的是"关系温度"，不是"抹掉历史"。
+        //      没有记录的人被手工设置时补一条 count=1，否则 saveSocialV2State 会把 count=0 的丢掉。
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/affinity') {
+          const body = await readBody();
+          const wantKey = String(body.key ?? '').trim();
+          const wantUser = String(body.userId ?? '').trim();
+          // scope=global：控制台面板用。好感度全局一份，不需要会话 key。
+          const scopeGlobal = String(body.scope ?? '') === 'global' || wantKey === 'global';
+          if (!scopeGlobal && !canonicalV2Key(wantKey)) {
+            sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号（或传 scope=global）' }, 400);
+            return;
+          }
+          if (!/^\d{1,20}$/.test(wantUser)) { sendJson({ ok: false, error: 'userId 必须是纯数字 QQ 号' }, 400); return; }
+          const rawScore = Number(body.score);
+          if (!Number.isFinite(rawScore)) { sendJson({ ok: false, error: 'score 必须是数字' }, 400); return; }
+          // 与 affinity.js 的 bumpAffinity 同口径。
+          // ⚠️ 必须用导出的 SCORE_MIN/SCORE_MAX，不能在这里重写数字：
+          //   实测算过——加了 400 分的新档位、滑条也放开到 600，但这一行还写着
+          //   `Math.min(200, …)`，于是控制台拖到 500 存进去立刻被夹回 200，
+          //   看起来像"滑条坏了/后端存不住"，其实是这里的上限没跟着改。
+          const score = Math.max(AFFINITY_SCORE_MIN, Math.min(AFFINITY_SCORE_MAX, Math.round(rawScore)));
+          try {
+            // 全局模式下没有具体会话 key，canonicalKey 只为兼容旧副本清理而保留。
+            const canonicalKey = scopeGlobal ? '' : canonicalV2Key(wantKey);
+            // 好感度现在**全局按 QQ 号**存：只写一处，不再往每个会话里铺副本。
+            // 这样控制台拖一次滑条 = 改一条记录，也不会再出现"某个会话里少了那份"。
+            if (!socialV2.affinities || typeof socialV2.affinities !== 'object') socialV2.affinities = {};
+            const now = Date.now();
+            const prev = socialV2.affinities[wantUser];
+            socialV2.affinities[wantUser] = {
+              score,
+              stageId: affinityStageOf(score).id,
+              // 手工设置也算一次接触，但不虚增互动次数（次数是"聊过几次"的事实）。
+              count: Math.max(1, Number(prev?.count) || 0),
+              createdAt: Number(prev?.createdAt) || now,
+              lastAt: Number(prev?.lastAt) || now,
+              // 留痕：区分"聊天聊出来的"和"操作者拖出来的"，排查时能看出来源。
+              manualAt: now,
+            };
+
+            // ── 档位变化也要记 ────────────────────────────────────────────
+            // 2026-11-12 修：原来只有"聊天计分"那条会写 affinityStageChanges，
+            // 手工拖滑条不写 —— 于是操作者把某人拖进"喜欢"档，唤醒词却一声不响。
+            // 档位变化就是档位变化，不管来源是聊天还是拖条。只在**档位 id 变了**时记。
+            const prevStageId = prev ? affinityStageOf(Number(prev.score) || 0).id : null;
+            const nextStageId = affinityStageOf(score).id;
+            if (prevStageId && prevStageId !== nextStageId) {
+              try {
+                if (!socialV2.affinityStageChanges || typeof socialV2.affinityStageChanges !== 'object') {
+                  socialV2.affinityStageChanges = {};
+                }
+                const fromLabel = AFFINITY_STAGES.find((s) => s.id === prevStageId)?.label ?? prevStageId;
+                const toLabel = AFFINITY_STAGES.find((s) => s.id === nextStageId)?.label ?? nextStageId;
+                socialV2.affinityStageChanges[wantUser] = { from: fromLabel, to: toLabel, at: now };
+                log(`[affinity] 控制台调整导致档位变化 ${wantUser}: ${fromLabel} → ${toLabel}（已记入唤醒提醒）`);
+              } catch {}
+            }
+            // 清掉会话里的旧副本（如果还有），避免以后被当成另一份数据。
+            // 全局模式下没有具体会话，就把所有会话里的副本都清一遍。
+            try {
+              const cleanKeys = scopeGlobal
+                ? [...socialV2.conversations.keys()]
+                : [canonicalKey, ...shareGroupOf(canonicalKey)];
+              for (const ck of cleanKeys) {
+                const cst = getSocialV2State(ck);
+                if (cst?.affinities?.[wantUser]) delete cst.affinities[wantUser];
+              }
+            } catch {}
+            saveSocialV2State();
+            // 回显用昵称（跟 GET 同一口径），日志里保留 QQ 号方便排查。
+            // 这里同样要清洗：脏 sender 直接写进提示会把控制字符带进页面。
+            const NON_NAME_W = new Set(['私聊', '我', '未知', '群友', '管理员']);
+            const keysToScan = scopeGlobal
+              ? [...socialV2.conversations.keys()]
+              : [canonicalKey, ...shareGroupOf(canonicalKey)];
+            const nickOfUser = (() => {
+              for (const ck of keysToScan) {
+                let cst;
+                try { cst = getSocialV2State(ck); } catch { continue; }
+                const msgs = Array.isArray(cst.recentMessages) ? cst.recentMessages : [];
+                for (let i = msgs.length - 1; i >= 0; i -= 1) {
+                  const m = msgs[i];
+                  if (String(m?.userId ?? '') !== wantUser) continue;
+                  let s = String(m?.sender ?? '')
+                    .replace(/[\u0000-\u001F\u007F-\u009F\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g, '')
+                    .replace(/\s+/g, ' ')
+                    .trim()
+                    .slice(0, 40);
+                  if (!s || s === wantUser || NON_NAME_W.has(s)) continue;
+                  if (!/[\p{L}\p{N}]/u.test(s)) continue;
+                  return s;
+                }
+              }
+              return '';
+            })();
+            const label = wantUser === String(cfg.ownerQQ ?? '') ? '主人' : (nickOfUser || wantUser);
+            const stage = affinityStageOf(score);
+            log(`[好感度] 控制台调整 ${label}(${wantUser}) → ${score}（${stage.label}），全局记录已更新`);
+            sendJson({
+              ok: true,
+              key: wantKey,
+              userId: wantUser,
+              label,
+              score,
+              stage: stage.id,
+              stageLabel: stage.label,
+              // 保留 written 字段的形状（前端/测试可能读它），但现在只有全局一份。
+              written: ['*global*'],
+              text: describeAffinity({ score, count: 1, lastAt: now }, label, now),
+            });
+          } catch (error) {
+            sendJson({ ok: false, error: `设置好感度失败：${error?.message ?? error}` }, 500);
+          }
+          return;
+        }
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/facts') {
+          const wantKey = String(url.searchParams.get('key') ?? '').trim();
+          // 2026-11-10：不再有 mode=delta。操作者的要求是「每次调用都给她看完整的，
+          // 只额外告诉她哪些忘掉了」——差集模式让她可能漏读中间写过又没变化的内容。
+          // 现在固定返回：全部活跃事实 + forgotten（自上次看过之后掉出去的）。
+          try {
+            const now = Date.now();
+            // 长期事实**全局一份**（2026-11-10 定稿）：不管请求带的是哪个会话 key，
+            // 都去读同一份 —— 用 memoryKeyOf() 归一成 GLOBAL_MEMORY_KEY。
+            //
+            // ⚠️ 这里曾经是 `keys = wantKey ? [wantKey] : [...]`，直接拿请求里的 key
+            // 当文件名，于是查 private:10001 会去找 private_10001.jsonl（不存在）
+            // → 明明 global.jsonl 里有活跃事实，却回 0 条。这正是"她查不到那条旧约定"的原因。
             const keys = wantKey
-              ? [wantKey]
-              : [...socialV2.conversations.keys()].filter(Boolean);
+              ? [memoryKeyOf(wantKey)]
+              : [...new Set([...socialV2.conversations.keys()].filter(Boolean).map((k) => memoryKeyOf(k)))];
             const out = [];
             for (const k of keys) {
               const all = loadFacts(STATE_DIR, k);
@@ -7490,7 +7955,36 @@ async function main() {
               }
             }
             out.sort((a, b) => b.weight - a.weight || (b.lastHit || 0) - (a.lastHit || 0));
-            sendJson({ ok: true, key: wantKey || null, total: out.length, facts: out });
+
+            // 「已经忘掉的」：上次看到过、这次不在活跃列表里了（被归档或权重掉出去）。
+            // 长期事实是**全局一份**，所以「她看过什么」这个基准也必须全局 ——
+            // 按会话记会让群和私聊各有一份 seen，同一批事实被各自判一次「忘了」。
+            let forgotten = [];
+            if (wantKey) {
+              const stForSeen = getSocialV2State(GLOBAL_MEMORY_KEY);
+              const seen = new Set(Array.isArray(stForSeen?.factSeenIds) ? stForSeen.factSeenIds : []);
+              const live = out.filter((f) => !f.archived);
+              const nowIds = new Set(live.map((f) => f.id));
+              const byId = new Map(out.map((f) => [f.id, f]));
+              forgotten = [...seen]
+                .filter((id) => !nowIds.has(id))
+                .map((id) => byId.get(id))
+                .filter(Boolean)
+                .map((f) => ({ id: f.id, text: f.text, tag: f.tag }));
+              // 把这次看到的活跃 id 记下来，下次再比。
+              stForSeen.factSeenIds = [...nowIds].slice(-200);
+              try { saveSocialV2State(); } catch {}
+            }
+
+            sendJson({
+              ok: true,
+              key: wantKey || null,
+              total: out.length,
+              facts: out,
+              forgotten,
+              // 没有变化时也照常返回全量；changed 只是给调用方一个"要不要额外提一句"的提示。
+              changed: forgotten.length > 0,
+            });
           } catch (error) {
             sendJson({ ok: false, error: `读取长期事实失败：${error?.message ?? error}` }, 500);
           }
@@ -7546,39 +8040,54 @@ async function main() {
           }
           return;
         }
-        if (req.method === 'POST' && url.pathname === '/api/socialV2/fact-add') {
-          const body = await readBody();
-          const key = String(body.key ?? '').trim();
-          const text = String(body.text ?? '').trim();
-          const tag = String(body.tag ?? 'misc').trim();
-          if (!key || !text) { sendJson({ ok: false, error: 'key/text 不能为空' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('fact')) { sendJson({ ok: false, error: '工具未启用：qq_fact_add' }, 403); return; }
-          try {
-            // addFact 内部按 text 完全相等去重：同一条再写一次只会加权，不会多存一份。
-            const fact = addFact(STATE_DIR, key, { text, tag, source: 'ai' });
-            sendJson({ ok: true, key, fact, preview: selectFactsForInjection(STATE_DIR, key).text });
-          } catch (error) {
-            sendJson({ ok: false, error: `长期事实写入失败：${error?.message ?? error}` }, 500);
-          }
-          return;
-        }
         if (req.method === 'POST' && url.pathname === '/api/socialV2/memory-append') {
           const body = await readBody();
           const key = String(body.key ?? '').trim();
           const category = String(body.category ?? '').trim();
           const content = String(body.content ?? '').trim();
           const extra = body.extra && typeof body.extra === 'object' ? body.extra : {};
+          // 2026-11-12：顶层 target 也认。原来只认 extra.target，而模型很容易把
+          // "给谁记"和 category/content 平铺在顶层 —— 结果明明填了名字却报
+          // 「memberImpression 需要 extra.target」（实测踩过）。
+          // 顶层优先、extra 兜底，两种写法都收。
+          const bodyTarget = String(body.target ?? '').trim();
+          if (bodyTarget && !extra.target) extra.target = bodyTarget;
           if (!key || !category || !content) { sendJson({ ok: false, error: 'key/category/content 不能为空' }, 400); return; }
-          if (!['activeTopic', 'pendingThought', 'memberImpression', 'selfNote'].includes(category)) { sendJson({ ok: false, error: 'category 必须是 activeTopic / pendingThought / memberImpression / selfNote' }, 400); return; }
-          if (category === 'memberImpression' && !String(extra.target || '').trim()) { sendJson({ ok: false, error: 'memberImpression 需要 extra.target 指定群友名字' }, 400); return; }
+          if (!['activeTopic', 'pendingThought', 'memberImpression', 'selfNote', 'longTerm', 'todo'].includes(category)) { sendJson({ ok: false, error: 'category 必须是 activeTopic / pendingThought / memberImpression / selfNote / longTerm / todo' }, 400); return; }
+          if (category === 'memberImpression' && !String(extra.target || '').trim()) { sendJson({ ok: false, error: 'memberImpression 需要指定 target（这个人的名字）：传顶层 target 或 extra.target 都行' }, 400); return; }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('memory')) { sendJson({ ok: false, error: '工具未启用：qq_memory_append' }, 403); return; }
+          // 长期事实（2026-11-10 并入本端点，原 /api/socialV2/fact-add 与 qq_fact_add 工具已删除）：
+          // 走 facts 库而不是 socialV2 状态，因为它是按权重衰减、可归档、append-only 修订的独立存储。
+          if (category === 'longTerm') {
+            const tag = String(extra.tag || 'misc').trim();
+            if (!['identity', 'agreement', 'emotion', 'preference', 'meme', 'misc'].includes(tag)) {
+              sendJson({ ok: false, error: 'extra.tag 必须是 identity / agreement / emotion / preference / meme / misc' }, 400);
+              return;
+            }
+            try {
+              // addFact 内部按 text 完全相等去重：同一条再写一次只会加权，不会多存一份。
+              // 长期事实**全局一份**（memoryKeyFor 对 longTerm 返回 GLOBAL_MEMORY_KEY）。
+              const memKey = memoryKeyFor('longTerm', key);
+              const fact = addFact(STATE_DIR, memKey, { text: content, tag, source: 'ai' });
+              sendJson({ ok: true, key, category, fact, preview: selectFactsForInjection(STATE_DIR, memKey).text });
+            } catch (error) {
+              sendJson({ ok: false, error: `长期事实写入失败：${error?.message ?? error}` }, 500);
+            }
+            return;
+          }
           const st = getSocialV2State(key);
-          appendMemoryV2(st, category, content, extra);
-          sendJson({ ok: true, key, category, content, memory: formatMemoryV2(st) });
+          // 记忆归属见文件上游的「记忆归属」注释块：
+          //   selfNote / memberImpression → 全局一份；
+          //   activeTopic / pendingThought → 当前会话自己。
+          const memKey = memoryKeyFor(category, key);
+          const memSt = memKey === key ? st : getSocialV2State(memKey);
+          // extra.sessionKey：memberImpression 要用它把 target（名字）反查成 QQ 号，
+          // 反查的数据源是"发这条消息的那个会话"的消息列表 —— 而 memSt 在全局记忆下
+          // 不是任何真实会话，所以必须把请求里的 key 单独带进去。
+          appendMemoryV2(memSt, category, content, { ...extra, sessionKey: key });
+          sendJson({ ok: true, key, category, content, memory: formatMemoryV2(memSt, key) });
           return;
         }
         if (req.method === 'POST' && url.pathname === '/api/socialV2/memory-update') {
@@ -7598,13 +8107,14 @@ async function main() {
             target: newExtra.target !== undefined ? redactExtra(newExtra.target) : undefined
           };
           if (!key || !category) { sendJson({ ok: false, error: 'key/category 不能为空' }, 400); return; }
-          if (!['activeTopic', 'pendingThought', 'memberImpression', 'selfNote'].includes(category)) { sendJson({ ok: false, error: 'category 必须是 activeTopic / pendingThought / memberImpression / selfNote' }, 400); return; }
+          if (!['activeTopic', 'pendingThought', 'memberImpression', 'selfNote', 'todo'].includes(category)) { sendJson({ ok: false, error: 'category 必须是 activeTopic / pendingThought / memberImpression / selfNote' }, 400); return; }
           if (category === 'memberImpression' && !target) { sendJson({ ok: false, error: 'memberImpression 需要 target 指定原群友名字' }, 400); return; }
           if (category !== 'memberImpression' && !oldContent) { sendJson({ ok: false, error: '该类别需要 oldContent 指定要编辑的记忆内容' }, 400); return; }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('memory')) { sendJson({ ok: false, error: '工具未启用：qq_memory_*' }, 403); return; }
-          const st = getSocialV2State(key);
+          // 编辑也要去记忆真正所在的那一份改，否则「编辑了记忆」其实一个字节都没动（404）。
+          const st = getSocialV2State(memoryKeyFor(category, key));
           if (category === 'activeTopic' && Array.isArray(st.activeTopics)) {
             const idx = st.activeTopics.findIndex((t) => String(t?.text ?? '') === oldContent);
             if (idx < 0) { sendJson({ ok: false, error: '找不到要编辑的 activeTopic' }, 404); return; }
@@ -7653,7 +8163,7 @@ async function main() {
             }
           }
           saveSocialV2State();
-          sendJson({ ok: true, key, category, memory: formatMemoryV2(st) });
+          sendJson({ ok: true, key, category, memory: formatMemoryV2(st, key) });
           return;
         }
         if (req.method === 'GET' && url.pathname === '/api/socialV2/memory') {
@@ -7663,31 +8173,58 @@ async function main() {
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('memory')) { sendJson({ ok: false, error: '工具未启用：qq_memory_query' }, 403); return; }
-          const st = getSocialV2State(key);
+          // 记忆归属见文件上游的「记忆归属」注释块：
+          //   selfNote / memberImpression / todo 是全局一份（所有会话都读同一份）；
+          //   activeTopic / pendingThought 各聊各的。
+          // 不带 category 时两边都要取：全局的来自 GLOBAL，会话级来自本会话。
+          const localSt = getSocialV2State(key);
+          const globalSt = getSocialV2State(GLOBAL_MEMORY_KEY);
+          const isSessionScope = category === 'activeTopic' || category === 'pendingThought';
+          const longTermSt = isSessionScope ? localSt : globalSt;
           const raw = {
-            activeTopics: Array.isArray(st.activeTopics) ? st.activeTopics.slice(-20) : [],
-            pendingThoughts: Array.isArray(st.pendingThoughts) ? st.pendingThoughts.filter((t) => !t.expiresAt || Date.now() < t.expiresAt).slice(-20) : [],
-            memberImpressions: st.memberImpressions && typeof st.memberImpressions === 'object' ? st.memberImpressions : {},
-            selfNotes: Array.isArray(st.selfNotes) ? st.selfNotes.slice(-40) : []
+            activeTopics: Array.isArray(localSt.activeTopics) ? localSt.activeTopics.slice(-20) : [],
+            pendingThoughts: Array.isArray(localSt.pendingThoughts) ? localSt.pendingThoughts.filter((t) => !t.expiresAt || Date.now() < t.expiresAt).slice(-20) : [],
+            memberImpressions: longTermSt.memberImpressions && typeof longTermSt.memberImpressions === 'object' ? longTermSt.memberImpressions : {},
+            selfNotes: Array.isArray(longTermSt.selfNotes) ? longTermSt.selfNotes.slice(-40) : [],
+            // 待办是全局的，且只给还没过期的（过期的对她没有意义）。
+            todos: Array.isArray(longTermSt.todos)
+              ? longTermSt.todos.filter((t) => t && t.text && (!t.expiresAt || Date.now() < t.expiresAt)).slice(-20)
+              : []
           };
           if (category === 'activeTopic') {
             raw.pendingThoughts = [];
             raw.memberImpressions = {};
             raw.selfNotes = [];
+            raw.todos = [];
           } else if (category === 'pendingThought') {
             raw.activeTopics = [];
             raw.memberImpressions = {};
             raw.selfNotes = [];
+            raw.todos = [];
           } else if (category === 'memberImpression') {
             raw.activeTopics = [];
             raw.pendingThoughts = [];
             raw.selfNotes = [];
+            raw.todos = [];
           } else if (category === 'selfNote') {
             raw.activeTopics = [];
             raw.pendingThoughts = [];
             raw.memberImpressions = {};
+            raw.todos = [];
+          } else if (category === 'todo') {
+            raw.activeTopics = [];
+            raw.pendingThoughts = [];
+            raw.memberImpressions = {};
+            raw.selfNotes = [];
           }
-          sendJson({ ok: true, key, category, formatted: formatMemoryV2({ ...st, ...raw }), raw });
+          // formatMemoryV2 只看传入对象上的字段，raw 已经按类别把该隐藏的置空了，
+          // formatMemoryV2 只看传入对象上的字段，raw 已经按类别把该隐藏的置空了。
+          // 基底：先 localSt（短期两类在它身上），再 longTermSt（长期三类在它身上），
+          // 最后 raw 覆盖 —— 三者的字段名不重叠，顺序只是防止同名时读错来源。
+          // ⚠️ 这里曾经写成 `...sharedSt`，而 sharedSt 在改成全局记忆时已被删除 ——
+          //   结果是每次 qq_memory_query 都 500 "sharedSt is not defined"。
+          //   加字段/改变量名时，务必跑一遍 test-global-memory.mjs（它覆盖这条读路径）。
+          sendJson({ ok: true, key, category, formatted: formatMemoryV2({ ...localSt, ...longTermSt, ...raw }, key), raw });
           return;
         }
         if (req.method === 'POST' && url.pathname === '/api/socialV2/memory-remove') {
@@ -7697,14 +8234,15 @@ async function main() {
           const content = String(body.content ?? '').trim();
           const target = String(body.target ?? '').trim();
           if (!key || !category) { sendJson({ ok: false, error: 'key/category 不能为空' }, 400); return; }
-          if (!['activeTopic', 'pendingThought', 'memberImpression', 'selfNote'].includes(category)) { sendJson({ ok: false, error: 'category 必须是 activeTopic / pendingThought / memberImpression / selfNote' }, 400); return; }
+          if (!['activeTopic', 'pendingThought', 'memberImpression', 'selfNote', 'todo'].includes(category)) { sendJson({ ok: false, error: 'category 必须是 activeTopic / pendingThought / memberImpression / selfNote' }, 400); return; }
           if (category === 'memberImpression' && !target) { sendJson({ ok: false, error: 'memberImpression 需要 target 指定群友名字' }, 400); return; }
           if (category === 'memberImpression' && ['__proto__', 'constructor', 'prototype'].includes(target)) { sendJson({ ok: false, error: '非法的群友名字' }, 400); return; }
           if (category !== 'memberImpression' && !content) { sendJson({ ok: false, error: '该类别需要 content 指定要删除的记忆内容' }, 400); return; }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('memory')) { sendJson({ ok: false, error: '工具未启用：qq_memory_remove' }, 403); return; }
-          const st = getSocialV2State(key);
+          // 删也得去记忆真正所在的那一份删（长期三类在全局，短期两类在会话）。
+          const st = getSocialV2State(memoryKeyFor(category, key));
           if (category === 'activeTopic' && Array.isArray(st.activeTopics)) {
             st.activeTopics = st.activeTopics.filter((t) => String(t?.text ?? '') !== content);
           } else if (category === 'pendingThought' && Array.isArray(st.pendingThoughts)) {
@@ -7714,9 +8252,12 @@ async function main() {
           } else if (category === 'selfNote' && Array.isArray(st.selfNotes)) {
             // 过时的自我认知要能删（"我以前觉得自己…，现在不这么想了"）。
             st.selfNotes = st.selfNotes.filter((n) => String(n?.text ?? '') !== content);
+          } else if (category === 'todo' && Array.isArray(st.todos)) {
+            // 待办也能删（做完了 / 不用做了）。
+            st.todos = st.todos.filter((t) => String(t?.text ?? '') !== content);
           }
           saveSocialV2State();
-          sendJson({ ok: true, key, category, memory: formatMemoryV2(st) });
+          sendJson({ ok: true, key, category, memory: formatMemoryV2(st, key) });
           return;
         }
         if (req.method === 'POST' && url.pathname === '/api/socialV2/memory-clear') {
@@ -7724,99 +8265,26 @@ async function main() {
           const key = String(body.key ?? '').trim();
           const category = String(body.category ?? '').trim();
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
-          if (category && !['activeTopic', 'pendingThought', 'memberImpression'].includes(category)) { sendJson({ ok: false, error: 'category 必须是 activeTopic / pendingThought / memberImpression' }, 400); return; }
+          if (category && !['activeTopic', 'pendingThought', 'memberImpression', 'selfNote', 'todo'].includes(category)) { sendJson({ ok: false, error: 'category 必须是 activeTopic / pendingThought / memberImpression / selfNote / todo' }, 400); return; }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('memory')) { sendJson({ ok: false, error: '工具未启用：qq_memory_clear' }, 403); return; }
-          const st = getSocialV2State(key);
-          if (!category || category === 'activeTopic') st.activeTopics = [];
-          if (!category || category === 'pendingThought') st.pendingThoughts = [];
-          if (!category || category === 'memberImpression') st.memberImpressions = {};
+          // category 为空 = 清全部：全局那份（印象/自我认知/待办）和本会话那份（话题/想法）都要清。
+          // 2026-11-12：之前漏了 selfNote 和 todo —— 面板上加了这两块之后，
+          // 它们的"清空"按钮点了不会有任何效果，等于假按钮。
+          const clearAll = !category;
+          const globalSt = getSocialV2State(GLOBAL_MEMORY_KEY);
+          const localSt = getSocialV2State(key);
+          if (!category || category === 'activeTopic') localSt.activeTopics = [];
+          if (!category || category === 'pendingThought') localSt.pendingThoughts = [];
+          if (!category || category === 'memberImpression') globalSt.memberImpressions = {};
+          if (!category || category === 'selfNote') globalSt.selfNotes = [];
+          if (!category || category === 'todo') globalSt.todos = [];
           saveSocialV2State();
-          sendJson({ ok: true, key, category: category || 'all', memory: formatMemoryV2(st) });
+          sendJson({ ok: true, key, category: category || 'all', memory: formatMemoryV2(localSt, key) });
           return;
         }
         // ── 二代黑话学习（reserved2）：AI 查询/提交黑话候选 ─────────────────
-        if (req.method === 'GET' && url.pathname === '/api/socialV2/slang/query') {
-          const key = String(url.searchParams.get('key') ?? '').trim();
-          const q = String(url.searchParams.get('q') ?? '').trim().toLowerCase();
-          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('slangQuery')) { sendJson({ ok: false, error: '工具未启用：qq_slang_query' }, 403); return; }
-          const list = confirmedSlangListV2().filter((e) => {
-            if (!q) return true;
-            return e.content.toLowerCase().includes(q)
-              || e.meaning.toLowerCase().includes(q)
-              || e.usage.toLowerCase().includes(q)
-              || e.example.toLowerCase().includes(q);
-          });
-          sendJson({
-            ok: true,
-            key,
-            total: list.length,
-            entries: list,
-            block: buildSlangContext(slangEntries, cfg.slang?.injectMax ?? 8)
-          });
-          return;
-        }
-        if (req.method === 'POST' && url.pathname === '/api/socialV2/slang/submit') {
-          const body = await readBody();
-          const key = String(body.key ?? '').trim();
-          const token = String(body.token ?? '').trim();
-          const content = redactKnownTokensOnly(String(body.content ?? '')).trim();
-          const context = redactKnownTokensOnly(String(body.context ?? '')).trim();
-          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('slangSubmit')) { sendJson({ ok: false, error: '工具未启用：qq_slang_submit' }, 403); return; }
-          if (cfg.slang?.enabled === false) { sendJson({ ok: false, error: '黑话学习已关闭（slang.enabled=false）' }, 403); return; }
-          if (!content) { sendJson({ ok: false, error: 'content 不能为空' }, 400); return; }
-          if (content.length > 50) { sendJson({ ok: false, error: '黑话词条过长（最多 50 字）' }, 400); return; }
-          if (!allowSlangSubmit(key)) { sendJson({ ok: false, error: '黑话提交过于频繁，请稍后再试' }, 429); return; }
-          const existing = slangEntries.find((e) => e.content === content);
-          if (existing) {
-            if (existing.status === SLANG_STATUS.CONFIRMED) {
-              sendJson({ ok: true, duplicate: true, status: 'confirmed', entry: publicSlangEntry(existing) });
-              return;
-            }
-            if (existing.status === SLANG_STATUS.REJECTED) {
-              sendJson({ ok: false, error: '该词已被管理员拒绝，如需重新收录请联系管理员' }, 403);
-              return;
-            }
-            // candidate：累计出现次数并追加语境证据
-            existing.count = (Number(existing.count) || 0) + 1;
-            if (context) {
-              existing.evidence = mergeEvidence(existing.evidence, [{ key, sender: 'AI提交', text: context.slice(0, 200), time: Date.now() }]);
-            }
-            existing.updatedAt = new Date().toISOString();
-            saveSlangStore();
-            if (cfg.slang?.autoResearch !== false) {
-              const thresholds = Array.isArray(cfg.slang?.inferenceThresholds) ? cfg.slang.inferenceThresholds.map(Number).filter(Boolean) : [2, 4, 8];
-              if (thresholds.includes(existing.count) && existing.count > (Number(existing.lastInferenceCount) || 0)) {
-                queueSlangTask(() => runSlangResearch([existing]));
-              }
-            }
-            log(`[reserved2] AI 再次提交黑话候选「${content}」(${key})，累计 ${existing.count} 次`);
-            sendJson({ ok: true, duplicate: true, status: 'candidate', entry: publicSlangEntry(existing) });
-            return;
-          }
-          const entry = createSlangEntry({
-            content,
-            source: 'ai',
-            status: SLANG_STATUS.CANDIDATE,
-            evidence: context ? [{ key, sender: 'AI提交', text: context.slice(0, 200), time: Date.now() }] : []
-          });
-          slangEntries.push(entry);
-          saveSlangStore();
-          if (cfg.slang?.autoResearch !== false) {
-            queueSlangTask(() => runSlangResearch([entry]));
-          }
-          log(`[reserved2] AI 提交黑话候选「${content}」(${key})`);
-          appendActivity(`${key} [reserved2] AI 提交黑话候选：${content}${context ? '（附语境）' : ''}`);
-          sendJson({ ok: true, entry: publicSlangEntry(entry) });
-          return;
-        }
         if (req.method === 'POST' && url.pathname === '/api/authorize/read') {
           const body = await readBody();
           const key = String(body.key ?? '').trim();
@@ -7971,7 +8439,8 @@ async function main() {
               sendJson({ ok: false, error: '发送频率超限，请稍后再试' }, 429);
               return;
             }
-            st.sendTimes.push(now);
+
+            noteSendCallV2(st, now);  // 节流按"调用"记账，不按条数
             if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
             const sentMessages = await sendMessagesV2(key, [message], [], actualReplyToMessageId, atUserId);
             recordSentMessagesV2(key, sentMessages);
@@ -7979,6 +8448,8 @@ async function main() {
             st.lastActionAt = now;
             st.wakeConfig.noActionCount = 0;
             saveSocialV2State();
+            // 发送后空转：代替"节流拦截"，只让这次调用慢一点，不产生额外回合。
+            if (sentMessages.length > 0) await paceAfterSendV2(st, Date.now());
             log(`[send] ${url.pathname} ${key}: 成功 ${sentMessages.length}/1 条`);
             appendActivity(`${key} [send] 成功 ${sentMessages.length}/1 条：${message.slice(0, 80)}`);
             if (sentMessages.length > 0) scheduleReplyCheckV2(key);
@@ -8009,6 +8480,57 @@ async function main() {
           sessionEpoch++;
           const oldSessionId = state.sessions[key];
           delete state.sessions[key];
+          // 共用会话：清一个 = 清整组。
+          //
+          // 2026-11-10 修的第二个坑（上一版写错了）：最初这里只清
+          // `memberSession === oldSessionId` 的成员，可是**共用组里的每个 key
+          // 会各持一份自己的 sessionId**（ensureSession 按 key 建映射，只是复用同一个
+          // DSH 会话）—— 于是那个条件永远不成立，整段等于没写。
+          // 实测后果：清了群，私聊仍拿着旧映射继续用，且 bootstrapSent 还是 true；
+          // 随后私聊来了条消息，走普通唤醒（reason=private），既不补引导也不提记忆，
+          // 看上去就是"新会话第一轮却什么都没注入"。
+          //
+          // 现在的语义：组内**所有** key 的会话映射一起清、bootstrapSent 一起复位。
+          // 这才对得上"共用会话"的模型 —— 它们本来就是同一个 DSH 会话、同一份记忆、同一段引导。
+          const resetPool = (() => { try { return shareGroupOf(key); } catch { return [key]; } })();
+          const alsoCleared = [];
+          for (const memberKey of resetPool) {
+            if (memberKey === key) continue;
+            const memberCanonical = canonicalV2Key(memberKey) || memberKey;
+            const memberSession = state.sessions[memberKey];
+            if (memberSession) {
+              // 各 key 的 sessionId 可能不同（同一 DSH 会话复用），所以这里不能比对 id，
+              // 只能"凡在组内的都清掉"。
+              delete state.sessions[memberKey];
+              reverse.delete(memberSession);
+              collectors.delete(memberSession);
+              sendToolSucceededSessions.delete(memberSession);
+              pendingSendToolCalls.delete(memberSession);
+              v2TurnStartAt.delete(memberSession);
+              turnLeaseNoted.delete(memberSession);
+              toolCallNames.delete(memberSession);
+              alsoCleared.push(memberKey);
+            }
+            delete state.sessionPolicies[memberKey];
+            const memberSt = socialV2.conversations.get(memberCanonical);
+            if (memberSt) memberSt.bootstrapSent = false;
+            // 让这个成员的下一条消息重新走一遍 bootstrap（引导 + 记忆提示）。
+            const memberPe = pending.get(memberKey);
+            if (memberPe) {
+              clearTimeout(memberPe.timer);
+              cancelPendingEntry(memberPe).catch(() => {});
+              pending.delete(memberKey);
+            }
+            clearSocialV2Timers(memberKey);
+            pendingWakeKeys.delete(memberKey);
+            wakeConfigUpdatedKeys.delete(memberKey);
+            markReadCalledKeys.delete(memberKey);
+            wakeConfigMissCount.delete(memberKey);
+            forgetAgentToken(memberKey);
+          }
+          if (alsoCleared.length) {
+            log(`控制台：共用会话 ${key} 清上下文，连带复位 ${alsoCleared.join('、')}（整组重走一次引导）`);
+          }
           modelAppliedSessions.delete(oldSessionId);
           // 权限元数据必须与映射一起删除，否则会永久残留在 sessions.json 里。
           delete state.sessionPolicies[key];
@@ -8036,10 +8558,7 @@ async function main() {
           social.silentContext.delete(key);
           social.silentTurns.delete(oldSessionId);
           social.exitingSessions.delete(oldSessionId);
-          slangWindows.delete(key);
-          slangExtractionCooldowns.delete(key);
-          slangSubmitTimes.delete(key);
-          cancelSocialTimers(key);
+                cancelSocialTimers(key);
           clearSocialV2Timers(key);
           pendingWakeKeys.delete(key);
           wakeConfigUpdatedKeys.delete(key);
@@ -8100,9 +8619,6 @@ async function main() {
           social.silentContext.clear();
           social.silentTurns.clear();
           social.exitingSessions.clear();
-          slangWindows.clear();
-          slangExtractionCooldowns.clear();
-          slangSubmitTimes.clear();
           cancelAllSocialTimers();
           clearAllSocialV2Timers();
           // 清空工作区 = 所有会话连同 token 一起作废，两张表整体清掉（比逐会话摘除更不容易漏）。
@@ -8125,6 +8641,44 @@ async function main() {
           return;
         }
         // ── 重启桥接（守护模式下 5 秒后自动拉起） ──────────────────────────────
+        // 主动对齐 DSH 端口。
+        //
+        // 为什么需要这个端点：桥接平时只在「探测到 DSH 连不上」时才重新跟随（有 60 秒
+        // 冷却）。但有些时机使用者希望**立刻**对齐 —— 比如刚重启完 DSH、点「启动
+        // SnowLuma」时。那次请求顺带调一下这里，桥接就跳过冷却直接重探一次。
+        //
+        // 语义是"促一次探测"，不是"强制改写"：如果当前 baseUrl 仍然可用，
+        // followDshEndpoint 会原样返回（changed=false），不会无谓改配置。
+        if (req.method === 'POST' && url.pathname === '/api/dsh/follow-endpoint') {
+          try {
+            // ⚠️ 必须先把磁盘上的值读回来再判断。
+            // followDshEndpoint 的第一条是「配置里的 baseUrl 还能用就什么都不做」，
+            // 而 cfg.dsh.baseUrl 是**启动时**加载进内存的 —— 如果配置文件在运行期间
+            // 被改过（换端口、手工编辑、另一个进程写回），内存里还是旧值，
+            // 于是这一步会拿旧值去探活、探通了就返回 changed:false，
+            // 看起来"对齐成功"、实际磁盘上的错误值一个字都没动（实测踩过）。
+            try {
+              const diskCfg = loadConfig();
+              if (diskCfg?.dsh?.baseUrl) cfg.dsh.baseUrl = String(diskCfg.dsh.baseUrl).trim();
+            } catch { /* 读不到就沿用内存值，不阻断 */ }
+
+            const r = await followDshEndpoint(cfg);
+            if (r.changed) {
+              // 端口变了要同步换掉 NodeApiClient 的 baseUrl，否则只改了 cfg 和
+              // config.json，实际请求还打旧端口。
+              api.baseUrl = r.baseUrl;
+              api.invalidateAuth();
+              // 立刻用它做一次探活，让 /api/status 的 dshReady 马上反映真实情况，
+              // 而不是等下一个 5 秒轮询。
+              lastDshFollowAt = Date.now();
+              log(`[dsh] 控制台请求主动对齐：${r.from || '(空)'} → ${r.baseUrl}`);
+            }
+            sendJson({ ok: true, changed: r.changed === true, baseUrl: r.baseUrl, from: r.from ?? null });
+          } catch (error) {
+            sendJson({ ok: false, error: String(error?.message ?? error) }, 500);
+          }
+          return;
+        }
         if (req.method === 'POST' && url.pathname === '/api/restart') {
           sendJson({ ok: true, message: '正在重启桥接（若由守护窗口启动，5 秒后自动恢复）…' });
           setTimeout(() => {
@@ -8403,6 +8957,33 @@ async function main() {
   }
 
 
+  /**
+   * 纯语音模式：把一条文本合成为语音，返回可发送的 record 段。
+   *
+   * 为什么改在这里（onebotSend 是**所有**文本消息的唯一出口）：
+   *   她照常调 qq_send_message 打字，语音这件事完全由桥接决定 ——
+   *   她自己不知道、也不需要知道。这样人设不会被"要不要发语音"污染。
+   *
+   * 失败必须**降级成文字**，不能吞消息：TTS 只是表达方式，
+   *   不是内容本身；合不出来还照样把字发出去，比静默失败好得多。
+   */
+  async function maybeSendAsVoice(kind, id, rawMessage, voiceCfg) {
+    if (!voiceCfg?.enabled) return null;
+    const text = String(rawMessage ?? '').trim();
+    if (!text) return null;
+    // 纯表情/纯符号没必要念出来（TTS 会把它们念成奇怪的东西）。
+    if (!/[\p{L}\p{N}]/u.test(text)) return null;
+
+    try {
+      const r = await synthesizeTts(text, voiceCfg, { cacheDir: TTS_CACHE_DIR, log });
+      return { type: 'record', data: { file: r.path } };
+    } catch (error) {
+      log(`[tts] 合成失败，降级为文字（${kind}:${id}）：${error?.message ?? error}`);
+      appendActivity(`[tts] 合成失败，已降级为文字：${String(error?.message ?? error).slice(0, 80)}`);
+      return null;
+    }
+  }
+
   async function onebotSend(kind, id, message, replyToMessageId, atUserId = null) {
     const segments = [];
     if (replyToMessageId !== undefined && replyToMessageId !== null && String(replyToMessageId).trim() !== '') {
@@ -8422,7 +9003,18 @@ async function main() {
       log(`发送内容包含会话令牌，已阻止发送 (${kind}:${id})`);
       throw new Error('发送内容包含会话令牌，已阻止发送');
     }
-    segments.push({ type: 'text', data: { text: escapeCqText(rawMessage) } });
+    // 纯语音：把文字换成语音条。带引用/@ 的消息不转（语音段放不下引用），
+    // 合成失败也自动降级回文字。
+    const voiceCfg = socialV2?.tts ?? null;
+    const canVoice = voiceCfg?.enabled === true
+      && (!segments.length)   // 没有引用/@ 前置段
+      && kind;                // 群聊/私聊都支持
+    const recordSegment = canVoice ? await maybeSendAsVoice(kind, id, rawMessage, voiceCfg) : null;
+    if (recordSegment) {
+      segments.push(recordSegment);
+    } else {
+      segments.push({ type: 'text', data: { text: escapeCqText(rawMessage) } });
+    }
     const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg';
     const params = kind === 'private' ? { user_id: Number(id), message: segments } : { group_id: Number(id), message: segments };
     const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
@@ -8432,8 +9024,9 @@ async function main() {
         'content-type': 'application/json',
         ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {})
       },
+      // 语音条要过一次 SILK 转码，比纯文本慢，给足预算。
       body: JSON.stringify(params),
-      signal: AbortSignal.timeout(15000)
+      signal: AbortSignal.timeout(recordSegment ? 60000 : 15000)
     });
     const body = await res.json().catch(() => ({}));
     if (!res.ok || body.status !== 'ok' || body.retcode !== 0) {
@@ -8920,6 +9513,77 @@ async function main() {
     return Math.max(min, Math.min(max, Math.round(Number(ms) || min)));
   }
 
+  // ── 发送节流（2026-11-13 新增）──────────────────────────────────────────
+  //
+  // 现象：她会在收尾观望循环里连续回话（观望 10 秒 → 有新消息 → 回 2~3 条 →
+  // 再观望 → 又回…），一分钟内攒到 8 条就撞上 maxSendPerMinute 的限流。
+  // 实测 01:13–01:17 四分钟发了 17 条，其中 01:14:49 → 01:15:07 的 18 秒里就 5 条。
+  //
+  // 这里加一道「同一会话两次发送之间至少隔 N 秒」的软节流：
+  //   · 和 maxSendPerMinute 不同，它不看窗口总数，只看**上一次发送的时刻**；
+  //   · 撞上时返回 429 + 剩余秒数，让她知道再等多久（而不是一句"频率超限"）；
+  //   · 配置项 socialV2.send.minSendIntervalMs，默认 5000（操作者定 5 秒）。
+  //
+  // 为什么不用"放宽 maxSendPerMinute"：那个阈值是防 QQ 风控的最后一道闸，
+  // 调高换来的快，代价是真被冻结 —— 比一次 429 严重得多。
+  function sendThrottleRemainMsV2(st, now = Date.now()) {
+    const minGap = Math.max(0, Number(cfg.socialV2?.send?.minSendIntervalMs ?? 5000));
+    if (!minGap) return 0;
+    // 2026-11-13 修：**按"上一次调用"算，不按"上一次发出去的消息"算**。
+    //
+    // 原来用 sendTimes 的 max：一次 send_message 发 3 条会压进 3 个相同时间戳，
+    // 于是"发完 3 条后立刻补一句"被判成连发（实测报「再等 1 秒」）。
+    // 但她一回合发 2~3 条本来就是允许的行为（burst 设计如此），
+    // 节流要拦的是**跨回合的砸屏**，不是同一回合内的连续表达。
+    //
+    // 现在用独立的 lastSendCallAt：只有「一次新的工具调用」才会刷新它。
+    const last = Number(st?.lastSendCallAt);
+    if (!Number.isFinite(last) || last <= 0) return 0;
+    const remain = minGap - (now - last);
+    return remain > 0 ? Math.round(remain) : 0;
+  }
+
+  /** 记一次「发送调用」的时刻（节流用；与 sendTimes 的条数记账分开）。 */
+  function noteSendCallV2(st, now = Date.now()) {
+    if (!st) return;
+    st.lastSendCallAt = now;
+  }
+
+  /**
+   * 发送成功后的短暂空转（2026-11-13）。
+   *
+   * 为什么不用"拦截"：撞到最小间隔时回 429 会让模型**重新思考、重新组句、重新发**，
+   * 一个回合变成两个，每一步都要重发整段历史 —— 比等几秒贵得多。
+   * 现在改成让这次工具调用多停一会儿再返回：效果一样是"别连发"，
+   * 但代价只是这一个 HTTP 请求慢 N 秒，不产生额外回合，也不消耗上下文。
+   *
+   * 语义：保证「上一次调用」与「这一次调用」之间至少隔 minSendIntervalMs。
+   * 调用方在发送前已经调过 noteSendCallV2(st, now)，所以 last 一定存在；
+   * 本函数把 lastSendCallAt 推进到「空转结束时刻」，下次进来才不会重复计算。
+   *
+   * ⚠️ 2026-11-13 修：原来这里有个"首次直接 return"的分支，
+   * 它在 saveSocialV2State() 之后才写 st，写进去的值没落盘 ——
+   * 于是每次读到的 last 都是 undefined，永远走"首次"分支，**空转一次都没生效**。
+   * 实测 12:25:07 和 12:25:09 两次发送只隔 2 秒，就是这么来的。
+   */
+  async function paceAfterSendV2(st, now = Date.now()) {
+    if (!st) return;
+    const minGap = Math.max(0, Number(cfg.socialV2?.send?.minSendIntervalMs ?? 5000));
+    if (!minGap) return;
+    const last = Number(st.lastSendCallAt);
+    // last 缺失只可能是异常路径；此时把它记为 now 并落盘，不做等待。
+    if (!Number.isFinite(last) || last <= 0) {
+      st.lastSendCallAt = now;
+      try { saveSocialV2State(); } catch { /* ignore */ }
+      return;
+    }
+    const waitMs = Math.max(0, Math.min(minGap, minGap - (now - last)));
+    st.lastSendCallAt = now + waitMs;
+    // 必须落盘：否则下次读到的是旧值，空转就白等了。
+    try { saveSocialV2State(); } catch { /* ignore */ }
+    if (waitMs > 0) await sleep(waitMs);
+  }
+
   function computeGapsV2(messages, gapMode, gapMs, gaps, sendCfg) {
     const delays = [];
     if (!messages || messages.length <= 1) return delays;
@@ -9099,6 +9763,35 @@ async function main() {
     const epoch = sessionEpoch;
     const policy = sessionPolicy(key);
     if (!isSessionAllowedInCurrentMode(key)) throw new Error(`当前模式不允许会话 ${key}`);
+    // 共用会话：组内任何成员先建出会话，其余成员直接复用同一个 sessionId。
+    // 先扫一遍同组已存在的映射，命中就登记双向关系后返回 —— 这正是"两个 key 共用一个会话"。
+    const group = shareGroupOf(key);
+    if (group.length > 1) {
+      for (const member of group) {
+        if (member !== key && state.sessions[member]) {
+          const shared = state.sessions[member];
+          if (isCurrentSession(member, shared)) {
+            state.sessions[key] = shared;
+            state.sessionPolicies[key] = policy;
+            if (!keysForSession.has(shared)) keysForSession.set(shared, new Set());
+            keysForSession.get(shared).add(key);
+            reverse.set(shared, sharedOwnerKeyOf(cfg, member));
+            // ⚠️ 复用分支过去完全没碰 bootstrapSent（直接 return），
+            // 于是"复用一个刚建好的会话"和"新建一个会话"在引导语义上不一致：
+            // 新建分支会复位整组，复用分支不会。
+            // 实测后果：清了某个 key 的上下文后，另一个 key 走复用路径拿到旧会话，
+            // 那轮就只是普通唤醒 —— 没有【引导】、没有记忆提示。
+            // 这里不主动复位（复用意味着会话还有上下文，不该当冷启动），
+            // 只在**整组都还是未引导**时保持未引导，让下一次真正的新会话去处理。
+            // 真正的复位点只有两个：ensureSession 的新建分支、/api/session/reset。
+            saveState();
+            log(`共用会话：${key} 复用 ${member} 的会话 ${shared}`);
+            await ensureChatModel(shared);
+            return shared;
+          }
+        }
+      }
+    }
     const existing = state.sessions[key];
     if (existing) {
       // reset/清空工作区期间旧映射可能尚未清理；发现代际不匹配必须丢弃旧会话，防止复活。
@@ -9123,7 +9816,12 @@ async function main() {
       fs.mkdirSync(dir, { recursive: true });
       let sessionId;
       let lastError = null;
-      const preset = modePreset(key, currentMode, cfg);
+      // 共用组取组内最低权限档的 preset（见 sharedPresetName 的说明）；
+      // 不在共享组里时就是本来的单会话 preset。
+      const shareGroup = shareGroupOf(key);
+      const preset = shareGroup.length > 1
+        ? sharedPresetName(shareGroup, currentMode, cfg)
+        : modePreset(key, currentMode, cfg);
       // 非 closed-agent（chat / reserved / reserved2，会话可能属于 QQ 群）必须 fail-closed：
       // 拿不到 qq-chat* 就拒绝建会话，绝不让 DSH 用默认 preset（standard）顶上——那会把
       // bash/文件读写等本地工具暴露给 QQ 群里的任何人（见 RULES.md「无本地工具」）。
@@ -9173,6 +9871,20 @@ async function main() {
       state.sessions[key] = sessionId;
       state.sessionPolicies[key] = policy;
       reverse.set(sessionId, key);
+      // ── 条件 A「新会话」的唯一写入点（2026-11-13 重建）──────────────────
+      //
+      // 按 **DSH sessionId** 登记，不按 QQ key：共用会话下私聊和群拿到的是同一个
+      // sessionId，登记一份就是全组一份，两个入口不可能各发一遍。
+      // sessionId 变了 = 上下文一定没了，这是硬事实，比任何 reason 都可靠。
+      //
+      // ⚠️ 这里**不再复位 bootstrapSent**。
+      // 旧实现靠"新会话 → bootstrapSent=false"来标记冷启动，于是它必须在这里清；
+      // 而清完之后，调用方（控制台手动唤醒）刚刚 markGroupBootstrapSent 置的位
+      // 会被紧随其后的 ensureSession 抹掉 —— 第二次手动唤醒又被判成首次，无限重复。
+      // 现在冷启动由登记表回答，bootstrapSent 只剩"初始提示词注入过没有"这一个用途，
+      // 而初始提示词本来就该跟着**新会话**重新注入一次，所以只在确实需要时清
+      // ——那种情况由 reset 路径负责，不在这里顺手清。
+      markColdStart(sessionId, 'new', `新建会话 ${key}`);
       saveState();
       await ensureChatModel(sessionId);
       if (epoch !== sessionEpoch || !isCurrentSession(key, sessionId)) {
@@ -9218,6 +9930,19 @@ async function main() {
   const socialV2 = {
     conversations: new Map(), // key -> state
     paused: false, // 控制台可暂停整个二代 AI 活动（停止唤醒/等待）
+    // ── 好感度：**全局按 QQ 号存**，不再挂在会话上 ────────────────────────
+    // 为什么改（2026-11-10 操作者要求，也是踩坑后的结论）：
+    //   原来 affinities 存在 conversations[key].affinities 里，于是：
+    //     · 「清除上下文」/「重置二代状态」/清空工作区 都会连它一起删掉；
+    //     · 私聊和群各自存一份，靠 shareGroup 合并，逻辑本来就绕。
+    //   操作者清了一次上下文，18 个人的好感度直接归零 —— 那是攒了很久的数据。
+    //   关系是"我和这个人之间"的事实，不该因为某个聊天窗口重建而消失。
+    // 现在：userId -> { score, stageId, lastAt, count, createdAt }
+    //   与 key 无关；私聊/群、重置会话、换会话都不影响它。
+    // 旧数据（会话里那份）在加载时会被合并进来，见 loadSocialV2 / migrateAffinitiesToGlobal。
+    affinities: {},
+    // 档位变化提醒：userId -> { from, to, at }。同样全局，不再按会话分。
+    affinityStageChanges: {},
   };
 
   // 一代/普通模式的图片/表情元数据存储：key -> Map<messageId/seq, media[]>
@@ -9297,7 +10022,12 @@ async function main() {
   }
 
   // 把“仍使用默认唤醒配置”的会话刷新为当前推荐/默认参数。
-  // 只有 confirmedBy === 'default' 的会话才会被刷新；AI 或管理员显式设置过的（set_wake_config / mark_read）不会被覆盖。
+  // 只有 confirmedBy === 'default' 的会话才会被刷新；AI 显式设置过的
+  // （set_wake_config 写入的 'set_wake_config'）不会被覆盖。
+  //
+  // 2026-11-11：mark_read **不再**写 confirmedBy（旧注释把它和 set_wake_config
+  // 并列是错的）。mark_read 只表示"我看完了"，不代表改过唤醒配置；让它冻结配置的
+  // 后果是"控制台关掉提问唤醒也不生效"（实测踩过：一个问号仍会叫醒她）。
   function refreshDefaultWakeConfigV2(st) {
     if (!st || !st.wakeConfig) return false;
     if (st.wakeConfig.confirmedBy !== 'default') return false;
@@ -9324,11 +10054,18 @@ async function main() {
     return changed;
   }
 
-  // 沉睡前强制观察窗口：防止 AI 聊两句就立刻潜水。
-  // 新规则：每次设置潜水/下一次唤醒前，AI 必须先进入一次“沉睡前观察”（qq_wait_for_messages(timeoutMs=preSleepWaitMs)）。
-  // - 观察期间没人说话 → 可以设置唤醒并沉睡（preSleepWaitSatisfiedAt）。
-  // - 观察期间有人发了新消息 → 等待工具会把新消息带回给 AI（preSleepWaitObservedAt）；
-  //   AI 看过新消息后若判断没必要参与，可以直接沉睡；若参与了（发送/拍一拍），则下次想睡需重新观察。
+  // ── 沉睡前拦截（2026-11-12 简化）──────────────────────────────────────
+  //
+  // 旧版这里有三套机制叠加：观察窗口（wait 满 N 分钟）、结束语识别、连续水位。
+  // 观察窗口已经退役（wait 变成 passive，立刻返回），现在只剩一条真正有意义：
+  //
+  //   **还有她没看过的消息时，先让她看到，再让她决定收尾还是继续。**
+  //
+  // 具体表现放在调用方（mark_read / set_wake_config 的拦截分支）：
+  // 不是回一句错误，而是把 `uncovered` 那几条按【本轮消息】的格式贴出来。
+  //
+  // 结束语识别保留：对方明确说了"晚安/拜拜/睡了"，说明对话结束，
+  // 这时即使有零星的未读也不该拦她 —— 那几句大概率是无关闲聊。
   const EXPLICIT_END_RE = /(?:不聊了|不说了|晚安|晚安啦|睡了|先睡了|睡啦|困了|下了|先下了|拜拜|再见|明天见|see\s*you|good\s*night|走了|先走|撤了|溜了|去忙|忙了|下次再聊|下次聊|散了吧|结束|就到这|先这样|就这样吧|886|88|睡觉了|下班了|去洗澡|去吃饭了)/i;
 
   function hasExplicitEndV2(st) {
@@ -9411,6 +10148,12 @@ async function main() {
   }
 
   function getSocialV2State(key) {
+    // 全局记忆是**不是会话**：它没有唤醒配置、没有未读队列、没有定时器。
+    // 但记忆相关的函数（appendMemoryV2 / formatMemoryV2 / 各端点）都要一个
+    // "长得像会话状态"的对象来读写，所以这里把 globalMemory 补齐成同形状返回。
+    // 绝不会被放进 socialV2.conversations —— 那会让十几处"遍历会话"的逻辑
+    // 把它当成一个真实 QQ 聊天（见 globalMemory 定义处的说明）。
+    if (key === GLOBAL_MEMORY_KEY) return globalMemory;
     // 只允许内部约定的会话 key 格式，并统一成无前导零的正整数形式，防止同一会话分裂成多个状态。
     const canonical = canonicalV2Key(key);
     if (!canonical) {
@@ -9454,6 +10197,13 @@ async function main() {
         // **刻意不进 formatMemoryV2**：每轮灌给它就成了新的灌输，成长必须是它自己
         // 想起来的。只在冷启动（新会话第一次唤醒）读一次，平时靠 qq_memory_query。
         selfNotes: [],
+        // 好感度：userId → { score, stageId, lastAt, count, createdAt }。
+        // 按人记而不是按聊天记 —— 同一个群里跟 A 熟、跟 B 生疏是两回事。
+        affinities: {},
+        // 档位变化提醒：userId → { from, to, at }。
+        // 只在**档位真的变了**时写入，由唤醒包提示"某某的档位变了，回他之前先查一次"。
+        // 目的：不再要求"每轮必查"，把那次工具调用省下来。
+        affinityStageChanges: {},
         // 闲置压缩：idleCompactedAt 非 0 表示「这一轮对话已经压过」，直到用户
         // 再发消息才清零；idleCompactingAt 是正在压的防重入锁（跨扫描周期）。
         idleCompactedAt: 0,
@@ -9484,6 +10234,12 @@ async function main() {
       })();
       const raw = readJsonSafe(SOCIAL_V2_FILE, null);
       socialV2.paused = raw?.paused === true;
+      // 纯语音配置：从文件读回（2026-11-13 补）。
+      // 之前 saveSocialV2State 不写 tts、loadSocialV2State 也不读 ——
+      // 于是"纯语音开着的状态"活不过一次重启。现在两边都接上了。
+      if (raw && raw.tts && typeof raw.tts === 'object') {
+        socialV2.tts = normalizeTtsConfig(raw.tts);
+      }
       if (raw && typeof raw.conversations === 'object') {
         const seenTokens = new Set();
         for (const [key, val] of Object.entries(raw.conversations)) {
@@ -9530,6 +10286,39 @@ async function main() {
             activeTopics: Array.isArray(val.activeTopics) ? val.activeTopics : [],
             selfNotes: Array.isArray(val.selfNotes) ? val.selfNotes : [],
             pendingThoughts: Array.isArray(val.pendingThoughts) ? val.pendingThoughts : [],
+            // 好感度：按人记（userId → {score, stageId, lastAt, count}）。
+            // 与 memberImpressions 分开存：印象是文字描述，好感是数值档位。
+            affinities: (() => {
+              const raw = (val.affinities && typeof val.affinities === 'object') ? val.affinities : {};
+              const clean = {};
+              for (const [k, v] of Object.entries(raw)) {
+                if (['__proto__', 'constructor', 'prototype'].includes(k)) continue;
+                if (!v || typeof v !== 'object') continue;
+                const score = Number(v.score);
+                clean[k] = {
+                  score: Number.isFinite(score) ? score : AFFINITY_INITIAL,
+                  stageId: String(v.stageId || affinityStageOf(Number.isFinite(score) ? score : AFFINITY_INITIAL).id),
+                  lastAt: Number(v.lastAt) || 0,
+                  count: Number(v.count) || 0,
+                  createdAt: Number(v.createdAt) || 0,
+                };
+              }
+              return clean;
+            })(),
+            // 档位变化提醒：{ userId: { from, to, at } }。只恢复 7 天内的，防脏数据无限堆积。
+            affinityStageChanges: (() => {
+              const raw = (val.affinityStageChanges && typeof val.affinityStageChanges === 'object')
+                ? val.affinityStageChanges : {};
+              const cutoff = Date.now() - 7 * 86400000;
+              const clean = {};
+              for (const [k, v] of Object.entries(raw)) {
+                if (['__proto__', 'constructor', 'prototype'].includes(k)) continue;
+                if (!v || typeof v !== 'object') continue;
+                if (!(Number(v.at) > cutoff)) continue;
+                clean[k] = { from: String(v.from || ''), to: String(v.to || ''), at: Number(v.at) || 0 };
+              }
+              return clean;
+            })(),
             memberImpressions: (() => {
               const rawImp = (val.memberImpressions && typeof val.memberImpressions === 'object') ? val.memberImpressions : {};
               const clean = {};
@@ -9571,6 +10360,213 @@ async function main() {
           ensureWakeableV2(st, { skipSave: true, key });
           scheduleProactiveCheckV2(key);
         }
+        // ── 别名表：从顶层读（昵称 ↔ QQ 号）────────────────────────────────
+        // 缺失时不报错：第一次启动没有这个字段很正常，运行中会自动建起来。
+        try {
+          const rawAliases = raw.aliases && typeof raw.aliases === 'object' ? raw.aliases : {};
+          socialV2.aliases = {};
+          for (const [uid, v] of Object.entries(rawAliases)) {
+            if (!/^\d{4,12}$/.test(uid) || !v || !Array.isArray(v.names)) continue;
+            const names = v.names.filter((n) => typeof n === 'string' && n.trim()).slice(0, 12);
+            if (!names.length) continue;
+            socialV2.aliases[uid] = {
+              names,
+              primary: String(v.primary || names[0]).slice(0, 64),
+              lastAt: Number(v.lastAt) || 0
+            };
+          }
+          // 回填：老数据的别名表是空的（这个字段 2026-11-12 才出现），
+          // 不回填的话要等群里每个人都再说一句话才能查到号 —— 那要好几天。
+          // 这里从各会话的 recentMessages / unread 里扫一遍 (userId, sender) 补进去。
+          // 幂等：已有的号只是刷新 lastAt，不会重复建。
+          let backfilled = 0;
+          for (const [, st] of socialV2.conversations) {
+            for (const m of [...(Array.isArray(st?.unread) ? st.unread : []),
+              ...(Array.isArray(st?.recentMessages) ? st.recentMessages : [])]) {
+              if (!m || m.isSelf) continue;
+              if (m.userId == null || !m.sender) continue;
+              const before = socialV2.aliases[String(m.userId)]?.names?.length ?? 0;
+              if (noteAliasV2(m.userId, m.sender)) backfilled++;
+              const after = socialV2.aliases[String(m.userId)]?.names?.length ?? 0;
+              if (after > before) backfilled++;
+            }
+          }
+          if (backfilled > 0) {
+            log(`[alias] 别名表已从历史消息回填（${Object.keys(socialV2.aliases).length} 人）`);
+          }
+        } catch (error) {
+          log('[alias] 别名表恢复失败（已跳过）:', error?.message ?? error);
+          if (!socialV2.aliases) socialV2.aliases = {};
+        }
+        // ── 全局记忆：从**顶层**读（新格式），并把会话里的旧数据迁移进来 ──────
+        // 迁移规则（去重合并，不丢内容）：
+        //   · memberImpression：同一个 target 的多条 traits 合并去重；
+        //     target 若是「私聊」这类非人名，换成对应的 QQ 号/主人名。
+        //   · selfNote：按文本去重，保留最早 createdAt 与最新 lastTouchedAt。
+        // 迁移只做一次：完成后会话里的旧副本会在下次落盘时消失
+        // （saveSocialV2State 的会话段不再写这两类）。
+        try {
+          const rawGlobal = raw.globalMemory && typeof raw.globalMemory === 'object' ? raw.globalMemory : {};
+          const imp = {};
+          const noteMap = new Map();
+          // 1) 顶层（新格式）
+          for (const [name, v] of Object.entries(rawGlobal.memberImpressions || {})) {
+            if (!v || !Array.isArray(v.traits)) continue;
+            imp[name] = {
+              traits: v.traits.filter(Boolean).slice(0, 10),
+              interactionCount: Number(v.interactionCount) || 0,
+              lastSeenAt: Number(v.lastSeenAt) || 0
+            };
+          }
+          for (const n of (Array.isArray(rawGlobal.selfNotes) ? rawGlobal.selfNotes : [])) {
+            if (!n || !n.text) continue;
+            const text = String(n.text);
+            const prev = noteMap.get(text);
+            if (!prev) {
+              noteMap.set(text, {
+                text,
+                createdAt: Number(n.createdAt) || Number(n.at) || Date.now(),
+                lastTouchedAt: Number(n.lastTouchedAt) || Number(n.at) || Date.now()
+              });
+            } else {
+              prev.createdAt = Math.min(prev.createdAt, Number(n.createdAt) || prev.createdAt);
+              prev.lastTouchedAt = Math.max(prev.lastTouchedAt, Number(n.lastTouchedAt) || 0);
+            }
+          }
+          // 2) 从各会话的旧副本迁移进来
+          let migratedImp = 0;
+          let migratedNote = 0;
+          for (const [convKey, conv] of Object.entries(raw.conversations || {})) {
+            if (!conv || typeof conv !== 'object') continue;
+            for (const [name, v] of Object.entries(conv.memberImpressions || {})) {
+              if (!v || !Array.isArray(v.traits) || !v.traits.length) continue;
+              const merged = imp[name] || { traits: [], interactionCount: 0, lastSeenAt: 0 };
+              for (const t of v.traits.filter(Boolean)) {
+                if (!merged.traits.includes(t)) merged.traits.push(t);
+              }
+              merged.traits = merged.traits.slice(0, 10);
+              merged.interactionCount += Number(v.interactionCount) || 0;
+              merged.lastSeenAt = Math.max(merged.lastSeenAt, Number(v.lastSeenAt) || 0);
+              imp[name] = merged;
+              migratedImp += 1;
+            }
+            for (const n of (Array.isArray(conv.selfNotes) ? conv.selfNotes : [])) {
+              if (!n || !n.text) continue;
+              const text = String(n.text);
+              const prev = noteMap.get(text);
+              if (!prev) {
+                noteMap.set(text, {
+                  text,
+                  createdAt: Number(n.createdAt) || Number(n.at) || Date.now(),
+                  lastTouchedAt: Number(n.lastTouchedAt) || Number(n.at) || Date.now()
+                });
+                migratedNote += 1;
+              } else {
+                prev.createdAt = Math.min(prev.createdAt, Number(n.createdAt) || prev.createdAt);
+                prev.lastTouchedAt = Math.max(prev.lastTouchedAt, Number(n.lastTouchedAt) || 0);
+              }
+            }
+          }
+          globalMemory.memberImpressions = imp;
+          globalMemory.selfNotes = [...noteMap.values()].slice(-40);
+          // 待办：读进来时把过期的丢掉（文件里可能残留旧的、或时钟被改过）。
+          //
+          // ⚠️ 但有一个必须留：**刚过期、还没提醒过**的那条。
+          // 场景：她写了「六点提醒他拿快递」，桥接在 5:59 重启 ——
+          // 如果这里严格按"没过期"过滤，那条就被吃掉，她永远收不到提醒。
+          // 所以保留窗口是「过期后 10 分钟内且 notifiedAt 还是 0」，
+          // 让 setupTodoTimerV2 有机会立刻补发一次，然后正常丢弃。
+          const TODO_GRACE_MS = 10 * 60 * 1000;
+          globalMemory.todos = (Array.isArray(rawGlobal.todos) ? rawGlobal.todos : [])
+            .filter((t) => {
+              if (!t || !t.text) return false;
+              if (!t.expiresAt) return true;
+              const due = Number(t.expiresAt);
+              if (Date.now() < due) return true;
+              // 已过期：只有"还没提醒过 + 在宽限期内"才留。
+              return !t.notifiedAt && Date.now() - due < TODO_GRACE_MS;
+            })
+            .slice(-TODO_MAX);
+          // 长期事实的"变化基线"也挂在全局：指纹 + 已见 id。
+          // 不给默认值会让第一轮把整库当"新变化"提示一遍。
+          globalMemory.factFingerprint = String(rawGlobal.factFingerprint || '');
+          globalMemory.factSeenIds = Array.isArray(rawGlobal.factSeenIds) ? rawGlobal.factSeenIds.slice(-200) : [];
+          if (migratedImp || migratedNote) {
+            log(`[memory] 已把旧数据迁移进全局记忆：印象 ${migratedImp} 条、selfNote ${migratedNote} 条`);
+          }
+        } catch (error) {
+          log('[memory] 全局记忆恢复失败（已跳过）:', error?.message ?? error);
+        }
+        // ── 好感度：从**顶层**读（新格式），并把会话里的旧数据迁移进来 ────────
+        // 迁移规则（只增不减，取分最高的那份）：同一个 uid 可能分散在多个会话里，
+        // 取 score 最大的；count 取最大的（它是"聊过几次"的累计事实，不该因为迁移变小）。
+        // 迁移只做一次：完成后会话里的旧副本会在下次落盘时消失（saveSocialV2State 不再写它）。
+        try {
+          if (!socialV2.affinities || typeof socialV2.affinities !== 'object') socialV2.affinities = {};
+          if (!socialV2.affinityStageChanges || typeof socialV2.affinityStageChanges !== 'object') {
+            socialV2.affinityStageChanges = {};
+          }
+          // 1) 顶层已有的（新格式）
+          const top = raw.affinities && typeof raw.affinities === 'object' ? raw.affinities : {};
+          let migrated = 0;
+          for (const [uid, rec] of Object.entries(top)) {
+            if (!rec || !(Number(rec.count) > 0)) continue;
+            socialV2.affinities[uid] = {
+              score: Number(rec.score) || AFFINITY_INITIAL,
+              stageId: String(rec.stageId || affinityStageOf(Number(rec.score) || AFFINITY_INITIAL).id),
+              lastAt: Number(rec.lastAt) || 0,
+              count: Number(rec.count) || 0,
+              createdAt: Number(rec.createdAt) || 0,
+              ...(Number(rec.manualAt) > 0 ? { manualAt: Number(rec.manualAt) } : {}),
+            };
+          }
+          // 2) 会话里的旧数据（一次性迁移）
+          for (const [, cst] of socialV2.conversations) {
+            const old = cst.affinities && typeof cst.affinities === 'object' ? cst.affinities : {};
+            for (const [uid, rec] of Object.entries(old)) {
+              if (!rec || !(Number(rec.count) > 0)) continue;
+              const cur = socialV2.affinities[uid];
+              const candScore = Number(rec.score) || 0;
+              const candCount = Number(rec.count) || 0;
+              if (!cur) {
+                socialV2.affinities[uid] = {
+                  score: candScore,
+                  stageId: String(rec.stageId || affinityStageOf(candScore).id),
+                  lastAt: Number(rec.lastAt) || 0,
+                  count: candCount,
+                  createdAt: Number(rec.createdAt) || 0,
+                };
+                migrated += 1;
+              } else {
+                // 取更高的分（关系只增不减），次数取更大值。
+                if (candScore > Number(cur.score)) {
+                  cur.score = candScore;
+                  cur.stageId = String(rec.stageId || affinityStageOf(candScore).id);
+                  migrated += 1;
+                }
+                if (candCount > Number(cur.count)) cur.count = candCount;
+                if ((Number(rec.lastAt) || 0) > (Number(cur.lastAt) || 0)) cur.lastAt = Number(rec.lastAt) || 0;
+              }
+            }
+            // 迁移完就把会话里的旧副本清掉，避免以后又被当成"另一份数据"读出来。
+            if (Object.keys(old).length) cst.affinities = {};
+          }
+          // 3) 档位变化提醒同样从顶层读（外层变量是 raw，不是循环里的 val）
+          const topCh = raw.affinityStageChanges && typeof raw.affinityStageChanges === 'object'
+            ? raw.affinityStageChanges : {};
+          for (const [uid, v] of Object.entries(topCh)) {
+            if (!v || typeof v !== 'object') continue;
+            socialV2.affinityStageChanges[uid] = {
+              from: String(v.from || ''), to: String(v.to || ''), at: Number(v.at) || 0,
+            };
+          }
+          const total = Object.keys(socialV2.affinities).length;
+          if (migrated > 0 || total > 0) {
+            log(`[affinity] 全局好感度已加载：${total} 人${migrated > 0 ? `（本次从会话迁移 ${migrated} 条）` : ''}`);
+          }
+        } catch (error) {
+          log(`[affinity] 加载全局好感度失败（已跳过）：${error?.message ?? error}`);
+        }
         // 加载阶段统一落盘一次，避免 ensureWakeableV2 中途写盘覆盖未加载会话。
         // 但只有在文件仍是「我们读到的那一份」时才写：否则说明有另一个进程写过它，
         // 我们手里的内存态已经过时，回写会静默吞掉对方的新数据。
@@ -9596,6 +10592,89 @@ async function main() {
   function saveSocialV2State() {
     try {
       const obj = { paused: socialV2.paused, conversations: Object.create(null) };
+      // ── 别名表（昵称 ↔ QQ 号）：**顶层全局**一份 ──────────────────────────
+      // 2026-11-12：为了让模型"只看人名、不带 QQ 号"，桥接必须能反查。
+      // 结构：{ [userId]: { names: [...], lastAt, primary } }
+      //   · names —— 这个号用过的所有昵称/群名片（自动合并，去重、按最近使用排序）
+      //   · primary —— 最近一次用的名字（渲染时优先用它，保证同一个号显示同一个名）
+      //   · lastAt —— 最近一次见到的时间
+      // 与会话无关，且必须活过「清除上下文」（那是清会话，不该清"这人是谁"）。
+      obj.aliases = (() => {
+        const raw = socialV2.aliases && typeof socialV2.aliases === 'object' ? socialV2.aliases : {};
+        const entries = Object.entries(raw)
+          .filter(([uid, v]) => /^\d{4,12}$/.test(uid) && v && Array.isArray(v.names) && v.names.length)
+          .map(([uid, v]) => [uid, {
+            names: v.names.filter((n) => typeof n === 'string' && n.trim()).slice(0, 12),
+            primary: String(v.primary || v.names[0] || '').slice(0, 64),
+            lastAt: Number(v.lastAt) || 0
+          }]);
+        // 上限 1000 人：全局一份，比会话级宽得多。
+        entries.sort((a, b) => b[1].lastAt - a[1].lastAt);
+        return Object.fromEntries(entries.slice(0, 1000));
+      })();
+      // ── 好感度：**顶层全局**存一份（按 QQ 号），与会话无关 ────────────────
+      // 放顶层的原因：它必须活过「清除上下文」「重置二代状态」「清空工作区」，
+      // 因为那些操作只该清会话，不该清关系。之前挂在 conversations[key] 下，
+      // 清一次上下文 18 个人的记录就全没了（2026-11-10 实际发生过）。
+      obj.affinities = (() => {
+        const raw = socialV2.affinities && typeof socialV2.affinities === 'object' ? socialV2.affinities : {};
+        const entries = Object.entries(raw).filter(([, v]) => v && Number(v.count) > 0);
+        // 上限 500 人：比原来每会话 200 宽，因为现在是全局一份，不该被截断得太狠。
+        entries.sort((a, b) => (Number(b[1].lastAt) || 0) - (Number(a[1].lastAt) || 0));
+        return Object.fromEntries(entries.slice(0, 500));
+      })();
+      // ── 纯语音（TTS）配置：必须落盘，否则重启后开关被重置 ──────────────────
+      // 2026-11-13 修：以前这个字段压根没被保存，于是每次重启"纯语音"都变回关闭。
+      //   之前一直当成"重启会重置开关"，其实是数据从来没写进文件。
+      //   只存**开关 + 关键参数**，不存缓存路径之类的运行时东西。
+      obj.tts = socialV2.tts && typeof socialV2.tts === 'object'
+        ? { ...socialV2.tts }
+        : {};
+
+      // 档位变化提醒：只留最近 20 条、7 天内的。
+      obj.affinityStageChanges = (() => {
+        const raw = socialV2.affinityStageChanges && typeof socialV2.affinityStageChanges === 'object'
+          ? socialV2.affinityStageChanges : {};
+        const cutoff = Date.now() - 7 * 86400000;
+        return Object.fromEntries(
+          Object.entries(raw)
+            .filter(([, v]) => v && Number(v.at) > cutoff)
+            .slice(-20),
+        );
+      })();
+      // ── 全局记忆：**顶层存一份**，与会话无关 ────────────────────────────────
+      // 和 affinities 同理：memberImpressions / selfNotes 必须活过「清除上下文」
+      // 和「重置二代状态」——那些操作只该清会话，不该把"她是谁、她认识谁"一起抹掉。
+      // 以前这两类挂在 conversations[key] 下，清一次上下文就全没了，
+      // 而且同一个群友在不同 key 下会各存一条（"印象里出现两个我"就是这么来的）。
+      obj.globalMemory = {
+        memberImpressions: (() => {
+          const raw = globalMemory.memberImpressions && typeof globalMemory.memberImpressions === 'object'
+            ? globalMemory.memberImpressions : {};
+          const entries = Object.entries(raw)
+            .filter(([, v]) => v && Array.isArray(v.traits) && v.traits.length);
+          // 上限 500：全局一份，别截得太狠。
+          entries.sort((a, b) => (Number(b[1].lastSeenAt) || 0) - (Number(a[1].lastSeenAt) || 0));
+          return Object.fromEntries(entries.slice(0, 500));
+        })(),
+        // selfNote 上限 40：慢变量，堆太多互相稀释。
+        selfNotes: (Array.isArray(globalMemory.selfNotes) ? globalMemory.selfNotes : []).slice(-40),
+        // 待办：全局一份，但**只存还没过期的** —— 过期的事不该占用文件，
+        // 也没必要让她下次读到一堆早已经过去的事。
+        todos: (Array.isArray(globalMemory.todos) ? globalMemory.todos : [])
+          .filter((t) => {
+            if (!t || !t.text) return false;
+            if (!t.expiresAt) return true;
+            const due = Number(t.expiresAt);
+            if (Date.now() < due) return true;
+            // 和加载那边同一条规则：刚过期还没提醒过的要留着，否则重启就丢了。
+            return !t.notifiedAt && Date.now() - due < 10 * 60 * 1000;
+          })
+          .slice(-TODO_MAX),
+        // 长期事实的「变化基线」：全局一份（事实本身也是全局的）。
+        factFingerprint: String(globalMemory.factFingerprint || ''),
+        factSeenIds: Array.isArray(globalMemory.factSeenIds) ? globalMemory.factSeenIds.slice(-200) : []
+      };
       for (const [key, st] of socialV2.conversations) {
         obj.conversations[key] = {
           wakeConfig: st.wakeConfig,
@@ -9616,10 +10695,18 @@ async function main() {
           preSleepWaitAccumMs: st.preSleepWaitAccumMs || 0,
           lastUnreadSeq: st.lastUnreadSeq || 0,
           lastReadThroughSeq: st.lastReadThroughSeq || 0,
+          // 长期事实的内容指纹（id 序列 + hits）：判断「内容变了没有」，没变就不提示。
+          factFingerprint: String(st.factFingerprint || ''),
+          // 上一次「全量看到过」的事实 id 列表（冷启动注入时写入）。
+          // 工具据此只返回「新增的」和「已经掉出去的」，而不是每次都给全部 30 条。
+          factSeenIds: Array.isArray(st.factSeenIds) ? st.factSeenIds.slice(-200) : [],
           activeTopics: Array.isArray(st.activeTopics) ? st.activeTopics.slice(-50) : [],
           selfNotes: Array.isArray(st.selfNotes) ? st.selfNotes.slice(-40) : [],
           pendingThoughts: Array.isArray(st.pendingThoughts) ? st.pendingThoughts.slice(-50) : [],
           memberImpressions: st.memberImpressions && typeof st.memberImpressions === 'object' ? st.memberImpressions : {},
+          // ⚠️ 好感度**不再**按会话落盘（2026-11-10）：
+          //   它现在存在顶层的 socialV2.affinities 里，见下面 obj 的组装。
+          //   这里保留一个空对象，是为了让老版本读完不炸、以及迁移期间不丢字段。
           seenForwardIds: Array.from(seenForwardIds.get(key) || []).slice(-1000)
         };
       }
@@ -9789,24 +10876,23 @@ async function main() {
     const recentAi2m = recent.filter((m) => m && m.isSelf && now - (Number(m.time) || 0) < 2 * 60 * 1000).length;
     let hint = '';
     if (directUnread > 0) {
-      hint = '有人直接找你，优先回应；其余热闹可以挑着参与。';
+      hint = '有人直接找你。';
     } else if (recentAi2m >= 2) {
-      hint = '你刚刚已经连回过好几次了，这轮可以少说，但别直接消失；有值得接的仍要自然接一句。';
+      hint = '你刚连说了几次。';
     } else if (lastAiGap < 120000) {
-      hint = '你刚说过话，先听一会儿；有能接住的话再自然接，不用硬等点名。';
+      hint = '你刚说过话。';
     } else if (aiCount >= 5) {
-      hint = '你最近发言偏多，这轮可以少说，但遇到真正想说的仍主动说。';
+      hint = '你这一小时说得比较多。';
     } else if (fiveMinOthers.length >= 10 || (fiveMinOthers.length >= 6 && activeSenders >= 3)) {
-      hint = `群聊正热（近5分钟${fiveMinOthers.length}条${activeSenders ? `/${activeSenders}人` : ''}在聊），不用逐条关注；挑最值得接的一句主动参与，插不上再潜水。`;
+      hint = `近 5 分钟 ${fiveMinOthers.length} 条${activeSenders ? `/${activeSenders}人` : ''}在聊，比较热闹。`;
     } else if (otherCount >= 10 && aiCount === 0) {
-      hint = '群聊很热闹但没叫你，可以插一句有趣的，或只看不说。';
+      hint = '群里聊得多，没人叫你。';
     } else if (otherCount < 3 && aiCount > 0) {
-      hint = '群聊有点冷，不要一个人撑场；但有想法时仍可主动抛一句。';
-    } else if (aiCount <= 1 && otherCount >= 10) {
-      hint = '这轮可以简短接一句，别潜水；挑一个点参与。';
+      hint = '群里话不多。';
     }
     const burstText = fiveMinOthers.length ? `；近5分钟群聊 ${fiveMinOthers.length} 条${activeSenders ? `/${activeSenders}人` : ''}` : '';
-    return `【参与度参考】你最近 1 小时发言 ${aiCount} 次，群友发言 ${otherCount} 条${burstText}。${hint}`;
+    // 只给事实（谁在聊、聊了多少），不给"该不该开口"的指令：说什么、说不说是角色自己的事。
+    return `【群聊现状】你最近 1 小时发言 ${aiCount} 次，群友发言 ${otherCount} 条${burstText}。${hint}`;
   }
 
   function suggestQuietMsV2(st) {
@@ -9822,59 +10908,137 @@ async function main() {
     return defaultMs;
   }
 
-  function formatMemoryV2(st) {
+  /**
+   * 把记忆渲染成给模型看的纯文本。
+   *
+   * 2026-11-11 重排（操作者要求「做成和长期记忆一样的」+「会话级的两类要带上 key」）：
+   *   · 每类记忆**各占一段**，段间空行（与 formatFactsBlock 同一排版）；
+   *   · 段首统一「【标题】N 条（一句说明）」；
+   *   · 没内容也输出一行，不再整段消失（否则 formatted 为空 → MCP 回退成裸 JSON）；
+   *   · **activeTopic / pendingThought 是会话级的**，段首必须标出属于哪个 key，
+   *     否则她分不清"这个话题是群里的还是私聊的"——共用会话下尤其危险，
+   *     会把群里的话题当成私聊的接着说。
+   *
+   * @param {object} st   记忆状态（会话级的来自本会话、长期三类来自全局）
+   * @param {string} key 这个会话的 key（如 group:20001），用于标注会话级记忆的归属
+   */
+  function formatMemoryV2(st, key = '') {
     if (!st) return '';
-    const lines = [];
+    const blocks = [];
+    const now = Date.now();
+    // 会话级记忆的归属标注：有 key 就写「属于 xxx」，没有就留空说明是"当前会话"。
+    // key 原样输出（group:20001 / private:10001），因为模型发言时要照抄它。
+    const scope = key ? `属于 ${key}` : '属于当前会话';
+
+    // ① 进行中的话题（会话级）
     const topics = Array.isArray(st.activeTopics) ? st.activeTopics.filter((t) => t && t.text) : [];
     if (topics.length) {
-      lines.push('【进行中的话题】');
+      const lines = [`【进行中的话题】${topics.length} 条（${scope}；只在那个聊天里成立，不要搬到别的聊天去接）`];
       for (const t of topics.slice(-10)) {
-        const ago = t.lastMentionAt ? Math.round((Date.now() - t.lastMentionAt) / 60000) : 0;
-        const stale = t.lastMentionAt && Date.now() - Number(t.lastMentionAt) > 2 * 60 * 60 * 1000 ? '（已搁置）' : '';
-        lines.push(`- ${t.text}${stale}（${ago > 0 ? ago + '分钟前' : '刚刚'}）${t.pendingQuestion ? `；待追问：${t.pendingQuestion}` : ''}`);
+        const ago = t.lastMentionAt ? Math.round((now - t.lastMentionAt) / 60000) : 0;
+        const stale = t.lastMentionAt && now - Number(t.lastMentionAt) > 2 * 60 * 60 * 1000 ? '（已搁置）' : '';
+        lines.push(`- ${t.text}${stale}（${ago > 0 ? `${ago} 分钟前` : '刚刚'}）${t.pendingQuestion ? `；待追问：${t.pendingQuestion}` : ''}`);
       }
+      blocks.push(lines.join('\n'));
     }
-    const thoughts = Array.isArray(st.pendingThoughts) ? st.pendingThoughts.filter((t) => t && t.text && (!t.expiresAt || Date.now() < t.expiresAt)) : [];
+    // ② 想说但还没说的（会话级）
+    const thoughts = Array.isArray(st.pendingThoughts)
+      ? st.pendingThoughts.filter((t) => t && t.text && (!t.expiresAt || now < t.expiresAt))
+      : [];
     if (thoughts.length) {
-      lines.push('【你想说但还没说的】');
+      const lines = [`【你想说但还没说的】${thoughts.length} 条（${scope}；说出去或过期就没了）`];
       for (const t of thoughts.slice(-10)) {
         lines.push(`- ${t.text}${t.motivation ? `（${t.motivation}）` : ''}`);
       }
+      blocks.push(lines.join('\n'));
     }
-    const impressions = st.memberImpressions && typeof st.memberImpressions === 'object' ? st.memberImpressions : {};
-    const names = Object.keys(impressions);
-    if (names.length) {
-      lines.push('【对群友的印象】');
-      for (const name of names.slice(-10)) {
-        const im = impressions[name] || {};
-        const traits = Array.isArray(im.traits) ? im.traits : [];
-        lines.push(`- ${name}：${traits.length ? traits.join('、') : '暂无记录'}（互动 ${Number(im.interactionCount) || 0} 次）`);
+    // ②b 待办（全局；一两天内要兑现的事，到期自动消失）
+    const todos = Array.isArray(st.todos)
+      ? st.todos.filter((t) => t && t.text && (!t.expiresAt || now < t.expiresAt))
+      : [];
+    if (todos.length) {
+      const lines = [`【待办】${todos.length} 条（一两天内要做完的事；到期自动消失，不用一直记着）`];
+      for (const t of todos.slice(-10)) {
+        // 剩余时间用"还剩几小时/几天"表达，比绝对时间戳好读。
+        const leftMs = Number(t.expiresAt) ? Number(t.expiresAt) - now : 0;
+        const leftText = leftMs > 0
+          ? (leftMs >= 24 * 3600 * 1000
+            ? `还剩 ${Math.round(leftMs / (24 * 3600 * 1000))} 天`
+            : `还剩 ${Math.max(1, Math.round(leftMs / 3600000))} 小时`)
+          : '';
+        lines.push(`- ${t.done ? '[已完成] ' : ''}${t.text}${leftText ? `（${leftText}）` : ''}`);
       }
+      blocks.push(lines.join('\n'));
     }
-    // 自我认知：**故意放在 formatMemoryV2 里，但不进唤醒包**。
-    // 唤醒包早就不调这个函数了（memoryLine 已删），所以它只出现在
-    // qq_memory_append / qq_memory_query 的工具返回里 —— 等于"它写记忆时
-    // 能看到自己之前的全部叙述"，闭环成立，又不会每轮灌输。
+    // ③ 对群友的印象（全局一份，按 QQ 号记）
+    const impressions = st.memberImpressions && typeof st.memberImpressions === 'object' ? st.memberImpressions : {};
+    const uids = Object.keys(impressions);
+    if (uids.length) {
+      const lines = [`【对群友的印象】${uids.length} 人（按 QQ 号记，所有聊天共用同一份）`];
+      for (const uid of uids.slice(-10)) {
+        const im = impressions[uid] || {};
+        const traits = Array.isArray(im.traits) ? im.traits : [];
+        // 键是 QQ 号（全局唯一）。展示名**现取自别名表** ——
+        // 名字的唯一真相在那里（桥接每条消息都会写），impression 里不再存副本。
+        // 拿不到名字才退回号码，不猜。
+        const label = String(displayNameOfV2(uid, '') || '').trim() || uid;
+        const shown = label === '私聊' ? `QQ${uid}` : label;
+        lines.push(`- ${shown}：${traits.length ? traits.join('、') : '暂无记录'}（互动 ${Number(im.interactionCount) || 0} 次）`);
+      }
+      blocks.push(lines.join('\n'));
+    }
+    // ④ 自我认知（全局一份，只有她能写）
     const selfNotes = Array.isArray(st.selfNotes) ? st.selfNotes.filter((n) => n && n.text) : [];
     if (selfNotes.length) {
-      lines.push('【你对自己的认识】');
+      const lines = [`【你对自己的认识】${selfNotes.length} 条（全局一份；你自己一路写下来的，不是别人告诉你的）`];
       for (const n of selfNotes.slice(-10)) lines.push(`- ${n.text}`);
+      blocks.push(lines.join('\n'));
     }
-    return lines.join('\n');
+
+    // 段间空行 —— 和 formatFactsBlock（长期记忆）保持同一种排版。
+    return blocks.join('\n\n');
   }
 
   /**
    * 冷启动时给模型看它自己写下的自我认知。
    *
-   * 为什么只在 bootstrap 给：这层如果每轮注入，就变成"别人告诉你你是谁"，
-   * 和它自己慢慢长出来的叙述是两回事。新会话开始时读一次，等于"想起来"；
-   * 之后靠它自己 qq_memory_query 去翻。
+   * ⚠️ 2026-11-10 起**不再被唤醒包调用**：操作者要求唤醒词里不带记忆正文，
+   * 三类记忆统一改成她自己调 qq_memory_query 查。函数保留是因为控制台/调试脚本
+   * 还在用同款格式，删掉会连累那边的输出。别再把它接回 buildWakePromptV2。
+   *
+   * 为什么当初只在 bootstrap 给：这层如果每轮注入，就变成"别人告诉你你是谁"，
+   * 和它自己慢慢长出来的叙述是两回事。
    */
   function formatSelfNotesV2(st, limit = 20) {
     const notes = Array.isArray(st?.selfNotes) ? st.selfNotes.filter((n) => n && n.text) : [];
     if (!notes.length) return '';
     return `【你对自己的认识】这些是你自己一路写下来的，不是别人告诉你的：\n${notes.slice(-limit).map((n) => `- ${n.text}`).join('\n')}\n\n`;
   }
+
+  /**
+   * 群友印象：按人列，一人一段，traits 用 · 连起来。
+   *
+   * ⚠️ 同 formatSelfNotesV2：2026-11-10 起不再进唤醒包，改由 qq_memory_query 返回。
+   */
+  function formatMemberImpressionsV2(st, limit = 30) {
+    const im = st?.memberImpressions && typeof st.memberImpressions === 'object' ? st.memberImpressions : {};
+    const rows = Object.entries(im)
+      .filter(([, v]) => v && Array.isArray(v.traits) && v.traits.length)
+      .map(([uid, v]) => ({
+        // 展示名现取自别名表（名字的唯一真相），impression 里不存副本。
+        name: String(displayNameOfV2(uid, '') || '').trim() || (uid === '私聊' ? `QQ${uid}` : uid),
+        traits: v.traits.filter(Boolean),
+        seen: Number(v.lastSeenAt) || 0
+      }))
+      .sort((a, b) => b.seen - a.seen)
+      .slice(0, limit);
+    if (!rows.length) return '';
+    const lines = rows.map((r) => `- ${r.name}：${r.traits.join(' · ')}`);
+    return `【群友印象】你记下的这些人（不是评价，是你观察到的小事）：\n${lines.join('\n')}\n\n`;
+  }
+
+  // todo 的常量（TODO_DEFAULT_TTL_MS / TODO_MAX）定义在文件前面的 GLOBAL_MEMORY_KEY 旁边，
+  // 因为 loadSocialV2State 也要用；这里不要再重复声明。
 
   function appendMemoryV2(st, category, content, extra = {}) {
     if (!st) return;
@@ -9886,6 +11050,10 @@ async function main() {
     }
     if (Array.isArray(st.activeTopics)) {
       st.activeTopics = st.activeTopics.filter((t) => t && (!t.lastMentionAt || Date.now() - Number(t.lastMentionAt) < 24 * 60 * 60 * 1000));
+    }
+    // todo：过期的直接丢掉（这是它和 longTerm 的根本区别 —— 事情过了就不该再记着）。
+    if (Array.isArray(st.todos)) {
+      st.todos = st.todos.filter((t) => t && (!t.expiresAt || Date.now() < Number(t.expiresAt)));
     }
     if (cat === 'activeTopic' && text) {
       if (!Array.isArray(st.activeTopics)) st.activeTopics = [];
@@ -9922,22 +11090,96 @@ async function main() {
         });
       }
       if (st.pendingThoughts.length > 20) st.pendingThoughts.splice(0, st.pendingThoughts.length - 20);
+    } else if (cat === 'todo' && text) {
+      // 待办：一两天内要兑现的事（「明天讲那张卡片」「六点十分提醒他拿快递」）。
+      //
+      // 为什么单独一类：这类事塞进 longTerm 会污染长期记忆（几个月后不成立），
+      // 塞进 pendingThought 又不对（那是"想说没说出口的话"，不是"要做的事"）。
+      // 区别在于 todo 有明确的**到期时间**，过了就自动消失。
+      //
+      // extra.dueAtMs：距离现在多少毫秒到期。不传就按 TODO_DEFAULT_TTL_MS（48h）。
+      // 传了负值/0 视为"现在就过期"，等于写了个立刻失效的待办 —— 允许，
+      // 因为有时候她只是想确认一下"这条不用记了"。
+      if (!Array.isArray(st.todos)) st.todos = [];
+      const ttl = extra.dueAtMs !== undefined && extra.dueAtMs !== null
+        ? Math.max(0, Number(extra.dueAtMs) || 0)
+        : TODO_DEFAULT_TTL_MS;
+      const dueAt = Date.now() + ttl;
+      // 2026-11-12：记下是哪个会话排的，到点好按会话唤醒。
+      // todo 存在全局，但唤醒定时器必须挂在具体 key 上（见 setupTodoTimerV2）。
+      const wakeKey = canonicalV2Key(extra.sessionKey || extra.key || '') || '';
+      const existing = st.todos.find((t) => t && String(t.text || '') === text);
+      if (existing) {
+        // 同一件事再提一次：延后到期时间（等于"又提到了，还没做"），不新增一条。
+        existing.expiresAt = dueAt;
+        existing.lastMentionAt = Date.now();
+        if (wakeKey) existing.wakeKey = wakeKey;
+        // 到期时间变了 → 之前那次提醒作废，重新排。
+        existing.notifiedAt = 0;
+        if (extra.done === true) existing.done = true;
+      } else {
+        st.todos.push({
+          text: truncateText(text, 200),
+          createdAt: Date.now(),
+          lastMentionAt: Date.now(),
+          expiresAt: dueAt,
+          // wakeKey：哪个会话写的，到点就在那个会话里叫醒她。
+          wakeKey,
+          // notifiedAt：已经提醒过的毫秒时间戳，0/空表示还没提醒。
+          notifiedAt: 0,
+          // done 标记：做完了但还想留个痕（下次清理时按过期时间丢掉）。
+          done: extra.done === true
+        });
+      }
+      // 上限 20 条：先丢已完成的，再丢最早到期的。
+      if (st.todos.length > TODO_MAX) {
+        st.todos.sort((a, b) => {
+          const ad = a.done ? 0 : 1;
+          const bd = b.done ? 0 : 1;
+          if (ad !== bd) return ad - bd;
+          return (Number(a.expiresAt) || 0) - (Number(b.expiresAt) || 0);
+        });
+        st.todos.splice(0, st.todos.length - TODO_MAX);
+      }
+      // 排/重排这个会话的待办定时器（做了 mark_read 之类的不影响它）。
+      // 放在 appendMemoryV2 外面的调用方去排也行，但那样每个调用点都要记得，
+      // 集中在这里最不容易漏。
+      try { if (wakeKey) setupTodoTimerV2(wakeKey); } catch (error) {
+        log(`[todo] 排待办定时器失败（不影响写入）：${error?.message ?? error}`);
+      }
     } else if (cat === 'memberImpression') {
-      const target = String(extra.target || '').trim();
-      if (!target || ['__proto__', 'constructor', 'prototype'].includes(target)) return;
+      // 2026-11-10：按**全局 QQ 号**记，不按昵称（见 resolveImpressionTarget 的说明）。
+      // 全局存储下同一个人只会有一条，不会因为出现在多个群/私聊而分裂。
+      const resolved = resolveImpressionTarget(extra.sessionKey || extra.key || '', extra.target);
+      if (!resolved || !resolved.id) return;
+      const target = resolved.id;
+      if (['__proto__', 'constructor', 'prototype'].includes(target)) return;
       if (!st.memberImpressions || typeof st.memberImpressions !== 'object') st.memberImpressions = {};
       const old = st.memberImpressions[target] || {};
-      const traits = Array.isArray(old.traits) ? old.traits.slice(0, 10) : [];
-      if (text && !traits.includes(text.slice(0, 50))) traits.push(text.slice(0, 50));
+      // 每个人的印象最多 10 条。
+      //
+      // 2026-11-12 修：旧代码是 `old.traits.slice(0, 10)` 再 push —— 读的时候取前 10 条，
+      // 但 push 之后**没有再截断**，于是 traits 会涨到 11、12 条。
+      // 下次再读又只取前 10 条，第 11 条之后的内容写进去了却显示不出来（静默丢失）。
+      // 现在：先过滤掉重复，push 之后立刻截到最后 10 条 —— 满了就丢最旧的，而不是丢最新的。
+      const traits = Array.isArray(old.traits) ? old.traits.filter(Boolean) : [];
+      const one = String(text || '').slice(0, 50);
+      if (one && !traits.includes(one)) traits.push(one);
+      const capped = traits.slice(-10);
       st.memberImpressions[target] = {
-        traits,
+        traits: capped,
+        // 2026-11-12：**不再自己存 name**。
+        // 名字的唯一真相是别名表（socialV2.aliases），桥接每收到一条消息都会写
+        // （noteAliasV2），人会改昵称、会有多个昵称，那是它该管的事。
+        // 这里再存一份只会变成过期副本 —— 展示时统一用 displayNameOfV2 现取。
         interactionCount: (Number(old.interactionCount) || 0) + 1,
         lastSeenAt: Date.now()
       };
       const impressionEntries = Object.entries(st.memberImpressions);
-      if (impressionEntries.length > 50) {
+      // 全局上限 500：印象是全局一份，别按会话那个 50 条截。
+      if (impressionEntries.length > 500) {
         impressionEntries.sort((a, b) => (Number(a[1]?.lastSeenAt) || 0) - (Number(b[1]?.lastSeenAt) || 0));
-        for (let i = 0; i < impressionEntries.length - 50; i++) {
+        for (let i = 0; i < impressionEntries.length - 500; i++) {
           delete st.memberImpressions[impressionEntries[i][0]];
         }
       }
@@ -10204,51 +11446,96 @@ async function main() {
     let wakeState;
     let wakeToken;
     let wakeSnapshot;
+    // 这一轮渲染时看到的冷启动登记时刻：投递被接受后用它消费标记（见 commitColdStart）。
+    let coldStartAnchor = 0;
     if (opts.wakeReason) {
       if (wakeBlocked()) return skipWake();
       // Build only after session creation: retries may rotate the token, and an
       // offline queue may have received more messages since this wake was queued.
       wakeState = getSocialV2State(key);
       wakeToken = wakeState.agentToken;
+      // ★ 全桥接唯一的唤醒词渲染点（2026-11-13 重建）。
+      //   sendWakePromptV2 传进来的是空串，这里渲染出来才是真正要发的内容。
       promptText = buildWakePromptV2(key, opts.wakeReason);
+      coldStartAnchor = coldStartStateOf(key).anchor || 0;
       wakeSnapshot = buildWakeSnapshotV2(key);
       if (wakeSnapshot) {
         // 纯文本渲染，不再 JSON.stringify；使用说明（partial / throughSeq / reply 静默）
         // 全部收进 persona，不再每轮跟着消息一起灌进去。
         // base 可能为空（身份/令牌/facts 都进了 system prompt 且没有角色），
         // 这时不要留下前导空行。
-        const snap = renderWakeSnapshotV2(wakeSnapshot);
+        const snap = renderWakeSnapshotV2(wakeSnapshot, key);
         if (snap) promptText = promptText ? `${promptText}\n\n${snap}` : snap;
       }
     }
-    let content = [{ type: 'text', text: withSlangContext(promptText) }];
+    let content = [{ type: 'text', text: promptText }];
     if (Array.isArray(opts.media) && opts.media.length > 0) {
       const imageParts = await resolveMediaList(opts.media);
-      content = [{ type: 'text', text: withSlangContext(promptText) }, ...imageParts];
+      content = [{ type: 'text', text: promptText }, ...imageParts];
     }
     // 媒体解析成功后再标记退场，避免解析异常时残留退场标记。
     if (!isCurrentSession(key, sessionId)) throw new Error('投递前会话已重置或权限已变化');
     if (opts.farewell) social.exitingSessions.add(sessionId);
+    // 登记"这一轮是替谁发的"：共用会话时私聊与群共用一个 sessionId，
+    // 回复必须发回它自己的聊天。必须在 prompt 之前登记 —— turn/start 可能比响应先到。
+    pushTurnKey(sessionId, key);
     let accepted;
     try {
       accepted = await api.sessions.prompt({ sessionId, mode: 'queue', content });
     } catch (error) {
       if (opts.farewell) social.exitingSessions.delete(sessionId);
+      // 投递失败：撤回刚登记的归属，否则后续回合的回复会错位到这条聊天上。
+      const arr = turnKeyQueue.get(sessionId);
+      if (arr) {
+        const idx = arr.lastIndexOf(key);
+        if (idx >= 0) arr.splice(idx, 1);
+        if (arr.length === 0) turnKeyQueue.delete(sessionId);
+      }
       throw error;
     }
     if (!accepted.result.ok) {
       if (opts.farewell) social.exitingSessions.delete(sessionId);
+      // 同上：没被接受就没有对应的回合，归属记录必须撤回。
+      const arr = turnKeyQueue.get(sessionId);
+      if (arr) {
+        const idx = arr.lastIndexOf(key);
+        if (idx >= 0) arr.splice(idx, 1);
+        if (arr.length === 0) turnKeyQueue.delete(sessionId);
+      }
       const errText = `${accepted.result.error.code}: ${accepted.result.error.message}`;
       const safeErrText = shouldAuditKey(key) && SENSITIVE_RE.test(errText) ? '（含敏感信息，已隐藏）' : errText;
       if (!opts.silent) await sendToQQ(key, `⚠️ 消息未被接受：${safeErrText}`);
       return { ok: false, error: safeErrText };
     }
+    // ★ 冷启动提示**已经真的投递出去**了，消费掉标记（2026-11-13 重建）。
+    //
+    // 放在这里而不是渲染时：上面所有 return 都是"还没发出去"（被拒 / 阻塞 / 跳过），
+    // 那些路径必须保留标记，否则提示随失败一起消失 —— 旧实现压缩后那句永远发不出去，
+    // 就是因为它在渲染时就把标记清了。
+    if (coldStartAnchor) commitColdStart(sessionId, coldStartAnchor);
     if (wakeSnapshot && isCurrentSession(key, sessionId)
         && socialV2.conversations.get(canonicalV2Key(key)) === wakeState
         && wakeState.agentToken === wakeToken) {
       // Acceptance grants visibility, never acknowledgement. New arrivals and
       // rejected/stale deliveries must not be cleared by an old cursor.
-      noteModelMessagesV2(wakeState, [...wakeSnapshot.messages, ...wakeSnapshot.recent]);
+      if (wakeSnapshot.shared) {
+        // 共用会话：消息来自多个聊天，必须**各记各的**——每条登记到它自己那个 chat 的状态里。
+        // 以前这里一律记到 wakeState（= 当前唤醒的聊天），于是群里的消息被记进私聊的
+        // modelSeenSeqs，两个聊天的水位都算不出来，mark_read 永远 400
+        //（"throughSeq 必须是不超过已展示连续消息水位"）。
+        const byChat = new Map();
+        for (const row of wakeSnapshot.messages || []) {
+          const ck = row.chatKey;
+          if (!ck) continue;
+          if (!byChat.has(ck)) byChat.set(ck, []);
+          if (row.message) byChat.get(ck).push(row.message);
+        }
+        for (const [ck, msgs] of byChat) {
+          try { noteModelMessagesV2(getSocialV2State(ck), msgs); } catch { /* 单聊状态坏了不影响整轮 */ }
+        }
+      } else {
+        noteModelMessagesV2(wakeState, [...wakeSnapshot.messages, ...wakeSnapshot.recent]);
+      }
     }
     if (accepted.result.value.command?.text && !opts.silent && currentMode !== 'reserved2') {
       if (opts.farewell) social.exitingSessions.delete(sessionId);
@@ -10259,39 +11546,45 @@ async function main() {
     return { ok: true };
   }
 
-  // 每个 QQ 会话串行投递 DSH prompt，保证 turn 完成顺序与提交顺序一致，
-  // 从而让 [SILENT]、摘要静默、退场标记都能准确匹配到自己的 turn。
+  // 串行投递 DSH prompt，保证 turn 完成顺序与提交顺序一致，
+  // 从而让 [SILENT]、摘要静默、退场标记、以及共用会话下的回复归属都能准确对上自己的 turn。
+  //
+  // ⚠️ 队列键用 queueKeyOf（共享组代表 key），不是原本的 QQ key：
+  // 共用会话时私聊与群是同一条 DSH 会话，若各自并发投递，两个 turn 会交错，
+  // 回复必然串号。按组串行才是正确粒度。
   function deliverPrompt(key, promptText, opts = {}) {
     return new Promise((resolve, reject) => {
-      let entry = promptQueues.get(key);
+      const qkey = queueKeyOf(key);
+      let entry = promptQueues.get(qkey);
       if (!entry) {
         entry = { queue: [], running: false };
-        promptQueues.set(key, entry);
+        promptQueues.set(qkey, entry);
       }
-      entry.queue.push({ promptText, opts, resolve, reject });
-      processPromptQueue(key);
+      // 真正要发给谁记在 item 里 —— 队列按组串行，但每条仍然发回自己的聊天。
+      entry.queue.push({ key, promptText, opts, resolve, reject });
+      processPromptQueue(qkey);
     });
   }
 
-  async function processPromptQueue(key) {
-    const entry = promptQueues.get(key);
+  async function processPromptQueue(qkey) {
+    const entry = promptQueues.get(qkey);
     if (!entry || entry.running) return;
     const item = entry.queue.shift();
     if (!item) {
-      if (entry.queue.length === 0) promptQueues.delete(key);
+      if (entry.queue.length === 0) promptQueues.delete(qkey);
       return;
     }
     entry.running = true;
     try {
-      const result = await deliverPromptNow(key, item.promptText, item.opts);
+      const result = await deliverPromptNow(item.key, item.promptText, item.opts);
       item.resolve(result);
     } catch (error) {
       item.reject(error);
     } finally {
       entry.running = false;
-      if (promptQueues.get(key) === entry) {
-        if (entry.queue.length) processPromptQueue(key);
-        else promptQueues.delete(key);
+      if (promptQueues.get(qkey) === entry) {
+        if (entry.queue.length) processPromptQueue(qkey);
+        else promptQueues.delete(qkey);
       }
     }
   }
@@ -10883,6 +12176,99 @@ async function main() {
     }
   }
 
+  // ── 别名表：昵称 ↔ QQ 号 ───────────────────────────────────────────────
+  //
+  // 2026-11-12（操作者方案）：让模型只看到**人名**，不想让它每条消息都读一个
+  // 18 字符的 `userId:123456789`。但 @人、拍人、查好感度都必须要号，所以桥接
+  // 侧维护这张表，模型需要时用 qq_get_userid 按名字反查。
+  //
+  // 合并规则（操作者原话）："如果有没见过的人带见过的 QQ 号，就把第二个昵称
+  // 绑定那个 QQ 号"。也就是**以 QQ 号为主键**，昵称是它的属性：
+  //   · 同一个号出现新名字 → 追加进 names，并把 primary 换成新名字
+  //   · 同一个名字出现新号 → 不合并（不同人可能重名，宁可分开也不认错人）
+  //   · primary 决定渲染用哪个名字：保证同一个号始终显示同一个称呼，
+  //     否则同一个人在历史里以两个名字出现，模型会当成两个人。
+
+  function ensureAliasStore() {
+    if (!socialV2.aliases || typeof socialV2.aliases !== 'object') socialV2.aliases = {};
+    return socialV2.aliases;
+  }
+
+  /**
+   * 记一次「这个号叫这个名字」。幂等：同样的 (uid, name) 重复调用只是刷新 lastAt。
+   * @returns {boolean} 是否发生了实际变化（新号或新名字），调用方据此决定要不要落盘
+   */
+  function noteAliasV2(userId, rawName) {
+    const uid = String(userId ?? '').trim();
+    const name = String(rawName ?? '').replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, ' ').trim().slice(0, 64);
+    if (!/^\d{4,12}$/.test(uid) || !name) return false;
+    const store = ensureAliasStore();
+    const now = Date.now();
+    let rec = store[uid];
+    if (!rec || typeof rec !== 'object') {
+      store[uid] = { names: [name], primary: name, lastAt: now };
+      return true;
+    }
+    if (!Array.isArray(rec.names)) rec.names = [];
+    rec.lastAt = now;
+    let changed = false;
+    if (!rec.names.includes(name)) {
+      // 新名字：放到最前（最近使用的在前），上限 12 个防止被刷爆。
+      rec.names = [name, ...rec.names].slice(0, 12);
+      changed = true;
+    } else if (rec.primary !== name) {
+      // 已知名字但换了称呼：把 primary 切过去，让渲染保持一致。
+      changed = true;
+    }
+    rec.primary = name;
+    return changed;
+  }
+
+  /** 这个号当前该显示的名字（没有记录就回退到调用方给的原名）。 */
+  function displayNameOfV2(userId, fallback) {
+    const uid = String(userId ?? '').trim();
+    if (/^\d{4,12}$/.test(uid)) {
+      const rec = ensureAliasStore()[uid];
+      if (rec && typeof rec === 'object') {
+        const p = String(rec.primary || '').trim();
+        if (p) return p;
+        if (Array.isArray(rec.names) && rec.names.length) {
+          const n = String(rec.names[0] || '').trim();
+          if (n) return n;
+        }
+      }
+    }
+    return String(fallback ?? '').trim();
+  }
+
+  /** 反查：给一个名字（或 QQ 号），找出可能是谁。用于 qq_get_userid。 */
+  function lookupAliasV2(query) {
+    const q = String(query ?? '').replace(/[\u0000-\u001f\u007f]+/g, ' ').trim().toLowerCase();
+    const store = ensureAliasStore();
+    const rows = Object.entries(store)
+      .filter(([uid, v]) => /^\d{4,12}$/.test(uid) && v && Array.isArray(v.names) && v.names.length)
+      .map(([uid, v]) => ({
+        userId: uid,
+        primary: String(v.primary || v.names[0] || ''),
+        names: v.names.map((n) => String(n)),
+        lastAt: Number(v.lastAt) || 0
+      }));
+    if (!q) {
+      rows.sort((a, b) => b.lastAt - a.lastAt);
+      return rows;
+    }
+    const hit = rows.filter((r) =>
+      r.userId === q
+      || r.primary.toLowerCase().includes(q)
+      || r.names.some((n) => n.toLowerCase().includes(q)));
+    hit.sort((a, b) => {
+      // 精确命中优先，然后按最近活跃。
+      const exact = (r) => (r.userId === q || r.primary.toLowerCase() === q ? 0 : 1);
+      return exact(a) - exact(b) || b.lastAt - a.lastAt;
+    });
+    return hit;
+  }
+
   // ── 二代仿真模式（reserved2）唤醒调度 ──────────────────────────────────
   function appendSocialV2Message(key, sender, textContent, plainContent, quoteTargetIsSelf, isOwner, messageId, media = [], userId = null, forwardIds = []) {
     const st = getSocialV2State(key);
@@ -10921,10 +12307,18 @@ async function main() {
         }
       }
     }
+    // 记进别名表：以 QQ 号为主键，昵称是它的属性（一人多昵称会自动合并）。
+    // 放在建 msg 之前：这样下面的 `sender` 可以直接用**归一后的名字**，
+    // 保证同一个号在历史里始终显示同一个称呼（否则她会把同一人当成两个人）。
+    // 失败不影响收发：别名表只是"查号"的加速缓存，坏了顶多是查不到。
+    if (userId != null) {
+      try { noteAliasV2(userId, sender); } catch { /* 忽略 */ }
+    }
+    const displaySender = userId != null ? (displayNameOfV2(userId, sender) || sender) : sender;
     const msg = {
       seq: (st.lastUnreadSeq || 0) + 1,
       messageId: messageId != null ? String(messageId) : null,
-      sender,
+      sender: displaySender,
       userId: userId != null ? String(userId) : null,
       text: truncateText(String(textContent), 200),
       plain: truncateText(String(plainContent ?? textContent), 200),
@@ -10953,6 +12347,54 @@ async function main() {
     if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
     st.unread.push(msg);
     if (st.unread.length > unreadLimit) st.unread.splice(0, st.unread.length - unreadLimit);
+    // ── 好感度：每次真人说话都记一笔 ──────────────────────────────────────
+    // **全局按 QQ 号记**（socialV2.affinities），不再挂在会话上。
+    // 改动原因（2026-11-10）：原来存在 conversations[key].affinities，
+    // 于是「清除上下文」「重置二代状态」「清空工作区」都会连它一起删掉 ——
+    // 操作者清了一次上下文，18 个人的关系直接归零。
+    // 关系是"我和这个人之间"的事实，不该因为某个聊天窗口重建而消失。
+    // 只算真的有人跟她说话；自己发的、机器人自己发的不加。
+    try {
+      const uid = msg.userId ? String(msg.userId) : '';
+      if (uid) {
+        if (!socialV2.affinities || typeof socialV2.affinities !== 'object') socialV2.affinities = {};
+        // 直接读全局表；同一个人无论在群还是私聊，都是同一条记录。
+        const base = socialV2.affinities[uid] || {
+          score: AFFINITY_INITIAL,
+          stageId: affinityStageOf(AFFINITY_INITIAL).id,
+          lastAt: Date.now(),
+          count: 0,
+          createdAt: Date.now(),
+        };
+        const prev = decayAffinity(base);
+        const delta = scoreForMessage({ text: String(msg.text || ''), isSelf: !!msg.isSelf, isOwner: !!msg.isOwner });
+        const next = delta !== 0 ? bumpAffinity(prev, delta) : { ...prev, lastAt: Date.now() };
+        // ── 档位变化 → 记一条「下次回复她之前要先查一次」的提醒 ──────────
+        // 只在**档位 id 变了**时记：分数涨 1 分、或同档内爬 20 分，都不算变化。
+        const prevStageId = affinityStageOf(prev.score).id;
+        const nextStageId = affinityStageOf(next.score).id;
+        if (prevStageId !== nextStageId) {
+          try {
+            if (!socialV2.affinityStageChanges || typeof socialV2.affinityStageChanges !== 'object') {
+              socialV2.affinityStageChanges = {};
+            }
+            const fromLabel = AFFINITY_STAGES.find((s) => s.id === prevStageId)?.label ?? prevStageId;
+            const toLabel = AFFINITY_STAGES.find((s) => s.id === nextStageId)?.label ?? nextStageId;
+            socialV2.affinityStageChanges[uid] = { from: fromLabel, to: toLabel, at: Date.now() };
+            log(`[affinity] 档位变化 ${uid}: ${fromLabel} → ${toLabel}（已记入唤醒提醒）`);
+          } catch {}
+        }
+        socialV2.affinities[uid] = next;
+        // 顺手清掉会话里可能残留的旧副本，避免以后又被当成"另一份数据"读出来。
+        try {
+          if (st.affinities && typeof st.affinities === 'object' && st.affinities[uid]) {
+            delete st.affinities[uid];
+          }
+        } catch {}
+      }
+    } catch (error) {
+      log(`[affinity] 好感度更新失败（已跳过）：${error?.message ?? error}`);
+    }
     const lowerPlain = String(plainContent ?? textContent ?? '');
     for (const t of st.activeTopics || []) {
       if (!t || typeof t !== 'object') continue;
@@ -11040,8 +12482,15 @@ async function main() {
       });
       // 自己发出去的话也是原文的一部分：以后复盘"当时我怎么说的"只能靠它。
       // 用时间戳当 seq，避免与入站消息的本地 seq 撞号。
+      //
+      // 2026-11-13 修：role 原来硬编码成 'Deepdeep' —— 那是早期模型名，跟她的角色无关。
+      // 结果原文库里 1384 条她自己说的话全挂在 "Deepdeep" 名下，搜"睦说过什么"
+      // 一条都命不中。改成用机器人真实昵称。
+      // 注意用 selfDisplayName（保留大小写）而不是 selfNickname（被 toLowerCase 过，
+      // 那是给"被提到"匹配用的，拿来当展示名会变成 角色A 全小写）。
       memoryNote({
-        src: 'qq', key, seq: now + i * 1000, t: now + i * 1000, kind: 'ai', role: 'Deepdeep',
+        src: 'qq', key, seq: now + i * 1000, t: now + i * 1000, kind: 'ai',
+        role: String(selfDisplayName || '').trim() || '我',
         text: text.slice(0, 4000), meta: { self: true }
       });
     }
@@ -11181,7 +12630,10 @@ async function main() {
         }
       }
     }
-    if (tr.question && isDirectedAtAi(plainContent)) return 'question';
+    // 2026-11-12：question 触发已移除。群聊里"你…吗"绝大多数是在跟别的群友说话，
+    // 按文本特征判"在问 AI"误判率 60%（实测 10 条错 6 条）。
+    // 想让她被点名就醒，用 atMention / nameMention / keywords；
+    // 想让她对任何消息都醒，用 anyMessage 或 probability。
     if (Array.isArray(tr.speakerIds) && tr.speakerIds.length) {
       const speakerId = String(event?.user_id ?? event?.sender?.user_id ?? '');
       if (speakerId && tr.speakerIds.some((id) => String(id) === speakerId)) {
@@ -11195,19 +12647,34 @@ async function main() {
 
   // Only messages actually offered to the model authorize cursor-based acknowledgement.
   // Keep this receipt in memory: after a restart the model must fetch unread again.
+  //
+  // ── 2026-11-12 重写：去掉「连续水位」算法 ──────────────────────────────
+  //
+  // 旧实现是 `while (through < lastUnread && reachable(through + 1)) through += 1;`
+  // —— 只有**连续可达**才往前推，遇到第一条没展示过的 seq 就永久卡住。
+  //
+  // 那个"连续"要求是整套复杂度的根：为了不让水位跳过一个还没给模型看过的消息，
+  // 它必须一条一条数过去。而唤醒包有截断（wakeMessageLimit=12），
+  // 更早的未读可能从未展示 ⇒ 水位就停在半路 ⇒ 她传任何更大的 throughSeq 都被判非法
+  // （「必须是不超过已展示连续消息水位」）。实测这是 mark_read 反复失败的第三大来源。
+  //
+  // 现在的语义非常简单：
+  //   **返回「已经展示给模型的最大 seq」**，不再要求连续。
+  //   没展示过的那些不参与计算，它们会由 mark_read 的拦截分支直接贴给模型看。
+  //
+  // 为什么这样是安全的：真正防"划过去没看"的责任已经从"水位算法"转移到了
+  // mark_read / set_wake_config 的拦截分支 —— 那里会明确列出 `uncovered`
+  // （模型没看过的未读），并把正文贴出来。职责单一，不会再出现两个地方各算一遍。
   function readThroughSeqV2(st, additional = []) {
     const seen = new Set(st.modelSeenSeqs || []);
     for (const msg of additional) if (Number.isSafeInteger(msg?.seq) && msg.seq > 0) seen.add(msg.seq);
-    const seqs = st.unread.map((m) => m.seq).filter((seq) => Number.isSafeInteger(seq) && seq > 0);
-    const lowestBuffered = seqs.length ? Math.min(...seqs) : Infinity;
     const lastUnread = Number.isSafeInteger(st.lastUnreadSeq) ? st.lastUnreadSeq : 0;
-    let through = Number.isSafeInteger(st.lastReadThroughSeq) ? st.lastReadThroughSeq : 0;
-    // A seq may be reached only when it was offered to the model, or when the buffer
-    // no longer holds it at all (evicted by unreadLimit, so it can never be displayed
-    // again). Scoping the skip to the real buffer range is what keeps this from ever
-    // stepping over a still-pending message.
-    const reachable = (seq) => seen.has(seq) || (seq < lowestBuffered && seq <= lastUnread);
-    while (through < lastUnread && reachable(through + 1)) through += 1;
+    const base = Number.isSafeInteger(st.lastReadThroughSeq) ? st.lastReadThroughSeq : 0;
+    // 已展示过的最大 seq（只算真实存在的未读区间内的，避免旧回执残留把水位顶飞）。
+    let through = base;
+    for (const seq of seen) {
+      if (seq > through && seq <= lastUnread) through = seq;
+    }
     return through;
   }
 
@@ -11221,15 +12688,75 @@ async function main() {
     return readThroughSeqV2(st);
   }
 
+  // ── 收尾前观望（2026-11-12 新增）────────────────────────────────────────
+  //
+  // 操作者的方案：她收尾时先空转 10 秒；这期间来了新消息就直接把消息给她，
+  // 让她决定要不要接；没来就照常收尾。
+  //
+  // 为什么要它：以前靠"回复窗口"（armReplyWindowV2）在后台盯，问题是一句话
+  // 就能触发一次完整唤醒 —— 群里连发几句就是几次唤醒，每次都要重发整段历史。
+  // 改成"她自己等 10 秒"之后，同一段时间内的多条消息是**一次**给她，
+  // 她也能在同一条上下文里连续处理，不会被切成多个回合。
+  //
+  // 只做被动等待，不主动改状态：水位、未读都由调用方在这之后重新计算。
+  function observeBeforeSleepV2(st, key, waitMs = 10000) {
+    const budget = Math.max(0, Math.min(120000, Number(waitMs) || 0));
+    if (!budget) return Promise.resolve({ arrived: false, waitedMs: 0 });
+    const baseSeq = Number(st.lastUnreadSeq) || 0;
+    const startedAt = Date.now();
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (arrived) => {
+        if (done) return;
+        done = true;
+        try { clearInterval(timer); } catch { /* ignore */ }
+        resolve({ arrived, waitedMs: Date.now() - startedAt });
+      };
+      // 每 250ms 瞄一眼：只要 lastUnreadSeq 涨了，就说明来新消息了。
+      // 用轮询而不是事件回调，是因为这个函数在 HTTP handler 里，没有事件上下文。
+      const timer = setInterval(() => {
+        const nowSeq = Number(st.lastUnreadSeq) || 0;
+        if (nowSeq > baseSeq) { finish(true); return; }
+        if (Date.now() - startedAt >= budget) finish(false);
+      }, 250);
+      // 不要 unref：这个定时器在 HTTP handler 里等待 Promise resolve，
+      // unref 会让它不参与事件循环存活判定，极端情况下请求可能永远挂着。
+    });
+  }
+
   function requestedReadThroughSeqV2(st, body, isAgent) {
     if (!Object.prototype.hasOwnProperty.call(body, 'throughSeq')) return null;
     const seq = body.throughSeq;
-    const max = isAgent ? readThroughSeqV2(st) : st.lastUnreadSeq;
-    if (!Number.isSafeInteger(seq) || seq < 0 || seq > max || seq > st.lastUnreadSeq) {
-      const error = new Error('throughSeq 必须是不超过已展示连续消息水位的非负安全整数；请先读取未读消息并使用返回的 readThroughSeq');
+    if (!Number.isSafeInteger(seq) || seq < 0 || seq > st.lastUnreadSeq) {
+      const error = new Error(
+        `throughSeq 必须是 0~${st.lastUnreadSeq} 之间的安全整数（你传的是 ${JSON.stringify(seq)}）。`
+        + `正常用法：直接抄读取结果里的 readThroughSeq。`
+      );
       error.statusCode = 400;
       throw error;
     }
+    // ── 2026-11-12 放宽（操作者要求）──────────────────────────────────────
+    //
+    // 原来这里还有一条 `seq > max` 的判断（max = readThroughSeqV2(st)，只放行
+    // "连续可达"的水位），不满足就报「必须是不超过已展示连续消息水位」。
+    //
+    // 那个限制的问题是：**水位可能卡在半路**。readThroughSeqV2 用 while 递增，
+    // 遇到第一条"没展示过"的 seq 就停 —— 于是她明明读完了 #156~#160，
+    // 但只要中间某条没进过 modelSeenSeqs（唤醒包只内联了最近 N 条，
+    // 更早的几条从未展示），水位就停在前面，她传任何更大的值都被判非法。
+    //
+    // 结果是她反复撞墙、反复 get_unread，仍然标不掉。实测 mark_read 失败里
+    // 有相当一部分是这个（18 次/全会话 441 次，且集中在积压较多的时段）。
+    //
+    // 现在的语义：**她可以标到任何一个"已经入库"的 seq**（上限仍是 lastUnreadSeq，
+    // 防止标到还没到达的消息）。这符合操作者的意图：
+    //   「她读过唤醒词里的未读的就让她标记啊，还有新的消息就她看完继续标记那些」
+    //
+    // 仍然保留的防线：
+    //   · 不能超过 lastUnreadSeq（不存在未来消息）
+    //   · 沉睡前拦截（preSleepWaitBlockedV2）依然生效 —— 如果还有**她确实没看过**的，
+    //     会把那几条直接贴给她，让她决定读完还是明确放弃。
+    //   · 非 agent 调用（控制台）上限仍是 lastUnreadSeq，行为不变。
     return seq;
   }
 
@@ -11302,8 +12829,7 @@ async function main() {
   // 时间感只输出**本轮数值**：分档规则已经在 persona 的【时间感】里写死了，
 // 这里再抄一遍等于每轮把同一段规则重发一次（350 字），而且两处措辞迟早会漂移。
   function buildTimeSenseLine(st) {
-    // 精简版：只报「最新一条有多旧」。当前时间由 withSlangContext 的【当前时间】统一给，
-    // 分档规则（10 分钟 / 120 分钟怎么处理）在 persona【时间感】。
+    // 精简版：只报「最新一条有多旧」。分档规则（10 分钟 / 120 分钟怎么处理）在 persona【时间感】。
     // 以前这三处各写一份，改一处忘两处，还让每轮唤醒多出 80 字。
     const now = Date.now();
     const newest = [...(Array.isArray(st.unread) ? st.unread : [])].reverse().find((m) => m && !m.isSelf)
@@ -11315,15 +12841,214 @@ async function main() {
     return `【时间】最新一条是 ${ageText} 前。\n\n`;
   }
 
+  /**
+   * 群友印象的 target → 稳定标识（QQ 号）。
+   *
+   * 2026-11-10 操作者要求：**memberImpression 按全局 QQ 号记**，不按昵称/群名片。
+   * 理由：同一个人在不同群有不同群名片、还可能改昵称，按名字记就会一人多条
+   * （"印象里出现两个我"就是这个）。QQ 号是唯一稳定的。
+   *
+   * 解析顺序：
+   *   1. target 本身就是纯数字 → 直接用（大概率已经是 QQ 号）
+   *   2. 在该会话的 recentMessages / unread 里按 sender 反查 userId
+   *   3. 反查不到 → 原样返回（宁可用名字，也不要丢这条印象；
+   *      而且下次同一个人发言时会再由 2 收敛成 QQ 号）
+   *
+   * 返回值同时给出展示名，写入时存 `name` 便于她读。
+   */
+  function resolveImpressionTarget(key, rawTarget) {
+    const target = String(rawTarget || '').trim();
+    if (!target) return null;
+    // 1) 本来就是 QQ 号
+    if (/^\d{5,12}$/.test(target)) return { id: target, name: target };
+    // 2) 在会话消息里找这个名字对应的 userId
+    try {
+      const st = getSocialV2State(key);
+      const lists = [Array.isArray(st.unread) ? st.unread : [], Array.isArray(st.recentMessages) ? st.recentMessages : []];
+      for (const list of lists) {
+        for (let i = list.length - 1; i >= 0; i -= 1) {
+          const m = list[i];
+          if (!m || m.isSelf) continue;
+          const sender = String(m.sender ?? '').trim();
+          const uid = m.userId != null ? String(m.userId) : '';
+          if (!uid) continue;
+          if (sender === target) return { id: uid, name: target };
+        }
+      }
+    } catch { /* 拿不到会话状态就退回名字 */ }
+    // 3) 反查失败：仍按名字记，不丢数据
+    return { id: target, name: target };
+  }
+
+  /**
+   * 共用会话：把组内**所有聊天**的消息收成一份，给每条打上"回哪儿"的标签。
+   *
+   * 需求场景（原文）：群里有人骚扰她、主人私聊让她骂回去 —— 她要能在一轮里同时看见
+   * 这两条，自己决定先回哪个、回在哪里。
+   *
+   * 产出两块（与旧版单会话结构一致）：
+   *   unread —— 真·未读，必须处理，带 #seq 与水位
+   *   recent —— 各聊天最近几条已读，给她"刚才在聊什么"的上下文
+   * 两条都必须带聊天标签，否则模型分不清该发到群还是私聊 —— 那正是串号的根源。
+   *
+   * 每块各自按时间升序混排：模型读的是"事情发生的顺序"，不是"两个聊天各自的顺序"。
+   */
+  function collectSharedMessagesV2(key, opts = {}) {
+    const group = shareGroupOf(key);
+    if (group.length <= 1) return null; // 不在共享组：走原来的单会话逻辑
+    const now = Date.now();
+    const maxPerChat = Number.isFinite(Number(opts.maxPerChat))
+      ? Math.max(1, Math.round(Number(opts.maxPerChat)))
+      : 12;
+    const maxRecentPerChat = Number.isFinite(Number(opts.maxRecentPerChat))
+      ? Math.max(0, Math.round(Number(opts.maxRecentPerChat)))
+      : 4;
+    const unreadRows = [];
+    const recentRows = [];
+    const perChatThrough = {};
+    for (const member of group) {
+      let st;
+      try { st = getSocialV2State(member); } catch { continue; }
+      const label = chatLabelForV2(member);
+      try { perChatThrough[member] = readThroughSeqV2(st); } catch { perChatThrough[member] = 0; }
+      const unread = Array.isArray(st.unread) ? st.unread : [];
+      const recent = Array.isArray(st.recentMessages) ? st.recentMessages : [];
+      for (const m of unread.slice(-maxPerChat)) {
+        if (!m) continue;
+        unreadRows.push({
+          message: compactModelMessage(m, { now }),
+          chatKey: member,
+          chatLabel: label,
+          isUnread: true,
+        });
+      }
+      if (maxRecentPerChat > 0) {
+        // 已读上下文排除掉仍在未读里的那些，避免同一条出现两遍。
+        //
+        // 2026-11-10（操作者方案）：私聊的【之前】**仅在它本轮有未读时才带**。
+        //   · 私聊有未读 → 说明正在私聊，把上下文补上（和原来一样，4 条）；
+        //   · 私聊没未读 → 跳过，不再每轮固定塞 4 条陈年私聊。
+        // 群聊永远带（群里人多、上下文容易被刷掉，那几条是真缺的）。
+        // 2026-11-13：曾试过把群聊也改成"有未读才带"，操作者决定回退，保持原样。
+        const isPrivateChat = member.startsWith('private:');
+        const includeRecent = !isPrivateChat || unread.length > 0;
+        if (includeRecent) {
+          const unreadSeqs = new Set(unread.map((m) => m.seq));
+          const past = recent
+            .filter((m) => m && (!Number.isSafeInteger(m.seq) || !unreadSeqs.has(m.seq)))
+            .slice(-maxRecentPerChat);
+          for (const m of past) {
+            recentRows.push({
+              message: compactModelMessage(m, { now }),
+              chatKey: member,
+              chatLabel: label,
+              isUnread: false,
+            });
+          }
+        }
+      }
+    }
+    const byTime = (a, b) => (Number(a.message?.at ? Date.parse(a.message.at) : 0) || 0)
+      - (Number(b.message?.at ? Date.parse(b.message.at) : 0) || 0);
+    unreadRows.sort(byTime);
+    recentRows.sort(byTime);
+    return { unread: unreadRows, recent: recentRows, perChatThrough };
+  }
+
+  /**
+   * 消息的发送者标签（写进 recentMessages / 未读队列，也是 memberImpression 的 target）。
+   *
+   * 为什么不能再用 `'私聊'` 这个字面量（2026-11-10 修复）：
+   *   私聊消息原本一律记成 sender='私聊'。她记群友印象时 `target` 填的就是这个名字，
+   *   于是同一个人会出现两条——群里一条「Ap0LoG1zE」，私聊一条「私聊」。
+   *   更糟的是「私聊」根本不是人名，她没法判断这两条其实指同一个人。
+   *
+   * 现在的规则：
+   *   · 群聊：群名片 → 群昵称 → QQ 号（原样，群名片就是她认人的依据）
+   *   · 私聊：**用真实昵称**，并带主人标记；拿不到昵称就退回 QQ 号。
+   *     共用会话下私聊和群指向同一个人，标签一致才能合并成同一条印象。
+   */
+  function v2SenderLabelFor(key, kind, event) {
+    const nick = event?.sender?.card || event?.sender?.nickname || '';
+    const uid = String(event?.user_id ?? event?.sender?.user_id ?? '');
+    if (kind === 'group') return nick || uid || '群友';
+    // 私聊：昵称优先，其次是「主人」/QQ 号。
+    const isOwnerUid = uid && String(cfg.ownerQQ ?? '') === uid;
+    if (nick) return nick;
+    if (isOwnerUid) return '主人';
+    return uid || '私聊';
+  }
+
+  /** 聊天标签：与发言时 key 参数一一对应，模型照着抄即可。 */
+  function chatLabelForV2(key) {
+    const canonical = canonicalV2Key(key) || key;
+    // 2026-11-10（操作者要求）：**只简化群聊**，私聊保持原样带 QQ 号。
+    //   群：`群20001` → `群`（消息行每条都带，实测 2113 行；群号在同一会话里恒等，
+    //       对模型决策零信息量，真正要抄的 key 由【令牌】行给一次就够）
+    //   私聊：维持 `私聊10001（主人）` —— 私聊可能不止一个，号码是天然消歧符，
+    //       不简化（操作者明确要求）。
+    //
+    // 群聊仍需消歧：组内有两个以上群时退回带号码，否则两个群都叫「群」就串号了。
+    try {
+      const group = shareGroupOf(canonical);
+      if (canonical.startsWith('group:')) {
+        const kindOf = (k) => (String(k).startsWith('group:') ? 'group' : 'private');
+        const sameKind = group.filter((k) => kindOf(canonicalV2Key(k) || k) === 'group');
+        return sameKind.length > 1 ? `群${canonical.slice('group:'.length)}` : '群';
+      }
+      const uid = canonical.slice('private:'.length);
+      return String(cfg.ownerQQ ?? '') === uid ? `私聊${uid}（主人）` : `私聊${uid}`;
+    } catch {
+      // 兜底：拿不到共享组就退回旧行为，宁可啰嗦也不能让两个聊天撞名。
+      if (canonical.startsWith('group:')) return `群${canonical.slice('group:'.length)}`;
+      const uid = canonical.slice('private:'.length);
+      return String(cfg.ownerQQ ?? '') === uid ? `私聊${uid}（主人）` : `私聊${uid}`;
+    }
+  }
+
   function buildWakeSnapshotV2(key) {
     const context = cfg.socialV2?.context ?? {};
     if (context.inlineWakeMessages === false || (!v2ToolEnabled('getUnread') && !v2ToolEnabled('getRecent'))) return null;
     const st = getSocialV2State(key);
+
+    // 共用会话：组内所有聊天的消息合并成一份，每条带来源标签。
+    // 这就是"群里有人骚扰、主人私聊让她骂回去，她一轮里全看得见"的实现点。
+    const shared = collectSharedMessagesV2(key);
+    const bounded0 = (name, fallback, min, max) => {
+      const value = Number(context[name] ?? fallback);
+      return Number.isFinite(value) ? Math.min(max, Math.max(min, Math.round(value))) : fallback;
+    };
+    if (shared) {
+      const maxChars0 = bounded0('wakeMaxChars', 6500, 500, 20000);
+      // 预算按"未读优先、之前其次"的顺序扣：未读是必须处理的，不能被上下文挤掉。
+      const unreadRows = [];
+      for (const row of shared.unread) {
+        unreadRows.push(row);
+        if (JSON.stringify({ u: unreadRows, r: [] }).length > maxChars0 * 0.75) { unreadRows.pop(); break; }
+      }
+      const recentRows = [];
+      for (const row of shared.recent) {
+        recentRows.push(row);
+        if (JSON.stringify({ u: unreadRows, r: recentRows }).length > maxChars0) { recentRows.pop(); break; }
+      }
+      return {
+        shared: true,
+        messages: unreadRows,
+        recent: recentRows,
+        now: localClockText(Date.now()),
+        unreadCount: unreadRows.length,
+        includedUnreadCount: unreadRows.length,
+        partial: false,
+        // 每个聊天各自的水位：模型收尾时按聊天分别提交，不会把另一个聊天的消息一起标已读。
+        perChatThrough: shared.perChatThrough,
+      };
+    }
+
     const bounded = (name, fallback, min, max) => {
       const value = Number(context[name] ?? fallback);
       return Number.isFinite(value) ? Math.min(max, Math.max(min, Math.round(value))) : fallback;
     };
-    const maxChars = bounded('wakeMaxChars', 6000, 500, 20000);
+    const maxChars = bounded('wakeMaxChars', 6500, 500, 20000);
     const maxUnread = bounded('wakeMessageLimit', 12, 1, 100);
     const maxRecent = bounded('wakeRecentLimit', 4, 0, 20);
     // 一次快照只取一次 now：同一批消息的 ago 必须彼此可比。
@@ -11386,31 +13111,105 @@ async function main() {
    * `messageId` 不再给：引用走本地 seq 就够了 —— `resolveReplyTargetV2` 先按
    * seq 在 recentMessages 里查，命中就换成真实 messageId。
    */
-  function renderWakeSnapshotV2(snapshot) {
+  /**
+   * 单条消息 → 一行文本。**唤醒快照与 qq_get_unread_messages 共用这一份**。
+   *
+   * 2026-11-11：`get_unread` 原来返回原始 JSON（`{seq,messageId,sender,userId,text,
+   * isOwner,ownerLabel,at,ago,media:[{kind,summary,subType,index}]}`），单条约 190 字符，
+   * 而同样的信息渲染成一行只要约 60 字符。用它自己的话说是"太繁杂了"。
+   *
+   * 字段取舍（保留 / 压缩 / 删）：
+   *   · `seq`      → `#123`                        保留（引用、水位）
+   *   · `sender`   → 原样                          保留
+   *   · `userId`   → **不输出**（2026-11-12）：模型只看人名，需要号时用
+   *                 qq_get_userid 按名字反查（桥接侧别名表自动维护）。
+   *                 这样每条消息省 18 字符；实测 73 次 affinity 里只有少数需要现查。
+   *   · `text`     → 原样（超 300 字截断）          保留
+   *   · `at`       → `16:34`                       保留（操作者要求）
+   *   · `ago`      → `（1小时前）`                  保留，与 at 并列
+   *   · `isOwner`+`ownerLabel` → `（主人）`          合并，省约 52 字符
+   *   · `messageId`→ 仅媒体/转发时 `图id=`/`转发id=` 其余删（引用走 seq）
+   *   · `media[]`  → 删（正文已有 `[图片]`/`[表情]`） 省约 80 字符
+   */
+  function renderOneMessageLine(m, opts = {}) {
+    const label = opts.label ? `[${opts.label}] ` : '';
+    const seq = Number.isSafeInteger(m?.seq) && m.seq > 0 ? `#${m.seq} ` : '';
+    // sender 来自群名片/昵称，是**群友可控的**。实测有人在里面塞
+    // `\n\u0005\u0012\u0003小\n\u0005\n\u0003刀\u0010\u0000`（控制字符 + 换行），
+    // 拼进单行文本就能伪造出假的「新段落 / 系统提示」。和 sanitizeMediaSummary
+    // 用同一套清洗：控制字符、行分隔符一律压成空格。
+    const who = m?.isSelf ? '我' : String(m?.sender || '某人').replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, ' ').trim() || '某人';
+    // 正文同样要清洗：@段 解析出来的名字也可能带控制字符
+    // （实测 `@ \u0005\u0012\u0003小 \u0005 \u0003刀\u0010\u0000`）。
+    // 注意顺序：先削控制字符（\n \t 之外的），再收拢空白。
+    const raw = String(m?.text ?? m?.plain ?? '')
+      .replace(/[\u0000-\u0008\u000b-\u001f\u007f\u2028\u2029]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const text = raw.length > 300 ? `${raw.slice(0, 300)}…` : raw;
+    // at / ago 并列：`·16:34（1小时前）`。at 缺失时只给 ago，反之亦然。
+    const ago = humanAgoV2(m?.ago);
+    const at = String(m?.at ?? '').trim();
+    const when = at && ago ? `·${at}（${ago}）` : at ? `·${at}` : ago ? `·${ago}` : '';
+    // 精确句柄只在真需要时给。
+    const refs = [];
+    if ((m?.hasMedia || (Array.isArray(m?.media) && m.media.length)) && m?.messageId) {
+      refs.push(`图id=${m.messageId}`);
+    }
+    // 正文里已有 `[转发消息 id=xxx]` 就不再重复追加（单条 id 长达 84 字符）。
+    if (Array.isArray(m?.forwardIds) && m.forwardIds.length
+        && !m.forwardIds.every((fid) => raw.includes(String(fid)))) {
+      refs.push(`转发id=${m.forwardIds.join(',')}`);
+    }
+    const tail = refs.length ? `（${refs.join(' ')}）` : '';
+    const selfMark = m?.quoteTargetIsSelf ? '↩你 ' : '';
+    const ownerMark = m?.isOwner ? '（主人）' : '';
+    // 2026-11-12（操作者方案）：**消息行不再带 QQ 号**。
+    // 以前每条都挂 `userId:123456789`（18 字符），唤醒词 2113 行加起来是白烧。
+    // 现在只显示人名；需要号时用 qq_get_userid（query=人名）反查 ——
+    // 桥接侧的别名表（昵称 ↔ QQ 号）会自动维护，见 noteAliasV2。
+    // opts.withUserId 保留作为调试开关，正常路径不再传。
+    const uid = (opts.withUserId && m?.userId) ? ` userId:${m.userId}` : '';
+    return `${label}${seq}${who}${uid}${when}：${selfMark}${text}${tail}${ownerMark}`;
+  }
+
+  function renderWakeSnapshotV2(snapshot, wakeKey = '') {
     if (!snapshot || typeof snapshot !== 'object') return '';
     const unread = Array.isArray(snapshot.messages) ? snapshot.messages : [];
     const recent = Array.isArray(snapshot.recent) ? snapshot.recent : [];
-    const who = (m) => (m && m.isSelf ? '我' : String(m?.sender || '某人'));
-    const one = (m) => {
-      const seq = Number.isSafeInteger(m?.seq) && m.seq > 0 ? `#${m.seq} ` : '';
-      const ago = humanAgoV2(m?.ago);
-      // 单条硬截断：源消息本身已经截到 200 字，这里兜底防止异常数据撑爆。
-      const raw = String(m?.text ?? m?.plain ?? '').replace(/\s+/g, ' ').trim();
-      const text = raw.length > 300 ? `${raw.slice(0, 300)}…` : raw;
-      // 精确句柄**只在真的需要时**给：看图要 messageId，查转发要 forwardIds。
-      // 纯文字消息不给 —— 引用走本地 seq（resolveReplyTargetV2 会自己换成真实
-      // messageId），而每条 ID 十几个字符、每轮都进历史，纯属白烧。
-      const refs = [];
-      if ((m?.hasMedia || (Array.isArray(m?.media) && m.media.length)) && m?.messageId) {
-        refs.push(`图id=${m.messageId}`);
+    const one = (m) => renderOneMessageLine(m);
+    // ── 共用会话：组内多条聊天混排，每条标来源 ────────────────────────────
+    // 格式：`[群] 阿三·16:34（2分钟前）：…` / `[私聊10001（主人）] 主人·…：…`
+    // 标签写的就是发言时要传的 key 的"人话版"，模型照着标签就知道回哪儿。
+    if (snapshot.shared) {
+      const rows = Array.isArray(snapshot.messages) ? snapshot.messages : [];
+      const past = Array.isArray(snapshot.recent) ? snapshot.recent : [];
+      const oneRow = (row) => renderOneMessageLine(row.message, { label: row.chatLabel });
+      // 首行带**每个聊天各自的**水位：她收尾时要按聊天分别传 throughSeq，
+      // 只给一个总水位会导致另一个聊天永远标不完（或一次性清空）。
+      const through = snapshot.perChatThrough && typeof snapshot.perChatThrough === 'object'
+        ? Object.entries(snapshot.perChatThrough)
+          .filter(([k]) => canonicalV2Key(k))
+          .map(([k, v]) => `${chatLabelForV2(k)} 读到 #${v}`)
+          .join('，')
+        : '';
+      const unreadChats = new Set(rows.map((r) => r.chatKey)).size;
+      const head = rows.length
+        ? `${rows.length} 条未读${unreadChats > 1 ? `（来自 ${unreadChats} 个聊天）` : ''}`
+        : '没有新消息';
+      const out = [`【本轮消息】${head}${through ? `，${through}` : ''}`];
+      if (rows.length) {
+        for (const row of rows) out.push(oneRow(row));
+        // 「上面带方括号的就是去处…」这句删了：标签现在是 `[群]` / `[私聊10001（主人）]`，
+        // 和【令牌】行的「群 → key "group:…"」一眼对得上，再解释一遍纯属重复。
       }
-      if (Array.isArray(m?.forwardIds) && m.forwardIds.length) {
-        refs.push(`转发id=${m.forwardIds.join(',')}`);
+      if (past.length) {
+        out.push('【之前】');
+        for (const row of past) out.push(oneRow(row));
       }
-      const tail = refs.length ? `（${refs.join(' ')}）` : '';
-      const selfMark = m?.quoteTargetIsSelf ? '↩你 ' : '';
-      return `${seq}${who(m)}${ago ? `·${ago}` : ''}：${selfMark}${text}${tail}`;
-    };
+      return out.join('\n');
+    }
+
     const head = [];
     if (unread.length) head.push(`${unread.length} 条未读`);
     if (Number.isSafeInteger(snapshot.readThroughSeq)) head.push(`读到 #${snapshot.readThroughSeq}`);
@@ -11445,59 +13244,357 @@ async function main() {
     const name = String(selfDisplayName || '').trim();
     const id = String(selfUserId || '').trim();
     if (!name && !id) return '';
-    const label = name ? `「${name}」` : '（昵称未取到）';
-    const idText = id ? `（QQ ${id}）` : '';
-    const callBits = name
-      ? `消息里出现「@${name}」、有人叫「${name}」、或引用你的消息，指的都是你 —— 不要当成别人`
-      : '被 @、被叫到你的昵称、或引用你的消息，指的都是你 —— 不要当成别人';
-    return `【你的身份】你在 QQ 上的昵称是${label}${idText}。${callBits}；群名片可能与昵称不同，at/引用段里带${id ? ` ${id} ` : '你的 QQ 号'}就是在叫你。\n\n`;
+    // 2026-11-10 压成一行（原版 132 字）：
+    // 保留「@昵称 / @QQ号 都是在叫你」是**必要**的 —— 消息里的 at 段只渲染成 `@昵称`
+    // （见 segmentsToText 的 'at' 分支），没有这句她会把 @自己 当成群里另一个人
+    // （issue #29；实测 @角色A 出现 80 次，是高频事件）。
+    // 「或引用你的消息」可以删：引用自己渲染时会带 `↩你` 前缀（renderWakeSnapshotV2），
+    // 触发判定也不依赖这句（evaluateWakeTriggerV2 用 quoteTargetIsSelf）。
+    // 「群名片可能与昵称不同」删掉：解析不到昵称时本来就会回退成 `@QQ号`，下半句覆盖了。
+    const callBits = [name ? `@${name}` : '', id ? `@${id}` : ''].filter(Boolean).join(' 或 ');
+    return `【你的身份】QQ ${id || '?'}${name ? `，昵称 ${name}` : ''}；${callBits} 都是在叫你。\n\n`;
   }
 
   /**
-   * 角色卡注入：小卡直接全文带上，大卡只给名字。
+   * 角色卡注入：**默认一律不内联，只给名字**。
    *
-   * 为什么不全靠 qq_get_prompt：唤醒包里只写一个名字时，模型常常懒得再查一次，
-   * 结果它只知道"我在扮演 X"，不知道 X 什么脾气 —— 角色卡等于没启用。
-   * 但 6000 字的卡每轮塞进 user message 又太贵（而且会进历史反复重算），
-   * 所以按长度分档：小卡（几百字）直接内联，大卡才退回"按需查"。
+   * 历史与取舍（2026-11-12 定稿，操作者决定）：
+   *   旧版按长度分档：小卡（≤1200 字）全文内联，大卡退回"按需查"。
+   *   但实测发现两件事：
+   *     ① 卡里大量内容是模型**光凭角色名就知道**的（"话少""用省略号""情绪不写在脸上"），
+   *        写不写进去表现几乎一样 —— 内联这些等于白烧 token。
+   *     ② 卡越短越容易掉进"内联"档，于是"人格卡到底进没进上下文"这件事
+   *        变得依赖卡的长度，随时会随着编辑翻转，行为不可预期。
+   *
+   *   现在改成阈值 = 1：**任何卡都不会内联**。人格统一走 `qq_get_prompt`，
+   *   由 preset 规定"新会话第一轮 / 压缩后必须读一遍"。
+   *   好处：注入路径唯一、可预期；卡写多长都不会悄悄改变行为。
+   *   代价：冷启动那轮多一次工具调用（其余轮次靠会话历史里已有的内容）。
+   *
+   * ⚠️ 改成 1 之后，`hint.length <= 1` 只有空/单字符卡才会命中，等价于禁用内联。
+   *   如果哪天要恢复内联，直接调这个数字即可，不要另加开关。
    */
-  const ROLE_INLINE_MAX_CHARS = 1200;
-  function buildRoleLineV2(roleName) {
+  const ROLE_INLINE_MAX_CHARS = 1;
+  /**
+   * 角色行。
+   *
+   * 2026-11-12：加了 `coldStart` 参数 —— 之前每轮都输出同样一句
+   * 「（完整角色卡请调用 qq_get_prompt 查看）」，于是她在普通轮次里看到它
+   * 也会以为"随时可以调但不必现在调"，而真正的时机（新会话第一轮 / 压缩后）
+   * 反而没有任何区别性提示。实测 12 小时、16 个回合、70 次工具调用里
+   * qq_get_prompt 一次都没被主动调过（唯一一次是操作者手动要求的）。
+   *
+   * 现在分两种口吻：
+   *   · 冷启动：明确写成「先调」，和【记忆】那句并列，都属于"开口前必须先做的事"；
+   *   · 普通轮次：只报名字，不催 —— 那时人设已经在这个会话的上下文里了。
+   *
+   * @param {string} roleName 角色名
+   * @param {boolean} coldStart 是否新会话第一轮 / 刚压缩完
+   */
+  function buildRoleLineV2(roleName, coldStart = false) {
     const name = String(roleName || '').trim();
     if (!name) return '';
     let hint = '';
     try { hint = currentRoleHintV2() || ''; } catch { hint = ''; }
+    // 阈值已是 1：正常人格卡（哪怕只有几百字）都不会命中这条，一律走"只给名字"。
+    // 保留这个分支只是为了空卡时不输出一个字（否则会拼出「【当前角色】X\n\n\n」）。
     if (hint && hint.length <= ROLE_INLINE_MAX_CHARS) {
       return `【当前角色】${name}\n${hint.trim()}\n\n`;
+    }
+    // 大卡：冷启动必须点名去调；平时只报名字。
+    if (coldStart) {
+      return `【当前角色】${name}（你的完整人设不在上下文里 —— 开口前先调 qq_get_prompt 读一遍人格卡，它只返回人格卡正文。）\n\n`;
     }
     return `【当前角色】${name}（完整角色卡请调用 qq_get_prompt 查看）\n\n`;
   }
 
+  /**
+   * 【当前场景】只交代"有哪些聊天、各自的 key 是什么"，语气分寸那类建议不写。
+   *
+   * 为什么砍到这么短：manager 明确要求这里只给群号、私聊 QQ 号、key。
+   * 场景判断交给模型看【本轮消息】的标签自己决定 —— 那才是真正有信息量的地方。
+   */
+  function buildSceneLineV2(key) {
+    const canonical = canonicalV2Key(key) || key;
+    const group = shareGroupOf(canonical);
+    // 2026-11-10 起不再单独出这段：群聊标签已缩成「群」，私聊保持带 QQ 号，
+    // 而「标签 → key → 令牌」的三元组统一由 sessionTokenLineV2 给一次。
+    // 同一个映射写两遍（场景段给 key、令牌段再给 key+令牌）是纯重复。
+    // 【怎么回】那段也删了：消息行本身就带 `[群]` / `[私聊10001（主人）]` 前缀，
+    // 「想回哪个就把 key 填成对应的那个」属于一眼可推的推论。
+    if (group.length > 1) return '';
+    // 非共享组（只有一个聊天）保留一句最短定位，它没有"多聊天"的上下文可推。
+    return `【场景】${chatLabelForV2(canonical)}\n`;
+  }
+
+  /**
+   * 好感度注入：按「这轮是谁在跟她说话」取对应的人，渲染成一行状态提示。
+   *
+   * ⚠️ 关键：好感度是**按人**记的，不是按聊天。
+   * 私聊里的你和群里的你是同一个人，所以在哪说话都该算到同一个 QQ 号头上。
+   * 因此读取时要遍历整个共享组，取这个人**分数最高的那条记录** ——
+   * 同一个人的记录理论上只有一份，但共用会话开启前后可能各存过一份，
+   * 取高的那个才不会让已有的亲密度凭空消失。
+   *
+   * 取谁为准的顺序：
+   *   1. 本轮未读里最后一条真人消息的 userId（最贴近"现在在跟谁说话"）
+   *   2. 私聊时就是聊天对象本人
+   *   3. 群聊且没有未读时，退回合里最近说话的人
+   * 取不到人就不注入 —— 宁可没有，也不要给一个错的对象。
+   */
+  /**
+   * 好感度**不注入唤醒包**，这里只保留一个空实现，避免调用点报错。
+   *
+   * 历史（四次修订，全部保留教训）：
+   *   ① 写行为指令（"保持距离、一条就够"）→ 直接盖掉人格卡，她开始解释自己。
+   *   ② 压到一行状态描述 → 仍然每轮进上下文、仍然跟人格卡抢注意力。
+   *   ③ 整个退掉、一个字不提，只在 preset 里说"拿不准就 qq_affinity 查"。
+   *      → 300 条工具调用里 qq_affinity 只出现 1 次（还是操作者手动测的）。
+   *      等于**机制建好了却完全没接上**：她根本不知道谁是谁。
+   *   ④ 把 [依赖] 这类标记贴在每条消息的人名后面 → 有效，但用户选择走工具路线
+   *      （"规定一定要在回复人之前查好感度"），所以又撤掉了。
+   *
+   * 现在的方案：**不注入任何关系信息**，由 preset 里那条硬规则要求她在回复前
+   * 调 qq_affinity 查。好处是关系状态由她自己"想起来"、按需查，不占每轮上下文；
+   * 代价是多一次工具调用。
+   */
+  function buildAffinityLineV2() {
+    return '';
+  }
+
+  function buildAffinityStageChangeLineV2(key) {
+    // 档位变化现在存在**全局** socialV2.affinityStageChanges（按 QQ 号），
+    // 不再按会话存 —— 所以这里不需要 key 也能读到，保留参数只是为了签名一致。
+    let st;
+    try { st = getSocialV2State(key); } catch { st = null; }
+    const changes = socialV2.affinityStageChanges && typeof socialV2.affinityStageChanges === 'object'
+      ? socialV2.affinityStageChanges : null;
+    if (!changes) return '';
+    const entries = Object.entries(changes).filter(([, v]) => v && v.to);
+    if (!entries.length) return '';
+
+    // 名字：优先用这个会话最近消息里的群名片/昵称，取不到就退回 QQ 号。
+    // （好感度表只存 userId，昵称是展示用的东西，不该为了它去额外调 OneBot。）
+    const nameOf = (uid) => {
+      try {
+        const msgs = Array.isArray(st.recentMessages) ? st.recentMessages : [];
+        for (let i = msgs.length - 1; i >= 0; i -= 1) {
+          const m = msgs[i];
+          if (!m || String(m.userId ?? '') !== uid) continue;
+          const s = String(m.sender ?? '').trim();
+          if (s && s !== uid && !['私聊', '我', '未知', '群友', '管理员'].includes(s)) return s;
+        }
+      } catch {}
+      return uid === String(cfg.ownerQQ ?? '') ? '主人' : uid;
+    };
+
+    // 一次最多提 3 个人：再多就不是"提醒"，是一张待办清单了。
+    const names = entries.slice(-3).map(([uid]) => nameOf(uid));
+    const who = names.length === 1 ? names[0] : names.join('、');
+    // 2026-11-12 操作者要求：在后面补一句"查一下某某的好感度"。
+    // 原来只有「（某某的好感度发生了变化）」，是个**陈述**——她可能只是"知道了"就照旧凭记忆回话。
+    // 补上动作后，它变成指令，和前面的「（有人拍了一拍。）」区分开：
+    //   拍一拍 = 告知发生了什么；好感度变化 = 告知 + 要她做一件具体的事。
+    // 只对单个人时写名字，多人时写"他们的"——避免一句话里出现三个名字还得各自查。
+    const action = names.length === 1
+      ? `查一下${who}的好感度`
+      : `查一下他们的好感度`;
+    return `（${who} 的好感度发生了变化，${action}）`;
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 冷启动引导：**唯一一条链路**（2026-11-13 重建）
+  //
+  // 要解决的事只有一件：什么时候该在唤醒词里挂那两句提示
+  //   ①（新会话或上下文刚压缩过，你记下的东西现在不在上下文里。开口前先调 qq_memory_query，不带 category。）
+  //   ②（你的完整人设不在上下文里 —— 开口前先调 qq_get_prompt 读一遍人格卡。）
+  //
+  // 旧实现的问题（这是重建的动因，写在这里免得哪天又被改回去）：
+  //   · 判定散在三处：reason==='bootstrap'、st.memNeedsSync、组级 bootstrapSent。
+  //   · 渲染跑两遍：sendWakePromptV2 渲一次（结果被丢弃），deliverPromptNow 又渲一次。
+  //     而第一遍已经把 memNeedsSync 清掉了 ⇒ 压缩后那句**从来没真正发出去过**。
+  //   · 降级判定（组内已引导就按普通唤醒）只作用于第一遍，第二遍按原始
+  //     reason 重渲 ⇒ 同一个会话里冷启动提示发了两遍（12:56:09 / 12:56:42 实测）。
+  //
+  // 新结构：**写标记 → 唯一渲染点读标记 → 消费即清**。
+  //   · 标记按 DSH sessionId 存（shared 组天然一份，两个入口不可能各发一遍）；
+  //   · 渲染全桥接只有 buildWakePromptV2 一处；
+  //   · 消费在 deliverPromptNow 投递被接受之后（见 commitColdStart），
+  //     失败/入队/被拒都不消费，下次补投照样带着提示。
+  //
+  // 两个条件都在这里判定，不许在别处再判一次：
+  //   条件 A「新会话」：DSH 没有"会话是新的"这样的事件，所以由桥接在会话被创建时登记
+  //                     （ensureSession 新建分支）。sessionId 变了 = 上下文没了，这是硬事实。
+  //   条件 B「刚压缩过」：**优先用 DSH 原生事件** compaction/end（桥接一直能收到
+  //                     session/event，不需要新接口）。事件流断线期间漏掉的压缩，
+  //                     由 idleCompactV2 自己调 /compact 成功后补记一次作兜底。
+  // ══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * 登记"这个 DSH 会话要重新想起来一次"。
+   *
+   * @param {string} sessionId DSH 会话 id（= agent.id）
+   * @param {'new'|'compacted'} kind new=新会话；compacted=刚压缩过
+   * @param {string} why 只用于日志
+   */
+  function markColdStart(sessionId, kind, why = '') {
+    const sid = String(sessionId || '').trim();
+    if (!sid) return;
+    const now = Date.now();
+    const prev = coldStartRegistry.get(sid) ?? { newAt: 0, compactedAt: 0, consumedAt: 0, at: 0 };
+    const next = { ...prev, at: now };
+    if (kind === 'new') next.newAt = now; else next.compactedAt = now;
+    // 重新登记 = 一次全新的"上下文没了"，之前那次消费记录作废。
+    next.consumedAt = 0;
+    coldStartRegistry.set(sid, next);
+    saveColdStarts();
+    log(`[coldStart] 已登记 ${kind} ${sid}${why ? `（${why}）` : ''}`);
+  }
+
+  /**
+   * 这个会话此刻是否处于"上下文没了"的状态。
+   *
+   * 判据只有"标记还在、且没被消费" —— 刻意**不看** reason、不看 bootstrapSent、
+   * 不看 memNeedsSync：那些是"为什么醒"和"引导发没发过"，跟"她脑子里还有没有东西"是两件事。
+   *
+   * @returns {{coldStart: boolean, kind: string, anchor: number}}
+   */
+  function coldStartStateOf(key) {
+    const sid = state.sessions[key];
+    if (!sid) return { coldStart: false, kind: '', anchor: 0 };
+    const rec = coldStartRegistry.get(sid);
+    if (!rec) return { coldStart: false, kind: '', anchor: 0 };
+    // 消费过（且之后没有再登记）就不算 —— consumedAt 在重新登记时会被清零。
+    const anchor = Math.max(Number(rec.newAt) || 0, Number(rec.compactedAt) || 0);
+    if (!anchor || Number(rec.consumedAt) >= anchor) return { coldStart: false, kind: '', anchor: 0 };
+    return {
+      coldStart: true,
+      kind: (Number(rec.compactedAt) || 0) >= (Number(rec.newAt) || 0) ? 'compacted' : 'new',
+      anchor
+    };
+  }
+
+  /**
+   * 提示已经**真的投递出去**了：把这个标记就地消费掉。
+   *
+   * 为什么消费点放在 deliverPromptNow 而不是渲染时：渲染会跑在
+   * "会话繁忙 → 暂存 → 限频重试 → 入队补投" 这些还没落地的路径上。
+   * 在渲染时清，等于"提示被丢弃了但标记已经没了" —— 旧实现压缩后那句永远发不出去，
+   * 就是这么来的。只有 DSH 真的接受了这条 prompt，才算提示过。
+   *
+   * @param {string} sessionId
+   * @param {number} anchor 渲染时看到的那次登记时刻（防止消费掉渲染之后新来的登记）
+   */
+  function commitColdStart(sessionId, anchor) {
+    const sid = String(sessionId || '').trim();
+    if (!sid || !anchor) return;
+    const rec = coldStartRegistry.get(sid);
+    if (!rec) return;
+    const cur = Math.max(Number(rec.newAt) || 0, Number(rec.compactedAt) || 0);
+    // 渲染之后又登记过一次（比如投递等待期间正好压完一轮）：那次提示还没发，不能清。
+    if (cur !== anchor) return;
+    rec.consumedAt = Date.now();
+    saveColdStarts();
+    log(`[coldStart] 已消费 ${sid}`);
+  }
+
   function buildWakePromptV2(key, reason) {
     const roleState = readRoleState();
-    const roleLine = roleState.role ? buildRoleLineV2(roleState.role) : '';
+    // viaSystemPrompt 要先算：下面几段的拼法取决于它。
+    const viaSystemPrompt = cfg.socialV2?.injectViaSystemPrompt === true;
+    const st = getSocialV2State(key);
+    // 冷启动判定走登记表（唯一来源）。必须在角色行之前算：角色行要用它决定口吻
+    // （冷启动时明确催她调 qq_get_prompt，平时只报名字）。
+    const coldStartInfo = coldStartStateOf(key);
+    const coldStart = coldStartInfo.coldStart;
+    log(`[coldStart] key=${key} reason=${reason} → ${coldStart}${coldStart ? `（${coldStartInfo.kind}）` : ''}`);
+    const roleLine = roleState.role ? buildRoleLineV2(roleState.role, coldStart) : '';
     // 这几段（身份 / 令牌 / 表情 / 长期记忆）现在由 DSH 插件
     // `plugins/qq-agent-context` 注入到**系统提示词**里：模型照样看得到，但不再进对话历史，
     // 也就不会让每一轮唤醒读起来像一张工单。开关关掉就回到旧行为（全部塞进 user message）。
-    const viaSystemPrompt = cfg.socialV2?.injectViaSystemPrompt === true;
     const identityLine = viaSystemPrompt ? '' : selfIdentityTextV2();
-    const st = getSocialV2State(key);
-    const tokenLine = viaSystemPrompt ? '' : `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
+    const tokenLine = viaSystemPrompt ? '' : `${sessionTokenLineV2(key, st.agentToken)}\n\n`;
     // 【进行中的话题】不再逐轮注入：那是跨轮记忆，该走静态 facts（可缓存）或者
     // 让它自己 qq_recall，不该每轮塞进 user message 里重复计费。
-    // 长期记忆（L2）：按权重取前 N 条，跟「轻量记忆」（进行中的话题）分开注入。
+    // 长期记忆（L2）也不再整段注入唤醒包：30 条事实每轮几百字，且会进历史反复重算。
     // 单独 try：事实库坏了不能影响整轮唤醒。
+    // 记忆注入策略（2026-11-10 二次修订，操作者定）：
+    //   · **唤醒包里一律不带记忆正文**，三类记忆（selfNote / 群友印象 / 长期事实）都改成她自己调工具查；
+    //   · 冷启动（新会话第一轮）或刚压缩完 —— 挂一句「先查什么」的提示，因为这时她手上确实什么都没有；
+    //   · 其他轮次 —— 只在长期事实内容变了时提示一句（30 条里换掉一条也算变化，靠指纹判断）。
+    // 为什么冷启动/压缩后要提示：压缩会把历史压成摘要，selfNote/印象/事实都不在上下文里了，
+    // 而实测她 5471 次工具调用里 qq_memory_query 只用过 2 次 —— 不提示 = 等于失忆。
+    // 为什么不再注入正文：正文进唤醒包就是进对话历史，压缩时照样被摘要掉，而且每轮重复计费；
+    // 让她调工具拿，内容只在她真正开口的那一轮出现一次。
+    // 长期三类记忆（印象/自我认知）现在在全局存储里，和当前会话无关。
+    const memSt = getSocialV2State(GLOBAL_MEMORY_KEY);
+    // coldStart 已在函数开头算好（角色行要用它）。
+
     let factsLine = '';
     if (!viaSystemPrompt) {
       try {
-        const facts = selectFactsForInjection(STATE_DIR, key);
-        if (facts.text) factsLine = `${facts.text}\n\n`;
+        const facts = selectFactsForInjection(STATE_DIR, memoryKeyOf(key));
+        const picked = Array.isArray(facts.picked) ? facts.picked : [];
+        const nowCount = picked.length;
+        // 内容指纹：30 条时新写一条把权重最低的顶掉，条数还是 30 但内容变了 —— 只比条数会漏。
+        // 取「按权重排好序的 id + hits」，任何 id 进出或加权都会变。
+        const fingerprint = nowCount
+          ? crypto.createHash('sha1')
+            .update(picked.map((f) => `${f.id}:${f.hits || 0}`).join('|'))
+            .digest('hex')
+            .slice(0, 16)
+          : '';
+        // 指纹 / 已见 id 都跟着**长期事实**走，而长期事实是全局一份，
+        // 所以这两个字段也必须存在全局存储上 —— 否则群和私聊各有各的基线，
+        // 同一批事实会被两边各判一次「有变化」，各提示一遍。
+        const factState = getSocialV2State(GLOBAL_MEMORY_KEY);
+        const prevFingerprint = String(factState.factFingerprint || '');
+
+        if (coldStart) {
+          // 冷启动 / 刚压缩完：**只给提示，不注入正文**。
+          //
+          // 记忆正文不进唤醒包（2026-11-10 操作者定）：正文进了历史，压缩时照样被摘要掉，
+          // 而且每轮重复计费。让她调工具拿，内容只在她真正开口的那一轮出现一次。
+          // 提示只教一种查法（不带 category 一次拿全部）：上一版并列写两条时，
+          // 她只执行了参数更明确的那条，selfNote / 群友印象整块被跳过。
+          // 也不写"会返回什么"：那是工具自己的说明，写在这里就是一份可能过期的副本。
+          const hasSelf = Array.isArray(memSt?.selfNotes)
+            && memSt.selfNotes.some((n) => n && n.text);
+          const imMap = memSt?.memberImpressions;
+          const hasImp = !!imMap && typeof imMap === 'object'
+            && Object.values(imMap).some((v) => v && Array.isArray(v.traits) && v.traits.length);
+          const hasFact = nowCount > 0;
+          // 库里什么都没有时不点名工具：点名了她会白调一次，然后拿到一片空。
+          if (hasSelf || hasImp || hasFact) {
+            factsLine = '（新会话或上下文刚压缩过，你记下的东西现在不在上下文里。开口前先调 qq_memory_query，不带 category。）\n\n';
+          } else {
+            factsLine = '（新会话或上下文刚压缩过 —— 你记下的东西现在不在上下文里。）\n\n';
+          }
+          // 记录当前指纹作为基线：这一轮已经明确提示过"去查"，下一轮内容没变就不该再提示。
+          // （写基线不会漏检 —— 指纹是内容哈希，内容变了哈希必然变。留空反而会让
+          //   冷启动后的下一轮必然误报一次「长期记忆有变化」。）
+          factState.factFingerprint = fingerprint;
+          // 记下此刻活跃的 id：她按提示全量查过之后，delta 只需要给「新增 + 已消失」。
+          factState.factSeenIds = picked.map((f) => f.id).filter(Boolean);
+        } else if (nowCount > 0 && fingerprint !== prevFingerprint) {
+          // 平时：只提示变化，正文让她自己查。
+          // 不报条数（和冷启动那句保持一致）—— 条数是调用之后才有的信息，
+          // 写进唤醒词只是把它撑长；也不写 category='longTerm'，
+          // 全库只教一种查法：不带 category 一次拿全部。
+          factsLine = '（长期记忆有变化，先调 qq_memory_query 看一眼你记得什么，再说话。）\n\n';
+          factState.factFingerprint = fingerprint;
+        } else if (nowCount === 0 && prevFingerprint) {
+          factState.factFingerprint = '';
+        }
+        // ⚠️ 这里**不再清除任何"提示过"的标记**。
+        // 消费统一在 deliverPromptNow 投递被接受之后（commitColdStart）：
+        // 渲染会跑在"会话繁忙 → 暂存 → 限频重试 → 入队补投"这些还没落地的路径上，
+        // 在渲染时清 = 提示被丢弃但标记已经没了。
+        saveSocialV2State();
       } catch (error) {
-        log(`[memory] 长期记忆注入失败（已跳过）：${error?.message ?? error}`);
+        log(`[memory] 记忆注入失败（已跳过）：${error?.message ?? error}`);
       }
     }
-    // 注意：黑话表不在这里注入，deliverPromptNow 的 withSlangContext 会统一注入，
-    // 避免唤醒 prompt 出现两份黑话表。
     // 参与度统计不再每轮注入：实测模型基本不看它，看了也不改行为。
     // 需要时由控制台或 qq_social_state 查。
     // 【反AI味】不再写进唤醒包：`qq-chat-v2` 的 persona 已有更完整的
@@ -11522,31 +13619,54 @@ async function main() {
     const initialPromptLine = initialPromptText ? `${initialPromptText}\n\n` : '';
     // 绝对时间也不再单独给一行【当前时间】：每条消息自带"多久前"，模型判断新鲜度
     // 够用；而绝对时间每轮都变，会挡住前缀缓存（那是延迟和成本的大头）。
-    //
-    // 加权提示（B 方案）：不额外起会话、不额外调模型，就在她本来这一轮里顺带判断。
-    // 只在 facts 非空时加 —— 空库时加这段纯属噪声。
-    // 用「原文照抄」而不是「第 N 条」：id/序号对模型是易失的，原文才稳定，
-    // 而且照抄后 addFact 的 text 完全相等去重能精确命中。
-    const bumpHint = factsLine
-      ? '【长期记忆·加权】如果这轮对话里有人提到了上面【长期记忆】中的某件事（同一件事换个说法也算），'
-        + '用 qq_fact_add 把那条事实原样再写一遍（text 和上面一字不差，tag 照旧）——'
-        + '重复写入只会给它加权，不会多存一条。语义相反的不算（那是需要修正的新情况）。'
-        + '没提到就不用管，不要为了加权硬凑。\n\n'
-      : '';
-    const base = roleLine + identityLine + tokenLine + initialPromptLine + factsLine + bumpHint + recallHint;
+    const base = roleLine + identityLine + tokenLine + initialPromptLine + factsLine + recallHint;
+    // 【当前场景】共用会话时私聊与群共用一个 DSH 会话，历史是连着的一份，
+    // 模型很容易把上一个场景的对话习惯带过来（在群里用私聊口吻、在私聊里以为有别人）。
+    // 所以每轮都明确写一次"这是哪儿、谁是对方、地址该填什么"，这是不串号的第一道保障
+    // （第二道是 turnKeyQueue 的回复路由）。
+    const sceneLine = buildSceneLineV2(key);
+    // 好感度**不再注入唤醒包**（2026-11-07 三次修订，操作者要求）。
+    // 理由：任何每轮都出现的状态描述都会跟人格卡抢注意力，实测她开始用解释口吻回话。
+    // 现在改成"她想起来才查"：流程写在 preset 里（发言前可先 qq_affinity 看一眼分寸），
+    // 工具是 qq_affinity，细节由它按需返回。
     // 各分支的"为什么叫醒你"都砍成一行：原文案（原因解释 + 行动要求 + 收尾提示）
     // 已经在 persona 和工具描述里，每轮再说一遍只是把历史撑长。
     if (reason === 'bootstrap') {
       // 冷启动把"它自己写下的自我认知"带上：新会话开始时读一次，等于想起来了。
       // 之后不再每轮注入 —— 那会变成别人告诉它"你是谁"。
-      const selfText = formatSelfNotesV2(st);
-      return `${base}${selfText}【引导】你已接入 QQ 会话 ${key}。\n你的文本输出不会自动发到 QQ，发言要调用 qq_send_message；处理完先收尾（qq_mark_read 或 qq_set_wake_config），否则会收到一条提醒。`;
+      // 共用会话：读组内代表 key 的 selfNotes，私聊与群共用同一份自我认知。
+      // selfNote / 群友印象 / 长期事实**都不再注入正文**（2026-11-10 操作者定）：
+      // factsLine 只在冷启动时给一句「先查 qq_memory_query」的提示，正文由她自己调工具拿。
+      const selfText = '';
+      // 2026-11-13（操作者要求）：**【引导】整段删除**。
+      //
+      // 那段原本写"你已接入 XX、发言必须调 qq_send_message 带 key、记得收尾"。
+      // 删掉的理由：
+      //   · 这些要求 preset 里已经常驻（system prompt，不占历史）；
+      //   · 引导本身经常发不出去 —— wakePriorityV2 里 bootstrap 的优先级是 0，
+      //     撞上合并窗口就会被丢弃；就算没丢，sendWakePromptV2 里还有一层
+      //     "组内已置位就降级"的判定。实测 18/48 个会话首轮没有引导。
+      //   · 它只在第一轮出现一次，多这 100 字符对模型行为的实际影响很小。
+      // 注意：**括号提示（factsLine）不受影响** —— 那段仍然只在冷启动/压缩后出现。
+      return `${sceneLine}${base}${selfText}`;
     }
-    if (reason === 'timeout') return `${base}（你设的潜水时间到了。）`;
-    if (reason === 'replyCheck') return `${base}（对方回你了。）`;
-    if (reason === 'proactiveCheck') return `${base}（群里安静了一阵，想说什么可以说。）`;
-    if (reason === 'poke') return `${base}（有人拍了一拍。）`;
-    return base;
+    // 档位变化提醒：和「（有人拍了一拍。）」一样的口吻与位置。
+    // 挂在末尾而不是开头，是因为它只是"补充说明"，不该抢走"为什么叫醒你"的位置。
+    const stageChangeLine = buildAffinityStageChangeLineV2(key);
+    const tail = stageChangeLine ? `\n${stageChangeLine}` : '';
+    if (reason === 'timeout') return `${sceneLine}${base}（你设的潜水时间到了。）${tail}`;
+    if (reason === 'replyCheck') return `${sceneLine}${base}（对方回你了。）${tail}`;
+    if (reason === 'proactiveCheck') return `${sceneLine}${base}（群里安静了一阵，想说什么可以说。）${tail}`;
+    if (reason === 'poke') return `${sceneLine}${base}（有人拍了一拍。）${tail}`;
+    // 待办到点：和「（有人拍了一拍。）」同样的位置和口吻，但要把是哪件事说出来 ——
+    // 只写"有件事到点了"她还得自己去查记忆，等于多一次工具往返。
+    // reason 形如 todo:明天讲那张卡片（写 todo 时把文本塞进子类型）。
+    if (String(reason).startsWith('todo:')) {
+      const what = String(reason).slice('todo:'.length).trim();
+      return `${sceneLine}${base}（待办到点了：${what}）${tail}`;
+    }
+    if (reason === 'todo') return `${sceneLine}${base}（你有待办到点了。）${tail}`;
+    return `${sceneLine}${base}${tail}`;
   }
 
   function buildWakeReminderPromptV2(key) {
@@ -11554,7 +13674,7 @@ async function main() {
     const roleLine = roleState.role ? `【当前角色】${roleState.role}（完整角色卡请调用 qq_get_prompt 查看）\n\n` : '';
     const identityLine = cfg.socialV2?.injectViaSystemPrompt === true ? '' : selfIdentityTextV2();
     const st = getSocialV2State(key);
-    const tokenLine = cfg.socialV2?.injectViaSystemPrompt === true ? '' : `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
+    const tokenLine = cfg.socialV2?.injectViaSystemPrompt === true ? '' : `${sessionTokenLineV2(key, st.agentToken)}\n\n`;
     // 观察窗口已退役（桥接在后台盯回复），提醒只说"忘了收尾会永眠"。
     return `${roleLine}${identityLine}${tokenLine}【提醒】本轮还没收尾：用 qq_set_wake_config 或 qq_mark_read 收尾（忘了会「永眠」）。不用等任何观察窗口。`;
   }
@@ -11650,7 +13770,14 @@ async function main() {
     st.wakeConfig.wakeCount = (st.wakeConfig.wakeCount || 0) + 1;
     st.lastWakeReason = reason;
     saveSocialV2State();
-    const promptText = buildWakePromptV2(key, reason);
+    // ⚠️ 这里**不渲染 prompt，也不做任何降级判定**（2026-11-13 重建）。
+    //
+    // 旧实现在这里 buildWakePromptV2 一次、把结果交给 deliverPrompt，
+    // 而 deliverPromptNow 拿到 wakeReason 后**又渲染一次**并覆盖前者。后果：
+    //   · 第一遍渲染时清掉的 memNeedsSync 让压缩提示永远发不出去；
+    //   · 这里的降级（组内已引导→按普通唤醒）只作用于被丢弃的那一份，
+    //     第二遍按原始 reason（bootstrap）重渲 ⇒ 同一会话里提示发两遍。
+    // 现在渲染只在 deliverPromptNow 一处发生，这里只负责"叫醒"。
     log(`[reserved2] 唤醒 ${key}（${reason}）`);
     const rollbackWakeTime = () => {
       const idx = st.wakeTimes.lastIndexOf(wakeTime);
@@ -11660,7 +13787,8 @@ async function main() {
     try {
       pendingWakeKeys.add(key);
       armPendingWakeLease(key);
-      const result = await deliverPrompt(key, promptText, { wakeReason: reason });
+      // promptText 传空串：deliverPromptNow 见到 wakeReason 会自己渲染（唯一渲染点）。
+      const result = await deliverPrompt(key, '', { wakeReason: reason });
       const restoreFiniteSleep = () => {
         if (hadFiniteSleep) {
           st.wakeConfig.sleepUntil = prevSleepUntil;
@@ -11711,13 +13839,12 @@ async function main() {
    * 挂窗口会让每条群聊闲话都可能叫醒它，成本反而涨。
    */
   function armReplyWindowV2(key, ms) {
-    if (cfg.socialV2?.enabled === false) return;
-    if (socialV2.paused || currentMode !== 'reserved2') return;
-    if (String(key).startsWith('group:')) return;
-    const st = getSocialV2State(key);
-    const windowMs = Math.max(5000, Math.min(300000, Number(ms) || 90000));
-    st.replyWindowUntil = Date.now() + windowMs;
-    log(`[reserved2] 已挂回复窗口 ${key}，${Math.round(windowMs / 1000)}s（有消息才叫醒）`);
+    // 2026-11-12 停用：回复窗口会被"几句话"反复触发多次唤醒，吃上下文。
+    // 改用收尾前的空转等待（mark_read / set_wake_config 的 10 秒观望），
+    // 那一段时间里她还没睡，新消息直接看到，不需要后台再叫一次。
+    // 保留函数签名，避免调用点报错。
+    void key; void ms;
+    return;
   }
 
   // ── 闲置压缩（上下文边界）────────────────────────────────────────────────
@@ -11728,14 +13855,18 @@ async function main() {
   // 45 秒/步）。于是「压缩」本意是省钱，实际制造了最贵的一类请求。
   //
   // 这里的策略正好相反：
-  //   · 对话进行中：preset 的 thresholdRatio 已抬到 0.95（≈95 万），永不触发；
+  //   · 对话进行中：preset 的 thresholdRatio 保持 0.95（≈95 万），永不触发；
   //   · 用户安静 idleMs、DSH 没在跑、且上下文超过 thresholdTokens 时：
-  //     先让模型把要点写进长期记忆，再轮换一个新的 DSH 会话 —— 旧会话归档，
-  //     上下文真正归零，下次唤醒从干净前缀开始；
+  //     **原地压缩**（调 DSH 的 /compact）—— 会话 id 不变、桥接映射不变，
+  //     dsh-compaction-basic 把尾部 retainTokens 原样保留、前面压成摘要。
+  //     当前配置：50 万触发、安静 30 分钟、保留后 20 万。
   //   · 压完置 idleCompactedAt，**直到用户下一条消息才解锁**，绝不反复触发。
   //
-  // 代价（有意为之）：轮换后模型手上只剩 system prompt + 长期记忆，不再有原始
-  // 对话。用「边界上一次完整重算」换「整段对话的缓存全命中」，这笔账是划算的。
+  // 【2026-11-13 更正】旧注释写的是"轮换一个新的 DSH 会话、旧会话归档、
+  // 上下文真正归零"—— 那是更早的实现，现在**不换会话、不清上下文**，
+  // 只做原地压缩，所以压缩后她仍看得到最近的那段对话。
+  //
+  // 代价：压缩那一步要重算整段历史（缓存失效），之后的请求恢复正常。
 
   /** 该会话当前上下文有多大：取账本里最近一步的**输入侧** token。 */
   function currentContextTokensV2(key) {
@@ -11776,119 +13907,6 @@ async function main() {
     const ctxTokens = currentContextTokensV2(key);
     if (ctxTokens < threshold) return null;
     return { idleMs: now - lastUser, ctxTokens };
-  }
-
-  /**
-   * 归档前的记忆整理：让模型把这段对话里值得长期记住的东西写进记忆库。
-   *
-   * 用 `silent: true` 投递 —— 这一轮的文本输出在 turn/end 时会被 silentTurns
-   * 名额吞掉，不会发到 QQ。否则用户会在半夜收到一条「我已经总结好了」。
-   */
-  async function summarizeForIdleV2(key) {
-    const sessionId = state.sessions[key];
-    if (!sessionId) return false;
-    const memoryRoot = path.join(STATE_DIR, 'memory');
-    // 把已有的长期事实和自我认知喂进去，让她自己判断哪些已经记过。
-    // 不带 id：这一步只负责"别重复写"，加权是聊天时的即时比对在做。
-    const existingFacts = (() => {
-      try {
-        return loadFacts(STATE_DIR, key)
-          .filter((f) => f && !f.archived && f.text)
-          .slice(-40)
-          .map((f) => String(f.text));
-      } catch { return []; }
-    })();
-    const existingNotes = (() => {
-      try {
-        const st = getSocialV2State(key);
-        return (Array.isArray(st?.selfNotes) ? st.selfNotes : [])
-          .filter((n) => n && n.text).slice(-20).map((n) => String(n.text));
-      } catch { return []; }
-    })();
-    const factsBlock = existingFacts.length
-      ? `已有长期事实（这些已经记过了，同一件事不要再写一遍）：\n${existingFacts.map((t) => `- ${t}`).join('\n')}`
-      : '已有长期事实：（还是空的）';
-    const notesBlock = existingNotes.length
-      ? `已有自我认知（这些已经写过了，同一件事不要再写一遍）：\n${existingNotes.map((t) => `- ${t}`).join('\n')}`
-      : '已有自我认知：（还是空的）';
-    const promptText = [
-      '【后台任务 · 上下文压缩前的记忆整理】',
-      '这段对话的历史马上会被压缩成一条摘要，原文细节会丢。趁现在把值得长期记住的东西写进记忆库。',
-      '',
-      '一、长期事实',
-      '写这些：',
-      '· 用户提到的事实、偏好、习惯、约定；',
-      '· 你们之间形成的默契、称呼、玩笑；',
-      '· 还没做完、下次需要接着做的事。',
-      '用 qq_fact_add 写入 facts 库（每条一句话，写结论不写流水账，不要复述整段对话）。',
-      'tag 按语义选：identity=身份关系 / agreement=约定 / emotion=强烈喜恶 / preference=偏好 / meme=梗 / misc=其他。',
-      '',
-      factsBlock,
-      '',
-      '二、自我认知（用 qq_memory_append，category 用 selfNote）',
-      '· 你对这个人的看法有没有变（他是什么样的人、你们是什么关系）；',
-      '· 你自己有没有什么变了（说话习惯、脾气、以前怎么想现在怎么想）。',
-      '这条只有你能写，别写成日记，想到一句写一句就够了。',
-      '',
-      notesBlock,
-      '',
-      '上面两块，凡是和已有内容讲同一件事的，直接跳过不写——不要换个说法再写一遍。',
-      '没有值得记的就直接结束，不要凑数。',
-      '',
-      '记忆库在里面（压缩后这就是你找回细节的唯一入口）：',
-      `· 长期事实 ${path.join(memoryRoot, 'facts')} —— 写用 qq_fact_add，它会每轮自动注入到你的提示里；`,
-      `· 对话原文 ${path.join(memoryRoot, 'events')} —— 检索用 qq_recall(query=关键词)；`,
-      `· 长文/文件产物 ${path.join(memoryRoot, 'artifacts')} —— 取用 qq_artifact_list / qq_artifact_get。`,
-      '所以写的时候想清楚以后要怎么搜：关键词要具体，别写「聊了一些事」这种搜不回来的话。',
-      '',
-      '这是后台整理，输出不会发到 QQ；写完直接收尾，不要调用发送工具。'
-    ].join('\n');
-    const silentId = `idle-${Date.now()}`;
-    social.silentTurns.set(sessionId, [...(social.silentTurns.get(sessionId) ?? []), { id: silentId, ts: Date.now() }]);
-    try {
-      const result = await deliverPrompt(key, promptText, { silent: true });
-      if (result && result.ok === false) {
-        log(`[compaction] 记忆整理投递被拒 ${key}: ${result.error || '未知错误'}`);
-        return false;
-      }
-      return true;
-    } catch (error) {
-      log(`[compaction] 记忆整理投递失败 ${key}: ${error?.message ?? error}`);
-      return false;
-    }
-  }
-
-  /**
-   * 等这一轮真正跑完（记忆整理要写盘，不能刚投递就归档）。
-   *
-   * 为什么不能直接 `await deliverPrompt(...)`：那个 Promise 在
-   * `api.sessions.prompt` 被**接受**时就 resolve 了，此刻模型还没开始跑。
-   * 更早的版本用「轮询 isConversationBusyV2，一空闲就返回」，在「投递已接受、
-   * turn/start 还没到」的那个空隙里会误判成"已经闲了"，于是转头把正在跑的
-   * 回合归档掉 —— 总结白跑，还可能丢这一轮。
-   *
-   * 所以这里要求「先见过忙、再见闲」：
-   *   · 见到 turn/start 或 collector 之后，等它们消失 = turn 真的结束；
-   *   · 一直没见到忙（投递被丢/DSH 没接），超时后返回 false，调用方据此跳过归档。
-   */
-  async function waitForTurnIdleV2(key, maxMs = 180000, startGraceMs = 60000) {
-    const sid = state.sessions[key];
-    if (!sid) return true;
-    const started = Date.now();
-    let sawBusy = false;
-    while (Date.now() - started < maxMs) {
-      const busy = v2TurnStartAt.has(sid) || collectors.has(sid) || (promptQueues.get(key)?.running ?? false);
-      if (busy) {
-        sawBusy = true;
-      } else if (sawBusy) {
-        return true;
-      } else if (Date.now() - started > startGraceMs) {
-        log(`[compaction] ${key} 投递后 ${Math.round(startGraceMs / 1000)}s 仍未见回合启动，判定投递未生效`);
-        return false;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 1500));
-    }
-    return false;
   }
 
   /**
@@ -11939,28 +13957,21 @@ async function main() {
     const mins = Math.round(decision.idleMs / 60000);
     log(`[compaction] 闲置边界：${key} 已安静 ${mins} 分钟、上下文约 ${Math.round(decision.ctxTokens / 1000)}k token，开始压缩`);
     try {
-      // ① 先写记忆：压缩会把原文压成摘要，细节只能靠记忆库补回来。
-      //    这一步没成功就直接放弃压缩 —— 宁可不压，也不要「记忆没落盘就把历史压掉」。
-      if (!decision.skipSummarize && cfg.socialV2?.compaction?.summarize !== false) {
-        const delivered = await summarizeForIdleV2(key);
-        if (!delivered) {
-          st.idleCompactedAt = Date.now();
-          log(`[compaction] ${key} 记忆整理投递失败，本次跳过压缩`);
-          return;
-        }
-        const finished = await waitForTurnIdleV2(key);
-        if (!finished) {
-          // 没等到总结跑完就压 = 把正在写的记忆掐掉。同上，宁可这次不压。
-          st.idleCompactedAt = Date.now();
-          log(`[compaction] ${key} 记忆整理未在时限内完成，本次跳过压缩`);
-          return;
-        }
-      }
-      // ② 原地压缩：会话 id 和桥接映射都不变，只是 DSH 把历史压成摘要 + 保留尾部。
+      // ① 原地压缩：会话 id 和桥接映射都不变，只是 DSH 把历史压成摘要 + 保留尾部。
+      //    （2026-11-10：压缩前的「记忆整理」投递已删除 —— 那是一次模型调用，
+      //     现在长期记忆由她自己在聊天中用 qq_memory_append(category='longTerm') 写。）
       const result = await compactSessionV2(key);
       st.idleCompactedAt = Date.now();
       if (result.ok) {
         log(`[compaction] 闲置压缩完成 ${key}：${result.text || '已压缩'}（会话 ${state.sessions[key] ?? '无'} 未变）`);
+        // 压缩把历史压成摘要 —— 记忆和人格卡都不在上下文里了。
+        //
+        // 主来源是 DSH 原生的 compaction/end（pumpMux 里登记），这里只是**兜底**：
+        // 事件流断线 / DSH 没推 end 的时候，桥接自己调的这次 /compact 成功了，
+        // 事实同样成立。同一次压缩登记两次没有副作用 —— markColdStart 只是刷新时刻，
+        // 而判据是"没被消费过"，不是"登记了几次"。
+        const sid = state.sessions[key];
+        if (sid) markColdStart(sid, 'compacted', '闲置压缩（兜底）');
       } else {
         // 失败也置 idleCompactedAt：否则每个扫描周期都会重试一次，每次都白跑
         // 一遍记忆整理（那是真金白银的模型调用）。等下一条用户消息再解锁。
@@ -12006,10 +14017,10 @@ async function main() {
   }
 
   function scheduleReplyCheckV2(key) {
-    if (cfg.socialV2?.enabled === false) return;
-    if (socialV2.paused || currentMode !== 'reserved2') return;
-    // 从「定时叫醒」改成「登记窗口」：发完消息后，桥接在后台盯，有指向 AI 的消息才叫醒。
-    armReplyWindowV2(key, Number(cfg.socialV2?.replyCheck?.windowMs) || 90000);
+    // 2026-11-12 停用：见 armReplyWindowV2。
+    // 发完消息不再挂任何"后台盯回复"的机制 —— 她收尾时自己会等 10 秒看有没有新的。
+    void key;
+    return;
   }
 
   /** 会话此刻算忙的具体原因（只用于日志，避免排查时只能反复重启加猜）。 */
@@ -12059,6 +14070,9 @@ async function main() {
     keyword: 60,
     anyMessage: 50,
     replyCheck: 40,
+    // 待办到点：和 timeout 同级 —— 都是"时间到了"的提醒，不该抢消息类唤醒的位置。
+    // 2026-11-12：她写 todo 时顺手排一个定时器，到点用这个原因唤醒自己。
+    todo: 35,
     timeout: 30,
     proactiveCheck: 20
   };
@@ -12072,7 +14086,7 @@ async function main() {
   // 与「未读消息」无关的唤醒原因（定时器/引导）。这些原因在会话繁忙时被暂存后，
   // 不能用「unread 里还有没有对应 seq」来判断是否还要补发 —— 那一轮很可能已经把
   // 未读全部标读了，结果就是 timeout 定时器被静默丢掉、会话停在无定时器的静默态。
-  const TIMER_WAKE_REASONS = new Set(['timeout', 'replyCheck', 'proactiveCheck', 'bootstrap', 'admin']);
+  const TIMER_WAKE_REASONS = new Set(['timeout', 'replyCheck', 'proactiveCheck', 'bootstrap', 'admin', 'todo']);
   function isTimerWakeReason(reason) {
     return TIMER_WAKE_REASONS.has(String(reason ?? '').split(':')[0]);
   }
@@ -12085,6 +14099,33 @@ async function main() {
       return;
     }
     const st = getSocialV2State(key);
+    // ── 组级去重（2026-11-13）──────────────────────────────────────────────
+    //
+    // 现象：私聊和群**共用同一个 DSH 会话**，但 `pendingWakeTimer` 是挂在各自的
+    // `st` 上的。两条消息几乎同时到达时，两边各排一个 8 秒唤醒 ——
+    // 在 DSH 看来是同一个会话的两次 prompt ⇒ 两个 turn ⇒ 引导词/冷启动提示发两遍。
+    // 实测 12:24:50 与 12:25:34 连续两轮都带了冷启动提示。
+    //
+    // 修法：用**组级集合**记录"这个组已经排了唤醒"，而不是依赖各自 st 上的 timer。
+    // 集合的键是组代表 key（sharedOwnerKeyOf），进组时加、定时器触发/取消时删。
+    // 这样无论哪个成员先来，第二个都会被挡住，且不需要在两个 st 之间同步状态。
+    const groupKeys = (() => { try { return shareGroupOf(key); } catch { return [key]; } })();
+    const groupOwner = groupKeys.length > 1 ? sharedOwnerKeyOf(cfg, key) : key;
+    const groupKey = canonicalV2Key(groupOwner) || groupOwner;
+    if (groupKeys.length > 1 && groupHasPendingWake.has(groupKey)) {
+      // 组内已经有待发唤醒 → 不再排第二个。
+      //
+      // ⚠️ 这里**刻意不去"升级原因"**：定时器挂在发起那个 key 的 st 上，
+      // 而 groupOwner 可能是另一个 key（组代表）。去 `getSocialV2State(groupOwner)`
+      // 改它的 pendingWakeReason 有两个问题：
+      //   ① 那个 st 上根本没有 timer（pendingWakeTimer 恒为 null），改了也没人读；
+      //   ② getSocialV2State 是**惰性创建**的 —— 调它会在 socialV2.conversations
+      //      里凭空建出一个假会话（有 wakeConfig、空 unread），污染状态文件。
+      // 反正那一轮唤醒的快照是按组收集的（collectSharedMessagesV2），
+      // 组内所有消息都会被带上，不需要靠"升级原因"来保证覆盖。
+      log(`[reserved2] 组内已有待发唤醒（${groupPendingReason.get(groupKey) || '未知'}），跳过 ${key} 的 ${reason}`);
+      return;
+    }
     if (st.pendingWakeTimer) {
       // 合并窗口内已有待发送唤醒：按优先级升级最终原因，避免先概率后 @ 却仍按概率唤醒。
       const cur = st.pendingWakeReason || reason;
@@ -12120,12 +14161,21 @@ async function main() {
       : Math.max(1000, Number(st.wakeConfig?.batchWindowMs) || 8000);
     st.pendingWakeTimer = setTimeout(() => {
       st.pendingWakeTimer = null;
+      // 组级登记同步清掉：下一次组内任何成员都能重新排唤醒。
+      groupHasPendingWake.delete(groupKey);
+      groupPendingReason.delete(groupKey);
       const finalReason = st.pendingWakeReason || reason;
       st.pendingWakeReason = null;
       void sendWakePromptV2(key, finalReason).catch((error) => log(`[reserved2] 计划唤醒异常 ${key}:`, error?.message ?? error));
     }, batchMs);
     // 与其它 per-conversation 定时器保持一致：别让一个待唤醒定时器把进程钉住不退出。
     st.pendingWakeTimer.unref?.();
+    // 登记到组级：共用会话下，代表 key 是固定的（sharedOwnerKeyOf 是组内容的纯函数），
+    // 所以这里用 groupKey 记，下一个成员进来能看见。
+    if (groupKeys.length > 1) {
+      groupHasPendingWake.add(groupKey);
+      groupPendingReason.set(groupKey, reason);
+    }
     log(`[reserved2] 计划唤醒 ${key}（${reason}），${Math.round(batchMs / 1000)}s 后发送`);
   }
 
@@ -12210,6 +14260,92 @@ async function main() {
     log(`[reserved2] 设置有限潜水定时器 ${key}，剩余 ${Math.round(delay / 1000)}s`);
   }
 
+  // ── 待办到期提醒（2026-11-12 新增）──────────────────────────────────────
+  //
+  // 需求：她写 todo 时顺手排一个定时唤醒，到点提醒她"该做这件事了"，
+  // 语气和位置跟「（有人拍了一拍。）」一样。
+  //
+  // 为什么不用 setInterval 扫全表：那样每个会话都要周期醒来看一遍，
+  // 而且时间精度差。这里按"最近一条待办"排一个 setTimeout，
+  // 到点唤醒后重新排下一个 —— 和 sleepTimer 的续期模式一致。
+  //
+  // 待办本身存在 globalMemory.todos（全局），但**唤醒必须按会话**：
+  // 她的定时器挂在具体 key 上，所以要记住"这条 todo 是哪个会话的"。
+  // 存在 todo 自己身上（wakeKey 字段），跟着 todo 一起持久化。
+  const TODO_TIMER_MAX_MS = 100009; // 和 sleepTimer 同一个上限，避免 2^31 溢出
+
+  /** 找出这个会话里**最早到期且还没提醒过**的待办。 */
+  function nextDueTodoFor(key) {
+    const g = getSocialV2State(GLOBAL_MEMORY_KEY);
+    const list = Array.isArray(g.todos) ? g.todos : [];
+    const now = Date.now();
+    let best = null;
+    for (const t of list) {
+      if (!t || !t.text || t.done) continue;
+      if (String(t.wakeKey || '') !== key) continue;   // 不是这个会话排的
+      if (t.notifiedAt) continue;                       // 已经提醒过了
+      const due = Number(t.expiresAt) || 0;
+      if (!due) continue;
+      if (!best || due < Number(best.expiresAt)) best = t;
+    }
+    return best;
+  }
+
+  /** 给这个会话重新排待办定时器（先取消旧的）。 */
+  function setupTodoTimerV2(key) {
+    if (cfg.socialV2?.enabled === false) return;
+    if (!isSessionAllowedInCurrentMode(key)) return;
+    const st = getSocialV2State(key);
+    if (st.todoTimer) {
+      clearTimeout(st.todoTimer);
+      st.todoTimer = null;
+    }
+    if (socialV2.paused) return;
+    const next = nextDueTodoFor(key);
+    if (!next) return;
+    const delay = Number(next.expiresAt) - Date.now();
+    if (delay <= 0) {
+      // 已经到点了：直接唤醒（不等 setTimeout(0)，那条路径容易被合并窗口吞掉）。
+      const text = String(next.text || '').slice(0, 60);
+      log(`[reserved2] 待办已到点，立即唤醒 ${key}：${text}`);
+      next.notifiedAt = Date.now();
+      saveSocialV2State();
+      scheduleWakeV2(key, `todo:${text}`);
+      return;
+    }
+    if (delay > TODO_TIMER_MAX_MS) {
+      st.todoTimer = setTimeout(() => {
+        st.todoTimer = null;
+        setupTodoTimerV2(key);
+      }, TODO_TIMER_MAX_MS);
+      st.todoTimer.unref?.();
+      log(`[reserved2] 设置远未来待办定时器 ${key}，首段 ${Math.round(TODO_TIMER_MAX_MS / 1000)} 秒后续期`);
+      return;
+    }
+    st.todoTimer = setTimeout(() => {
+      st.todoTimer = null;
+      const due = nextDueTodoFor(key);
+      if (!due) return;
+      const text = String(due.text || '').slice(0, 60);
+      due.notifiedAt = Date.now();
+      saveSocialV2State();
+      log(`[reserved2] 待办到点唤醒 ${key}：${text}`);
+      scheduleWakeV2(key, `todo:${text}`);
+      // 排下一个（可能还有别的待办）
+      setupTodoTimerV2(key);
+    }, delay);
+    st.todoTimer.unref?.();
+    log(`[reserved2] 设置待办定时器 ${key}，剩余 ${Math.round(delay / 1000)}s：${String(next.text || '').slice(0, 40)}`);
+  }
+
+  /** 取消这个会话的待办定时器。 */
+  function cancelTodoTimerV2(key) {
+    const st = socialV2.conversations.get(key);
+    if (!st || !st.todoTimer) return;
+    clearTimeout(st.todoTimer);
+    st.todoTimer = null;
+  }
+
   function cancelProactiveCheckV2(key) {
     const st = socialV2.conversations.get(key);
     if (!st || !st.proactiveTimer) return;
@@ -12258,6 +14394,7 @@ async function main() {
       clearTimeout(st.pendingWakeTimer);
       st.pendingWakeTimer = null;
     }
+          clearGroupPendingWake(key);
     st.pendingWakeReason = null;
     if (st.sleepTimer) {
       clearTimeout(st.sleepTimer);
@@ -12270,6 +14407,11 @@ async function main() {
     if (st.proactiveTimer) {
       clearTimeout(st.proactiveTimer);
       st.proactiveTimer = null;
+    }
+    // 待办到点提醒（2026-11-12）：模式切换/暂停时也要清掉，否则会绕过模式守卫。
+    if (st.todoTimer) {
+      clearTimeout(st.todoTimer);
+      st.todoTimer = null;
     }
     if (st.rateLimitRetryTimer) {
       clearTimeout(st.rateLimitRetryTimer);
@@ -12403,10 +14545,7 @@ async function main() {
           social.pendingSummaries.delete(key);
           social.states.delete(key);
           social.silentContext.delete(key);
-          slangWindows.delete(key);
-          slangExtractionCooldowns.delete(key);
-          slangSubmitTimes.delete(key);
-          cancelSocialTimers(key);
+                cancelSocialTimers(key);
           clearSocialV2Timers(key);
           pendingWakeKeys.delete(key);
           wakeConfigUpdatedKeys.delete(key);
@@ -12461,35 +14600,23 @@ async function main() {
 
     // 二代仿真模式（reserved2）：唤醒调度
     if (currentMode === 'reserved2') {
-      const sender = kind === 'group' ? (event.sender?.card || event.sender?.nickname || String(event.user_id)) : '私聊';
+      const sender = v2SenderLabelFor(key, kind, event);
       appendSocialV2Message(key, sender, textContent, plainContent, quoteTargetIsSelf, isOwner, event.message_id ?? event.msg_id ?? null, mediaList, event.user_id ?? null, extractForwardIds(event.message ?? []));
       // 二代同样收集群聊黑话学习素材（AI 自主提交之外，桥接仍自动提取高频陌生词）
-      if (kind === 'group') feedSlangWindow(key, sender, plainContent);
       if (socialV2.paused) {
         appendActivity(`${key} [reserved2] AI 已暂停，消息仅入库不唤醒：${textContent.slice(0, 80)}`);
         return;
       }
       const st = getSocialV2State(key);
-      if (!st.bootstrapSent) {
-        st.bootstrapSent = true;
+      // 引导判定按共用组：组里任何一方已经引导过就不再重复发（见 groupBootstrapSent）。
+      if (!groupBootstrapSent(key)) {
+        markGroupBootstrapSent(key);
         saveSocialV2State();
         scheduleWakeV2(key, 'bootstrap');
       } else {
-        // 回复窗口：AI 刚发完消息、桥接在后台盯（见 armReplyWindowV2）。
-        // 窗口内出现「指向 AI」的消息就立刻唤醒：不等 30 秒、也不看概率。
-        // 私聊任何新消息都算；群聊只认引用 AI 或被 @（避免每条闲聊都叫醒）。
-        const inReplyWindow = (st.replyWindowUntil || 0) > Date.now();
-        if (inReplyWindow) {
-          const atSelf = Array.isArray(event?.message) && event.message.some((seg) => seg?.type === 'at' && String(seg.data?.qq) === String(event?.self_id ?? ''));
-          const pointedAtMe = kind === 'private' || quoteTargetIsSelf || atSelf;
-          if (pointedAtMe) {
-            st.replyWindowUntil = 0;
-            saveSocialV2State();
-            appendActivity(`${key} [reserved2] 回复窗口内收到指向 AI 的消息，立即唤醒`);
-            scheduleWakeV2(key, 'reply');
-            return;
-          }
-        }
+        // 2026-11-12：回复窗口已停用（见 armReplyWindowV2）。
+        // 唤醒只走正常触发判定；"发完消息后还有人接话"由收尾前的 10 秒观望处理，
+        // 不在这里另开一条唤醒路径 —— 那条路会让几句话触发多次唤醒，很吃上下文。
         const reason = evaluateWakeTriggerV2(key, st, event, kind, textContent, plainContent, quoteTargetIsSelf);
         if (reason) {
           scheduleWakeV2(key, reason);
@@ -12501,7 +14628,6 @@ async function main() {
 
     // 黑话学习素材：只从群聊普通消息进入滚动窗口（命令/角色控制语不学；只学当前消息自己的文字，不学引用原文）
     if (kind === 'group') {
-      feedSlangWindow(key, event.sender?.card || event.sender?.nickname || String(event.user_id), plainContent);
     }
 
     // 角色扮演提示注入（仅注入给 agent，不影响群友之间的正常对话语义）
@@ -12520,7 +14646,7 @@ async function main() {
 
     // 仿真群友模式：reserved 走状态机（观望/活跃/试探/退场）
     if (isSocialEnabled()) {
-      const sender = kind === 'group' ? (event.sender?.card || event.sender?.nickname || String(event.user_id)) : '私聊';
+      const sender = v2SenderLabelFor(key, kind, event);
       appendRecentMessage(key, sender, textContent, plainContent, quoteTargetIsSelf, isOwner, mediaList, messageRef); // AI 始终感知
       const st = socialState(key);
 
@@ -12624,10 +14750,10 @@ async function main() {
       }
       throw error;
     }
-    let content = [{ type: 'text', text: withSlangContext(promptText) }];
+    let content = [{ type: 'text', text: promptText }];
     if (Array.isArray(mediaList) && mediaList.length > 0) {
       const imageParts = await resolveMediaList(mediaList);
-      content = [{ type: 'text', text: withSlangContext(promptText) }, ...imageParts];
+      content = [{ type: 'text', text: promptText }, ...imageParts];
     }
     if (!isCurrentSession(key, sessionId)) throw new Error('投递前会话已重置或权限已变化');
     const accepted = await api.sessions.prompt({
@@ -12782,8 +14908,10 @@ async function main() {
     if (currentMode !== 'reserved2') return;
     if (socialV2.paused) return;
     const st = getSocialV2State(key);
-    if (!st.bootstrapSent) {
-      st.bootstrapSent = true;
+    // 拍一拍也走同一套组级判定：防止「群里先被拍一下就发一次引导、
+    // 私聊第一次说话时又发一次」。
+    if (!groupBootstrapSent(key)) {
+      markGroupBootstrapSent(key);
       saveSocialV2State();
       scheduleWakeV2(key, 'bootstrap');
     } else if (st.wakeConfig?.triggers?.poke) {
@@ -12834,10 +14962,13 @@ async function main() {
       // 回合正常收尾：collector 立刻释放。v2TurnStartAt 留给调用方（无行动判定要用它），
       // 调用方在 `if (ended)` 分支里用完再删。
       collectors.delete(sessionId);
+      // 本轮归属用完即清：下一次 turn/start 重新从 turnKeyQueue 取。
+      turnKeyLatch.delete(sessionId);
     } else if (event?.type === 'turn/end' && (!collector || collector.size?.() === 0)) {
       collectors.delete(sessionId);
       v2TurnStartAt.delete(sessionId);
       turnLeaseNoted.delete(sessionId);
+      turnKeyLatch.delete(sessionId);
     }
     return { collector, ended };
   }
@@ -12861,10 +14992,29 @@ async function main() {
             continue;
           }
           if (frame.type === 'session/event') {
+            // ── 条件 B「刚压缩过」的原生来源（2026-11-13 重建）──────────────
+            // DSH 压缩会话时会推 compaction/start → compaction/summary → compaction/end。
+            // 这里**必须先于**下面所有 "key 不匹配就 continue" 的分支处理：
+            // 学习会话、未映射会话的压缩同样把上下文压没了，而那些分支会直接跳过。
+            if (frame.event?.type === 'compaction/start') {
+              compactionInFlight.set(String(frame.sessionId), Date.now());
+            } else if (frame.event?.type === 'compaction/end') {
+              compactionInFlight.delete(String(frame.sessionId));
+              // 只认"真的产生了摘要"的压缩：失败/中止的压缩没有把历史压成摘要，
+              // 挂提示只会让她白查一次。
+              markColdStart(frame.sessionId, 'compacted', 'DSH 原生 compaction/end');
+            }
             // Token 记账放在最前面：无论会话是否仍属当前模式/是否学习会话，
             // 花掉的钱都是真的，都必须入账（归属由 resolveKey 决定）。
             recordSessionUsage(frame.sessionId, frame.event);
-            const key = reverse.get(frame.sessionId);
+            // 回复归属：共用会话下 reverse 记的是组内代表 key，分不出私聊还是群，
+            // 所以以「本轮是谁投递的」为准（turnKeyQueue 按投递顺序排队，turn/start 出队并锁存）。
+            let key = turnKeyLatch.get(frame.sessionId);
+            if (frame.event.type === 'turn/start') {
+              const queuedKey = shiftTurnKey(frame.sessionId);
+              if (queuedKey) { key = queuedKey; turnKeyLatch.set(frame.sessionId, queuedKey); }
+            }
+            if (!key) key = reverse.get(frame.sessionId);
             if (!key) {
               // 黑话学习会话：只收集 turn，不发送 QQ，并唤醒等待中的学习任务。
               if (learnerSessions.has(frame.sessionId)) {
@@ -12892,7 +15042,7 @@ async function main() {
                     }
                   }
                   // 旧学习会话 turn 结束后从集合移除，避免残留
-                  if (frame.sessionId !== slangLearnerSessionId) learnerSessions.delete(frame.sessionId);
+                  learnerSessions.delete(frame.sessionId);
                 }
               }
               continue;
@@ -12978,7 +15128,9 @@ async function main() {
                     if (st.wakeConfig.noActionCount >= limit) {
                       log(`[reserved2] ${key} 连续 ${st.wakeConfig.noActionCount} 次唤醒无行动，重置唤醒配置`);
                       st.wakeConfig = defaultWakeConfigV2();
-                      st.bootstrapSent = true;
+                      // 这里曾经写 st.bootstrapSent = true（"配置都重置了，别再补引导"）。
+                      // 现在 bootstrapSent 只管【初始提示词】是否注入过，跟"要不要给冷启动提示"
+                      // 无关，在一个跟它无关的失败兜底里改它只会让语义更乱 —— 删掉。
                       st.wakeConfig.noActionCount = 0;
                     }
                   }

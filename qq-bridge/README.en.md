@@ -82,7 +82,9 @@ Or double-click `start.bat` on Windows (guard mode with auto-restart).
 
 ## DSH Setup on Another Device
 
-The bridge and console can run without extra DSH setup, but the two DSH chat presets (`qq-chat` and `qq-chat-v2`) and the MCP servers must be installed into DSH once per machine:
+The bridge and console can run without extra DSH setup, but the DSH chat preset and the MCP servers must be installed into DSH once per machine:
+
+> **As of 2026-11-07 there is only one preset.** The former four (`qq-chat` / `qq-chat-v2` / `qq-chat-readonly` / `qq-chat-owner`) were merged into a single `qq-chat-agent`, with the permission tier fixed to readonly (can read files, cannot write or execute). The tier logic still exists in the bridge, but all tiers now resolve to that same preset, so there is no longer any tool-surface difference between them.
 
 ```bash
 node scripts/setup-dsh.mjs
@@ -90,9 +92,9 @@ node scripts/setup-dsh.mjs
 
 This installs:
 
-- the `qq-agent-presets` bundle, which generates the two `@deepseek-ai/dsh-agent-preset` rows (`qq-chat`, `qq-chat-v2`) plus the shared `qq-tool-restrict` safety guard
+- the `qq-agent-presets` bundle, which generates the single `@deepseek-ai/dsh-agent-preset` row (`qq-chat-agent`) plus the shared `qq-tool-restrict` safety guard
 - MCP entries in `~/.dsh/profiles/web/cordis.patch.yml`
-- `qq-mode-console` and `qq-agent-presets` in the profile `package.json` (`bundles` + `link:` dependencies)
+- `qq-mode-console` and `qq-agent-presets` in the profile `package.json` (`bundles` + `link:` dependencies). These two do **not** conflict: `qq-mode-console` only exposes the `qq-mode` settings namespace (`mode` / `ownerQQ`) and contains no preset at all; `qq-agent-presets` owns the preset row.
 - Default DSH mode set to `reserved2` (second-generation simulation), with a local `state/mode.json` fallback
 
 Then restart DSH. See [docs/guides/DSH_SETUP.md](docs/guides/DSH_SETUP.md) for details.
@@ -118,9 +120,9 @@ qq-bridge/
     research/           # investigation notes
     audits/             # review / optimisation reports
     legacy/             # archived docs that were superseded
-  dsh/agent-presets/    # qq-chat / qq-chat-v2 DSH agent preset templates
-  plugins/qq-agent-presets  # DSH bundle: generates the qq-chat / qq-chat-v2 preset patch rows + the shared tool guard
-  plugins/qq-mode-console  # DSH plugin: exposes the qq-mode settings namespace (host half only; no UI card yet)
+  dsh/agent-presets/    # DSH agent preset template — only qq-chat-agent now (four old presets merged on 2026-11-07)
+  plugins/qq-agent-presets  # DSH bundle: inserts the qq-chat-agent preset row + ships the shared tool guard
+  plugins/qq-mode-console  # DSH plugin: exposes the qq-mode settings namespace (mode / ownerQQ only, NO presets; host half only, no UI card yet)
   src/                  # bridge core and MCP servers
   public/
     console.html        # local web console

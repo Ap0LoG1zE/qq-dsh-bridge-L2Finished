@@ -445,7 +445,7 @@ qq-dsh-bridge/
 │   ├── roles/                     # 角色卡（示例）
 │   └── config.example.json        # 配置模板
 ├── tools/                         # 发行层运维脚本
-└── dsh-plugins/dsh-thinking-zh/   # DSH 内的设置面板（人格/节奏/Token/表情）
+└── dsh-plugins/qq-dsh-panel/   # DSH 内的设置面板（人格/节奏/Token/表情）
 ```
 
 ---

@@ -103,20 +103,63 @@ export function createStore({ dir, maxTextChars = DEFAULT_MAX_TEXT }) {
       trunc = true;
     }
     const id = rec.id || makeId({ src: rec.src, key: rec.key, sid: rec.sid, seq: rec.seq });
-    return {
-      id,
-      v: MEMORY_VERSION,
-      src: rec.src === 'dsh' ? 'dsh' : 'qq',
+
+    // ── 2026-11-13 精简落盘格式（操作者要求）────────────────────────────
+    //
+    // 原来每条都写 11 个字段，其中三个是**纯冗余**：
+    //   id    = `${src}:${key}:${seq}` —— 完全可以由 key/seq 推出来
+    //   v     = 常量 1，3956 条无一例外
+    //   src   = 常量 'qq'，同上
+    //   sid   = **全部是 null**（0/3956 有值），那是给 DSH 侧事件留的字段，
+    //           而这一版只写了 QQ 消息
+    // 它们合计占文件体积 27%（每条约 66 字节白占）。
+    //
+    // 精简后只留「这条记录要回答问题所必需的」：
+    //   key / seq   谁、第几条（id 仍由它们推导，只是不落盘）
+    //   text        内容
+    //   t           什么时候
+    //   kind/role   谁说的、说的是什么类型
+    //   self        等价于 kind==='ai'，但读起来直白（操作者点名要这个）
+    //   meta        只留读取端真的用到的键（messageId/userId/media/forward/target*）
+    //
+    // ⚠️ 向后兼容：读取端（memory-search.js 的 load）本来就用 `rec.key ?? ...` 兜底，
+    // 老文件里多出来的字段它照样能读，所以新旧格式可以共存一个文件。
+    // 唯一必须保留的是 **id 仍在内存里算**（去重 + ids.txt 靠它），只是不写进 jsonl。
+    const out = {
       key: rec.key ?? null,
-      sid: rec.sid ?? null,
       seq: rec.seq ?? null,
       t,
       kind: rec.kind || 'msg',
       role: rec.role ?? null,
       text,
-      meta: rec.meta && typeof rec.meta === 'object' ? rec.meta : undefined,
-      trunc: trunc || undefined
     };
+    // self 是 kind:'ai' 的直白写法 —— 两个都写会重复，只写一个。
+    if (out.kind === 'ai') out.self = true;
+    // src / sid 只在**不是 QQ**时才写：将来接 DSH 事件时它才有值，
+    // 那时落盘才有意义；纯 QQ 记录不写 = 默认值，读的时候按 'qq' 处理。
+    if (rec.src === 'dsh') {
+      out.src = 'dsh';
+      if (rec.sid != null) out.sid = rec.sid;
+    }
+    if (rec.meta && typeof rec.meta === 'object') {
+      const m = {};
+      if (rec.meta.messageId != null) m.messageId = rec.meta.messageId;
+      if (rec.meta.userId != null) m.userId = rec.meta.userId;
+      if (rec.meta.media) m.media = true;
+      if (rec.meta.forward) m.forward = true;
+      if (rec.meta.targetId != null) m.targetId = rec.meta.targetId;
+      if (rec.meta.targetIsSelf) m.targetIsSelf = true;
+      if (rec.meta.groupId != null) m.groupId = rec.meta.groupId;
+      // meta.self 和 kind==='ai' 是同一件事，不重复写。
+      if (Object.keys(m).length) out.meta = m;
+    }
+    if (trunc) out.trunc = true;
+
+    // id 不进文件，但必须带在返回对象上：append() 用它去重、写 ids.txt。
+    // 用 non-enumerable 定义，JSON.stringify 自动跳过 —— 这样既不落盘，
+    // 又不用改 append() 的调用方式。
+    Object.defineProperty(out, 'id', { value: id, enumerable: false });
+    return out;
   };
 
   /**
@@ -159,7 +202,12 @@ export function createStore({ dir, maxTextChars = DEFAULT_MAX_TEXT }) {
     const h = openAppend();
     fs.writeSync(h, fresh.map((r) => r.id).join('\n') + '\n');
 
-    for (const r of fresh) manifest.counts[r.src] = (manifest.counts[r.src] || 0) + 1;
+    // 2026-11-13：src 不再是必写字段（纯 QQ 记录省略它 = 默认 'qq'），
+    // 所以统计时要兜底，否则 manifest 里会冒出 'undefined' 这个键。
+    for (const r of fresh) {
+      const src = r.src === 'dsh' ? 'dsh' : 'qq';
+      manifest.counts[src] = (manifest.counts[src] || 0) + 1;
+    }
     manifest.updatedAt = Date.now();
     fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), 'utf8');
 
@@ -218,7 +266,19 @@ export function createStore({ dir, maxTextChars = DEFAULT_MAX_TEXT }) {
       const raw = fs.readFileSync(path.join(eventsDir, `${shard}.jsonl`), 'utf8');
       for (const line of raw.split('\n')) {
         if (!line) continue;
-        try { ids.push(JSON.parse(line).id); } catch {}
+        try {
+          const rec = JSON.parse(line);
+          // 2026-11-13：新格式**不再落盘 id**（它由 key/seq 推导），
+          // 所以这里遇到没有 id 的记录要自己算 —— 否则新写的那批重建索引时会被丢掉，
+          // 下次启动 seen 集合缺它们 ⇒ 同一条消息可能被重复 append。
+          const id = rec.id || makeId({
+            src: rec.src === 'dsh' ? 'dsh' : 'qq',
+            key: rec.key,
+            sid: rec.sid,
+            seq: rec.seq,
+          });
+          if (id) ids.push(id);
+        } catch {}
       }
     }
     const uniq = [...new Set(ids)];

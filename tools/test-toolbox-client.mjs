@@ -17,7 +17,7 @@ import { discoverDshSessionCookie } from '../qq-bridge/src/dsh-client.js'
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.resolve(__dirname, '..')
 // dsh-plugins 与 qq-bridge 是平级的两棵目录树（发行层可以分别摆放）
-const TOOLBOX_DIR = process.env.QQ_TOOLBOX_DIR || path.join(path.resolve(__dirname, '..', '..'), 'dsh-plugins', 'dsh-thinking-zh')
+const TOOLBOX_DIR = process.env.QQ_TOOLBOX_DIR || path.join(path.resolve(__dirname, '..', '..'), 'dsh-plugins', 'qq-dsh-panel')
 const CLIENT = path.join(TOOLBOX_DIR, 'lib', 'client.js')
 const ORIGIN = process.argv[2] || 'http://127.0.0.1:3080'
 

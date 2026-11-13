@@ -12,7 +12,7 @@
 1. QQ 私聊能正常收发，单条消息从收到到发出 **≤ 5 秒**
 2. DSH 重启后桥接 1 分钟内自愈，并自动对齐新端口
 3. 唤醒包（发给模型的上下文）里**不含** `【你的身份】` / `【会话令牌】`
-4. 悬浮球（dsh-thinking-zh）已装、能看到
+4. 悬浮球（qq-dsh-panel）已装、能看到
 5. 看门狗已注册计划任务
 6. SnowLuma 已由你启动，OneBot 已开，**token 已写进桥接配置并告知用户**
 7. 唤醒与速率参数已按本文档设置好
@@ -133,13 +133,13 @@ New-Item -ItemType Junction -Path $l2 -Target $l1 | Out-Null
 
 > 这一步 + `injectViaSystemPrompt: true` 是配套的：身份/令牌改由插件写进系统提示词，唤醒包才干净。**只开开关不装插件 = 模型拿不到令牌，工具全被拒。**
 
-### 7. 装悬浮球 dsh-thinking-zh（**必装**）
+### 7. 装悬浮球 qq-dsh-panel（**必装**）
 
 ```powershell
-dsh plugin --profile desktop add "link:<仓库>\dsh-plugins\dsh-thinking-zh"
+dsh plugin --profile desktop add "link:<仓库>\dsh-plugins\qq-dsh-panel"
 ```
 
-**验收**：`cd <仓库>\dsh-plugins\dsh-thinking-zh; node scripts/smoke.mjs` 输出 `SMOKE OK`。
+**验收**：`cd <仓库>\dsh-plugins\qq-dsh-panel; node scripts/smoke.mjs` 输出 `SMOKE OK`。
 界面验收：DSH 窗口角落出现可拖动的小圆球（没出现就重启 DSH 或 Ctrl+R）。
 
 ### 8. 下载并解压 SnowLuma（你来做）

@@ -55,9 +55,14 @@ export const PRESET_BLOCKING_SUBSTRINGS_TIERED = [
 /**
  * preset 名 → 不变量档位标识（'v1' | 'v2' | 'owner' | 'readonly'）。
  * 未知名字按 'v2' 处理（更严），避免新增 preset 时悄悄跳过校验。
+ *
+ * ⚠️ 2026-11-07 合并：`qq-chat-agent` 是四个旧预设合并后的唯一预设，权限面按
+ *    readonly（有只读文件工具）⇒ 档位必须给 'readonly'，否则会拿"你没有本地工具"
+ *    那条去校验它，把它在控制台里锁死（存不进去也还原不了）。
  */
 export function presetTierKey(presetName) {
   const name = String(presetName ?? '').trim();
+  if (name === 'qq-chat-agent') return 'readonly';
   if (name === 'qq-chat') return 'v1';
   if (name === 'qq-chat-owner') return 'owner';
   if (name === 'qq-chat-readonly') return 'readonly';

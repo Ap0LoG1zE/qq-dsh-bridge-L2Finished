@@ -80,6 +80,39 @@ test('标题之外的内容（前言）不受影响', () => {
   assert.match(selectRoleText(card, 'v2'), /- y/);
 });
 
+// 关键回归（2026-11-08）：CRLF 人格卡的模式标记必须照样生效。
+//
+// 踩过的坑：解析用的是 /^(#{1,6})\s+(.*)$/，而 JS 正则的 `.` **不匹配行终止符**，
+// `\r` 正是其中之一。于是 Windows 上（人格卡普遍是 CRLF）每一行都匹配失败，
+// 全被当成"普通正文"塞进开头那个 section —— 表现为 roleSectionReport 永远只有 1 节、
+// 模式标记形同虚设：一代专属小节会被注入到二代，反之亦然。
+// 这个 bug 没有任何报错，只有"报告里永远只有一节"这一个迹象，所以必须钉住。
+test('CRLF 换行时模式标记仍然生效', () => {
+  const card = [
+    '# 卡',
+    '',
+    '## 公共 〔通用〕'.replace(' 〔通用〕', ''),
+    '- 公共内容',
+    '',
+    '## 只有二代 〔二代〕',
+    '- 二代内容',
+    '',
+    '## 只有一代 〔一代〕',
+    '- 一代内容',
+  ].join('\r\n');
+  const v1 = selectRoleText(card, 'v1');
+  const v2 = selectRoleText(card, 'v2');
+  assert.match(v2, /二代内容/, 'CRLF 下二代专属小节应该注入到二代');
+  assert.doesNotMatch(v2, /一代内容/, 'CRLF 下一代专属小节不该注入到二代');
+  assert.match(v1, /一代内容/, 'CRLF 下一代专属小节应该注入到一代');
+  assert.doesNotMatch(v1, /二代内容/, 'CRLF 下二代专属小节不该注入到一代');
+  // 报告必须能拆出多个小节，而不是"只有一节"
+  const report = roleSectionReport(card, 'v1');
+  assert.ok(report.length >= 3, `CRLF 下应拆出至少 3 个小节，实际 ${report.length} 节`);
+  // 注入文本里不应残留 \r（模型不需要行尾符）
+  assert.doesNotMatch(v2, /\r/, '注入文本不应残留 CR');
+});
+
 test('统计与小节报告可用于控制台预览', () => {
   const stats = roleCharStats(CARD);
   assert.ok(stats.v1Only > 0 && stats.v2Only > 0, '应能统计出两代各自专属的字符数');
@@ -92,17 +125,31 @@ test('统计与小节报告可用于控制台预览', () => {
   assert.equal(common.injected, true);
 });
 
-test('真实人格卡可用，且筛选不丢公共内容', () => {
-  const file = new URL('../roles/小鲸鱼.md', import.meta.url);
-  const raw = fs.readFileSync(file, 'utf8');
-  const v2 = selectRoleText(raw, 'v2');
-  const v1 = selectRoleText(raw, 'v1');
-  assert.ok(v2.length > 0 && v1.length > 0);
-  // 人设部分两种模式都必须保留
-  for (const text of [v1, v2]) {
-    assert.match(text, /小鲸鱼/);
-    assert.match(text, /AI 味|去 AI 味/);
+// 真实人格卡可用，且筛选不丢公共内容。
+//
+// ⚠️ 这条一度引用 roles/小鲸鱼.md，而那张卡早就被删了（仓库里现在只有角色A.md），
+// 于是脚本直接 ENOENT 抛错 —— 看起来像"role-card 坏了"，其实只是夹具文件没了。
+// 现在改成：只挑真实存在的人格卡来验，一张都没有就跳过（而不是假装通过或炸掉）。
+test('真实人格卡可用，且筛选不丢公共内容', async (t) => {
+  const dir = new URL('../roles/', import.meta.url);
+  const cards = fs.readdirSync(dir).filter((n) => n.endsWith('.md') && n !== 'README.md');
+  if (!cards.length) {
+    t.skip('roles/ 下没有真实人格卡，跳过');
+    return;
   }
-  // 二代注入的文本里不应再出现一代的分条机制
-  assert.doesNotMatch(v2, /空格分隔（例如|\[SILENT\]/);
+  for (const name of cards) {
+    const raw = fs.readFileSync(new URL(name, dir), 'utf8');
+    const v2 = selectRoleText(raw, 'v2');
+    const v1 = selectRoleText(raw, 'v1');
+    assert.ok(v2.length > 0 && v1.length > 0, `${name}：两种模式都应注入非空内容`);
+    // 筛选不能把公共正文弄丢：二代文本必须覆盖原文里所有"非 v1 专属"的行
+    const commonChars = roleCharStats(raw).common;
+    assert.ok(
+      v2.length >= commonChars,
+      `${name}：二代注入文本（${v2.length}）短于公共正文（${commonChars}），筛选丢内容了`,
+    );
+    // 注入文本里不应残留 CRLF，也不要带模式标记
+    assert.doesNotMatch(v2, /\r/, `${name}：注入文本不应残留 CR`);
+    assert.doesNotMatch(v2, /〔一代〕|〔二代〕|\[v1\]|\[v2\]/, `${name}：注入文本里不该留模式标记`);
+  }
 });

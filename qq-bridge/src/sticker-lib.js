@@ -78,7 +78,7 @@ export function normalizeStickerEntry(raw) {
  * 关键区别：**「文件不存在」和「文件读不动/读坏了」必须分开处理。**
  * 旧实现把两者都吞成 `[]`，而调用方拿到空库后会照常合并、再写回同一个文件 ——
  * 一次截断、一次 AV 占用、一次磁盘写满，就能把 AI 积累的 localNote/tags/usage
- * 永久清零且毫无提示（loadSlang 早已针对同一失败模式做过隔离，这里补齐）。
+ * 永久清零且毫无提示（表情库同理）。
  *
  * @param file - 库文件路径。
  * @returns 表情条目数组；文件不存在时为空数组（首次使用的正常情况）。
@@ -105,7 +105,7 @@ export function loadStickerStore(file) {
 export function saveStickerStore(file, entries) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
-  // 失败时必须自己清掉临时文件（对齐 saveSlang 的写法）：写盘中途报错（磁盘满、杀软占用）
+  // 失败时必须自己清掉临时文件（写盘失败要自己收尾）：写盘中途报错（磁盘满、杀软占用）
   // 会在 state/ 里永久留下 stickers.json.<pid>.<hex>.tmp —— 名字带随机串，没人会再去清理它，
   // 而且下次排查"表情库为什么不对"时这些残留文件会让人以为写入成功了。
   try {
@@ -175,7 +175,42 @@ function stickerUrlKey(value) {
   } catch { return ''; }
 }
 
+// 按人类可读的标签找表情（desc / localNote / tags 完全相等）。
+//
+// 为什么需要：提示词让模型「按 desc、localNote 选与语境相符的图」，但工具的
+// stickerId 只认 id/md5/url。模型很自然地就把它读到的备注原样回传 ——
+// 于是出现「找不到表情 被示爱很害羞时用」这种报错，看起来像表情丢了，
+// 实际上表情好好的，只是它的名字被当成了 id。
+//
+// 约束：**只做完全相等，不做模糊/子串匹配**。
+// 子串匹配会让「角色A本人」命中「角色A本人（害怕）」，模型想发 A 结果发成 B ——
+// 表情发错语境比发不出去更糟（那是真的在社交场合丢人）。
+// 唯一的例外是忽略首尾空白与大小写，这一点不会造成歧义。
+function stickerLabelKey(value) {
+  return String(value ?? '').trim().toLowerCase();
+}
+
+function findByLabel(entries, raw) {
+  const want = stickerLabelKey(raw);
+  if (!want) return null;
+  const matches = [];
+  for (const e of entries) {
+    if (!e) continue;
+    const labels = [
+      stickerLabelKey(e.desc),
+      stickerLabelKey(e.localNote),
+      ...(Array.isArray(e.tags) ? e.tags.map(stickerLabelKey) : [])
+    ].filter(Boolean);
+    if (labels.includes(want)) matches.push(e);
+  }
+  // 命中多条同名标签时返回 null 交给调用方报「有歧义」，绝不猜一条发出去。
+  if (matches.length === 1) return { entry: matches[0], ambiguous: false };
+  if (matches.length > 1) return { entry: null, ambiguous: true, candidates: matches.slice(0, 5) };
+  return null;
+}
+
 // id/md5 精确匹配优先；URL 只忽略协议、尾斜杠与查询参数，不做任意子串匹配。
+// 最后才退到「按备注/标签精确匹配」—— 这是模型最常用的引用方式。
 export function findSticker(entries, ref) {
   const raw = String(ref ?? '').trim();
   if (!raw) return null;
@@ -190,7 +225,55 @@ export function findSticker(entries, ref) {
   });
   if (exact) return exact;
   const urlNormalized = stickerUrlKey(raw);
-  return (urlNormalized && list.find((e) => e && stickerUrlKey(e.url) === urlNormalized)) || null;
+  const byUrl = urlNormalized && list.find((e) => e && stickerUrlKey(e.url) === urlNormalized);
+  if (byUrl) return byUrl;
+  const byLabel = findByLabel(list, raw);
+  return byLabel && !byLabel.ambiguous ? byLabel.entry : null;
+}
+
+/**
+ * 带诊断的查找：找不到时告诉调用方「为什么找不到、该改用什么」。
+ *
+ * 这一层是为模型写的错误信息。旧实现只会回一句「找不到表情 X，请先用
+ * qq_list_stickers 获取有效 id」—— 模型照做之后仍然会传备注，因为它刚刚
+ * 就是从 qq_list_stickers 里读到这个备注的。错误必须**指出正确用法**，
+ * 否则模型会在同一个坑里反复掉。
+ */
+export function resolveSticker(entries, ref) {
+  const list = Array.isArray(entries) ? entries : [];
+  const raw = String(ref ?? '').trim();
+  const hit = findSticker(list, raw);
+  if (hit) return { entry: hit };
+  if (!raw) return { entry: null, error: 'stickerId 不能为空' };
+  const byLabel = findByLabel(list, raw);
+  if (byLabel?.ambiguous) {
+    const ids = (byLabel.candidates || []).map((e) => `  - ${e.id}（${e.desc || e.localNote || '无备注'}）`).join('\n');
+    return {
+      entry: null,
+      error: `「${raw}」对应多个表情，请改用完整 id 指定是哪一个：\n${ids}`
+    };
+  }
+  // 没完全命中，但库里有名字包含这段文字的 —— 这种情况多半是记错了半个名字，
+  // 把候选列出来比让模型再盲猜一轮更省事（仍然不自动选）。
+  const want = stickerLabelKey(raw);
+  const near = want
+    ? list.filter((e) => {
+      const hay = `${e.desc || ''} ${e.localNote || ''} ${(e.tags || []).join(' ')}`.toLowerCase();
+      return hay.includes(want);
+    }).slice(0, 5)
+    : [];
+  if (near.length) {
+    const ids = near.map((e) => `  - ${e.id}（${e.desc || e.localNote || '无备注'}）`).join('\n');
+    return {
+      entry: null,
+      error: `没有备注正好等于「${raw}」的表情。可能是这几个之一，请用完整 id 重新调用：\n${ids}`
+    };
+  }
+  const sample = list.slice(0, 5).map((e) => `  - ${e.id}（${e.desc || e.localNote || '无备注'}）`).join('\n');
+  return {
+    entry: null,
+    error: `找不到表情「${raw}」。stickerId 要传 id / md5 / url，或者与备注【完全一致】的文字。\n当前库里的前几个（完整列表用 qq_list_stickers）：\n${sample || '  （表情库是空的）'}`
+  };
 }
 
 // 格式化给 AI 看的表情列表；query 会匹配 desc/localNote/tags/usage/id/md5。
@@ -204,18 +287,24 @@ export function formatStickerList(entries, query = '', limit = 48) {
       })
     : list;
   const max = Math.max(1, Math.min(500, Number(limit) || 48));
+  // 2026-11-11 瘦身：**不再返回 url / resId 等长字段**。
+  //   · `url`      —— 单条约 100 字符的签名链接，模型看不懂也用不上
+  //                   （真要看图走 qq_get_sticker_image，那条路径按 stickerId 取）
+  //   · `resId`    —— 与 `id` 完全同值（实测同一条 id 与 resId 一字不差）
+  //   · `lastUsedAt` —— 调试字段，模型从不看
+  //
+  // 句柄选择：**用 md5（32 字符）而不是 id（53 字符）**。
+  // qq_send_sticker / qq_get_sticker_image 的 stickerId 参数本来就接受 md5，
+  // 而 id 形如 `30001_0_0_0_<md5>_0_0` —— QQ 号前缀 + 后缀全是常量，
+  // 只有中间那 32 位 md5 在变。4 条表情能省 4×21 = 84 字符。
+  // 仍保留 `id` 字段名以兼容旧调用方，但值是 md5。
   const items = filtered.slice(0, max).map((e) => ({
-    id: e.id,
-    resId: e.resId,
-    md5: e.md5,
-    url: e.url,
+    id: e.md5 || e.id,
     desc: e.desc || '',
     localNote: e.localNote || '',
     tags: e.tags || [],
     usage: e.usage || '',
-    useCount: e.useCount || 0,
-    lastUsedAt: e.lastUsedAt || 0,
-    source: e.source || 'qq'
+    useCount: e.useCount || 0
   }));
   return {
     total: list.length,
@@ -223,6 +312,33 @@ export function formatStickerList(entries, query = '', limit = 48) {
     truncated: filtered.length > max,
     stickers: items
   };
+}
+
+/**
+ * 把 formatStickerList 的结果渲染成**纯文本行**（2026-11-11 新增）。
+ *
+ * 原来整块 JSON 每条都带 `url`（约 100 字符）+ `resId`（与 id 同值的 53 字符），
+ * 4 个表情就 1662 字符。文本每行约 60 字符，同样信息只要 299 字符。
+ *
+ * 注意 `id` 本身就很长（53 字符，形如 `30001_0_0_0_<md5>_0_0`），
+ * 它是发送表情时唯一必需的句柄，不能省 —— 否则省下的 token 会用一次失败的
+ * qq_send_sticker 还回来。
+ */
+export function renderStickerListText(result) {
+  if (!result || typeof result !== 'object') return '';
+  const items = Array.isArray(result.stickers) ? result.stickers : [];
+  const head = items.length
+    ? `表情 ${result.matched ?? items.length}/${result.total ?? items.length} 个${result.truncated ? `（只显示前 ${items.length} 个）` : ''}`
+    : `表情 0 个（共 ${result.total ?? 0} 个，没有匹配「${result.query ?? ''}」的）`;
+  const lines = items.map((e) => {
+    const label = String(e.desc || e.localNote || '（无备注，可先看图）').replace(/[\u0000-\u001f\u007f]+/g, ' ').trim();
+    const bits = [label];
+    if (e.tags?.length) bits.push(`[${e.tags.join('/')}]`);
+    if (e.usage) bits.push(`用法:${String(e.usage).slice(0, 40)}`);
+    if (e.useCount) bits.push(`用过${e.useCount}次`);
+    return `- ${e.id} ${bits.join(' ')}`;
+  });
+  return [head, ...lines].join('\n');
 }
 
 // 生成注入 AI 的“可用表情包”摘要（不暴露完整 URL，避免上下文爆炸）。

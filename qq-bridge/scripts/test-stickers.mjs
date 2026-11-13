@@ -65,10 +65,12 @@ console.log('## sticker-lib 纯函数');
   ];
   const all = formatStickerList(list, '', 10);
   ok(all.total === 3 && all.stickers.length === 3, 'formatStickerList 总数');
+  // 2026-11-11 起列表里的 `id` 字段填的是 md5（32 字符句柄），
+  // 不再是 emoji_id（53 字符）。两者都接受，但省 token 的是 md5。
   const q = formatStickerList(list, '生气', 10);
-  ok(q.matched === 1 && q.stickers[0].id === 'b', 'formatStickerList 按备注搜索');
+  ok(q.matched === 1 && q.stickers[0].id === 'DEF', 'formatStickerList 按备注搜索');
   const q2 = formatStickerList(list, '无语', 10);
-  ok(q2.matched === 1 && q2.stickers[0].id === 'c', 'formatStickerList 按本地笔记搜索');
+  ok(q2.matched === 1 && q2.stickers[0].id === 'GHI', 'formatStickerList 按本地笔记搜索');
   const ctx = buildStickerContext(list, 8);
   ok(ctx.includes('笑死') && ctx.includes('生气'), 'buildStickerContext 包含备注');
   ok(buildStickerStrategyHint().includes('qq_send_sticker'), '策略提示包含发送工具');
@@ -106,6 +108,18 @@ console.log('## 表情单气泡约束');
   const hint = buildStickerStrategyHint();
   ok(hint.includes('不能在同一气泡里附带文字'), '策略提示禁止同气泡混文字');
   ok(!hint.includes('先发一句话再发一张'), '策略提示不再引导“先发一句话再发一张”');
+}
+
+console.log('## 表情必须以「表情」而不是「图片」发出（sub_type=1）');
+{
+  // 回归：sendStickerV2 只发 { file } 时，网关按 picSubType=0 上传，
+  // QQ 会把收藏表情渲染成撑满气泡的大图（原本在客户端里是小的表情）。
+  // SnowLuma 自己的 send_custom_face action 就是靠 sub_type=1 保留表情样式。
+  const bridge = fs.readFileSync(path.join(ROOT, 'src', 'bridge.js'), 'utf8');
+  const sendBlock = bridge.slice(bridge.indexOf('async function sendStickerV2'), bridge.indexOf('function applyStickerNoteV2'));
+  ok(sendBlock.includes('sub_type: 1'), 'sendStickerV2 的 image 段带 sub_type: 1');
+  ok(/summary:\s*'\[动画表情\]'/.test(sendBlock), 'sendStickerV2 的 image 段带 [动画表情] summary');
+  ok(/sub_type:\s*1[\s\S]*?summary/.test(sendBlock), 'sub_type 与 summary 同时出现在同一个 image 段');
 }
 
 console.log('## MCP 工具描述存在性');

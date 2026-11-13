@@ -1,20 +1,19 @@
 #!/usr/bin/env node
-// 把「已存在会话」里冻结的系统提示词，换成当前 preset 源文件的正文。
+// 把「已存在会话」里冻结的系统提示，换成当前 preset 源文件里的正文。
 //
-// 【为什么重写过】
-// 旧版用 zlib.zstdDecompressSync(raw) 一次性解压 —— 但那只能拿到**第一帧**。
-// DSH 的会话日志是「每事件一个 zstd 帧」的格式（本会话实测 10316 帧），
-// 单流解压只解出 1 个 header 事件，于是永远找不到系统提示片段，脚本报「没找到」。
+// 【上一版的致命 bug】
+// 直接把含真实换行的文本拼进 JSON 字符串里，导致一个事件被切成几十行，
+// 每行都 JSON.parse 失败，DSH 报 "unparsable committed event"，整个会话打不开。
 //
 // 【本版做法】
-//   1. 按 zstd 魔数切帧，逐帧解压 → 拼回完整 JSONL
-//   2. 在 JSONL 文本层面替换系统提示区间（marker..anchor）
-//   3. 按原样「每行一帧」重新压缩
-//   4. 解压自检：重新读回并逐行比对，不一致就拒绝写盘
+//   1. 按帧解压 → 找到目标事件 → **JSON.parse 成对象**
+//   2. 只改 data.message.content[i].text 字段
+//   3. **JSON.stringify 序列化回去**（自动处理换行转义）
+//   4. 自检：每帧写回前先 JSON.parse 验证；整文件写盘后再全量复查
 //
-// 用法（**必须先关掉 DSH**，否则运行中的实例会把改动覆盖回去）：
+// 用法（必须先关掉 DSH）：
 //   node tools/fix-session-preset.mjs --key group:123456789 --preset qq-chat-readonly --dry
-//   node tools/fix-session-preset.mjs --key group:123456789 --preset qq-chat-readonly
+//   node tools/fix-session-preset.mjs --key group:123456789 --preset qq-chat-readonly --last
 import fs from 'node:fs'
 import path from 'node:path'
 import zlib from 'node:zlib'
@@ -37,12 +36,14 @@ const flag = (name) => process.argv.includes('--' + name)
 const key = arg('key')
 const preset = arg('preset')
 const dry = flag('dry')
+const onlyLast = flag('last')
+const modelName = arg('model', 'deepseek-flash')
 if (!key || !preset) {
-  console.error('用法: node tools/fix-session-preset.mjs --key group:123456789 --preset qq-chat-readonly [--dry]')
+  console.error('用法: node tools/fix-session-preset.mjs --key group:123456789 --preset qq-chat-readonly [--last] [--model xxx] [--dry]')
   process.exit(2)
 }
 
-// ── 读 preset 源文件的 prefix 正文 ─────────────────────────────────────────
+// ── 读 preset 正文 ─────────────────────────────────────────────────────────
 const presetFile = path.join(ROOT, 'dsh', 'agent-presets', preset, 'agent.cordis.yml')
 if (!fs.existsSync(presetFile)) {
   console.error(`找不到 preset 源文件: ${presetFile}`)
@@ -62,9 +63,9 @@ for (let i = headIdx + 1; i < presetLines.length; i += 1) {
   if ((line.match(/^\s*/)[0].length) < baseIndent) break
   body.push(line.slice(baseIndent))
 }
-const newPrefix = body.join('\n').replace(/\{\{model\}\}/g, 'deepseek-flash').trimEnd()
+const newPrefix = body.join('\n').replace(/\{\{model\}\}/g, modelName).replace(/\r\n/g, '\n').trimEnd()
 
-// ── 定位会话日志 ───────────────────────────────────────────────────────────
+// ── 定位日志 ───────────────────────────────────────────────────────────────
 const sessions = JSON.parse(fs.readFileSync(path.join(STATE, 'sessions.json'), 'utf8'))
 const sessionId = sessions.sessions?.[key]
 if (!sessionId) {
@@ -82,7 +83,7 @@ if (!logFile) {
   process.exit(2)
 }
 
-// ── 逐帧解压 ───────────────────────────────────────────────────────────────
+// ── 切帧 ───────────────────────────────────────────────────────────────────
 const raw = fs.readFileSync(logFile)
 const starts = []
 {
@@ -94,59 +95,116 @@ const starts = []
     i = j + 4
   }
 }
-const parts = []
-let badFrames = 0
+
+function hasPromptZone(text) {
+  const mi = text.indexOf(MARKER)
+  if (mi < 0) return false
+  return text.indexOf(ANCHOR, mi) >= 0
+}
+
+// 找出候选帧
+const candidates = []
 for (let k = 0; k < starts.length; k += 1) {
   const a = starts[k]
   const b = k + 1 < starts.length ? starts[k + 1] : raw.length
-  try {
-    parts.push(zlib.zstdDecompressSync(raw.subarray(a, b)).toString('utf8'))
-  } catch {
-    badFrames += 1
-  }
+  let text
+  try { text = zlib.zstdDecompressSync(raw.subarray(a, b)).toString('utf8') } catch { continue }
+  if (hasPromptZone(text)) candidates.push(k)
 }
-const plain = parts.join('')
-const lines = plain.split('\n').filter(Boolean)
+const targets = onlyLast ? new Set(candidates.slice(-1)) : new Set(candidates)
+
 console.log(`日志: ${logFile}`)
-console.log(`帧数: ${starts.length}（坏帧 ${badFrames}），事件行: ${lines.length}`)
-if (badFrames > 0) {
-  console.error('存在无法解压的帧，拒绝继续（避免写出坏日志）')
-  process.exit(3)
-}
-
-// ── 在行文本层面替换系统提示区间 ───────────────────────────────────────────
-let touched = 0
-let oldLen = 0
-let newLen = 0
-const outLines = lines.map((line) => {
-  const a = line.indexOf(MARKER)
-  if (a < 0) return line
-  const b = line.indexOf(ANCHOR, a)
-  if (b < 0) return line
-  const end = b + ANCHOR.length
-  oldLen = end - a
-  newLen = newPrefix.length
-  touched += 1
-  return line.slice(0, a) + newPrefix + line.slice(end)
-})
-
-console.log(`命中系统提示的行: ${touched}`)
-if (touched === 0) {
-  console.error('没找到可替换的系统提示片段，脚本中止（文件未改动）')
+console.log(`帧数: ${starts.length}  候选帧: ${candidates.length}  本次改: ${targets.size} 个`)
+console.log(`模型名: ${modelName}`)
+if (!targets.size) {
+  console.error('没有候选帧，中止')
   process.exit(4)
 }
-console.log(`替换区间: ${oldLen} 字符 → ${newLen} 字符`)
 
+// ── 逐帧重建 ───────────────────────────────────────────────────────────────
+let touched = 0
+const outParts = []
+
+for (let k = 0; k < starts.length; k += 1) {
+  const a = starts[k]
+  const b = k + 1 < starts.length ? starts[k + 1] : raw.length
+
+  if (!targets.has(k)) {
+    outParts.push(raw.subarray(a, b))   // 原样写回，逐字节不变
+    continue
+  }
+
+  let text
+  try {
+    text = zlib.zstdDecompressSync(raw.subarray(a, b)).toString('utf8')
+  } catch {
+    outParts.push(raw.subarray(a, b))
+    continue
+  }
+
+  const lines = text.split('\n').filter((l) => l.trim())
+  const newLines = []
+  let changed = false
+
+  for (const line of lines) {
+    let o
+    try {
+      o = JSON.parse(line)
+    } catch {
+      // 原本就坏的行，原样保留（不掩盖既有问题）
+      newLines.push(line)
+      continue
+    }
+    if (o && o.type === 'system/message') {
+      const content = o.data?.message?.content
+      if (Array.isArray(content)) {
+        for (const part of content) {
+          if (part && part.type === 'text' && typeof part.text === 'string') {
+            const mi = part.text.indexOf(MARKER)
+            const ai = mi >= 0 ? part.text.indexOf(ANCHOR, mi) : -1
+            if (mi >= 0 && ai >= 0) {
+              const end = ai + ANCHOR.length
+              // 在字符串层面替换，转义交给下面的 JSON.stringify
+              part.text = part.text.slice(0, mi) + newPrefix + part.text.slice(end)
+              changed = true
+            }
+          }
+        }
+      }
+    }
+    // ★ JSON.stringify 会自动把内容里的换行转成 \n 两个字符
+    newLines.push(JSON.stringify(o))
+  }
+
+  if (!changed) {
+    outParts.push(raw.subarray(a, b))
+    continue
+  }
+
+  // 自检 ①：每行序列化后必须能 parse 回来
+  for (let i = 0; i < newLines.length; i += 1) {
+    try {
+      JSON.parse(newLines[i])
+    } catch (e) {
+      console.error(`❌ 帧#${k} 第 ${i + 1} 条序列化后无法解析：${e.message}`)
+      process.exit(6)
+    }
+  }
+
+  const rebuilt = newLines.join('\n') + '\n'
+  outParts.push(zlib.zstdCompressSync(Buffer.from(rebuilt, 'utf8')))
+  touched += 1
+}
+
+console.log(`重建的帧数: ${touched}`)
 if (dry) {
   console.log('--dry：不写盘。')
   process.exit(0)
 }
 
-// ── 每行一帧重新压缩 ───────────────────────────────────────────────────────
-const outFrames = outLines.map((l) => zlib.zstdCompressSync(Buffer.from(l + '\n', 'utf8')))
-const outBuf = Buffer.concat(outFrames)
+const outBuf = Buffer.concat(outParts)
 
-// ── 自检：解压回来逐行比对 ─────────────────────────────────────────────────
+// ── 自检 ②：全量逐帧解压 + 逐行 JSON.parse ─────────────────────────────────
 {
   const chkStarts = []
   let i = 0
@@ -156,24 +214,33 @@ const outBuf = Buffer.concat(outFrames)
     chkStarts.push(j)
     i = j + 4
   }
-  const chk = []
+  if (chkStarts.length !== starts.length) {
+    console.error(`自检失败：原 ${starts.length} 帧，写回 ${chkStarts.length} 帧`)
+    process.exit(5)
+  }
+  let bad = 0
+  let newFound = 0
+  const probe = newPrefix.slice(0, 40)
   for (let k = 0; k < chkStarts.length; k += 1) {
     const a = chkStarts[k]
     const b = k + 1 < chkStarts.length ? chkStarts[k + 1] : outBuf.length
-    chk.push(zlib.zstdDecompressSync(outBuf.subarray(a, b)).toString('utf8'))
-  }
-  const chkLines = chk.join('').split('\n').filter(Boolean)
-  if (chkLines.length !== outLines.length) {
-    console.error(`自检失败：写入 ${outLines.length} 行，读回 ${chkLines.length} 行`)
-    process.exit(5)
-  }
-  for (let k = 0; k < chkLines.length; k += 1) {
-    if (chkLines[k] !== outLines[k]) {
-      console.error(`自检失败：第 ${k + 1} 行内容不一致`)
-      process.exit(5)
+    let text
+    try { text = zlib.zstdDecompressSync(outBuf.subarray(a, b)).toString('utf8') } catch { bad += 1; continue }
+    for (const line of text.split('\n')) {
+      if (!line.trim()) continue
+      try { JSON.parse(line) } catch { bad += 1 }
     }
+    if (targets.has(k) && text.includes(probe)) newFound += 1
   }
-  console.log(`自检通过：${chkLines.length} 行全部一致`)
+  if (bad > 0) {
+    console.error(`自检失败：${bad} 行无法解析（拒绝写盘）`)
+    process.exit(7)
+  }
+  if (newFound !== touched) {
+    console.error(`自检失败：期望 ${touched} 帧含新正文，实得 ${newFound}`)
+    process.exit(8)
+  }
+  console.log(`自检通过：${chkStarts.length} 帧全部可解析，${newFound} 帧已换新正文`)
 }
 
 // ── 备份 + 写盘 ────────────────────────────────────────────────────────────

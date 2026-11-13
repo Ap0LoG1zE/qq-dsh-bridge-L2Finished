@@ -24,15 +24,18 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = path.resolve(__dirname, '..');
 
 /**
- * 由桥接托管的四个 preset（顺序即 patch 层顺序）。
+ * 由桥接托管的 preset（顺序即 patch 层顺序）。
  *
- * 三档权限分级（2026-10-26）后是这样对应的：
- *   · qq-chat / qq-chat-v2 —— 「仅聊天」档：无本地工具（默认档；陌生会话与未分级会话都在这里）；
- *   · qq-chat-readonly   —— 白名单档（allow.private / allow.groups）：只读文件工具；
- *   · qq-chat-owner      —— 管理员档（private:<ownerQQ>）：完整本地工具。
- * 会话怎么选档在 src/bridge.js 的 presetForSession()；这个清单只负责生成/安装 patch。
+ * 2026-11-07 合并：原本四个（qq-chat / qq-chat-v2 / qq-chat-readonly / qq-chat-owner）
+ * 合并为唯一一个 `qq-chat-agent`：
+ *   · 权限面 —— 按 readonly（可读文本/看图/检索，不能写、不能执行）；
+ *   · 正文   —— 按 readonly，并删掉「教它怎么说话」的通用规则（交给 roles/<角色>.md）；
+ *   · 三档分级取消 —— 不再有 owner 全工具档，因此 src/bridge.js 的 TIER_PRESETS
+ *     与 preset-prompt.js 的 presetTierKey() 都改成把任何情况映射到这一个名字。
+ *
+ * 旧四个的源与 patch 已备份在 作者本机的备份目录-*（不在 DSH 里，仅存档查看）。
  */
-export const PRESETS = ['qq-chat', 'qq-chat-v2', 'qq-chat-owner', 'qq-chat-readonly'];
+export const PRESETS = ['qq-chat-agent'];
 
 /** preset 行 id：与 config.id（桥接解析的 preset 名）区分开，方便在 profile patch 里按行定位。 */
 export function presetRowId(name) {

@@ -7,7 +7,7 @@
  *
  * 用法：node tools/check-toolbox-host.mjs
  */
-import * as feature from '../../dsh-plugins/dsh-thinking-zh/lib/features/qq-bigfish.js'
+import * as feature from '../../dsh-plugins/qq-dsh-panel/lib/features/qq-bigfish.js'
 
 const routes = new Map()
 const ctx = {
@@ -45,13 +45,13 @@ function mockReq(url, method = 'GET') {
 }
 
 const routesToTry = [
-  '/dsh-thinking-zh/qq-bigfish',
-  '/dsh-thinking-zh/qq-bigfish/settings',
-  '/dsh-thinking-zh/qq-bigfish/persona',
-  '/dsh-thinking-zh/qq-bigfish/tokens',
-  '/dsh-thinking-zh/qq-bigfish/stickers',
-  '/dsh-thinking-zh/qq-bigfish/backend',
-  '/dsh-thinking-zh/qq-bigfish/diagnose',
+  '/qq-dsh-panel/qq-bigfish',
+  '/qq-dsh-panel/qq-bigfish/settings',
+  '/qq-dsh-panel/qq-bigfish/persona',
+  '/qq-dsh-panel/qq-bigfish/tokens',
+  '/qq-dsh-panel/qq-bigfish/stickers',
+  '/qq-dsh-panel/qq-bigfish/backend',
+  '/qq-dsh-panel/qq-bigfish/diagnose',
 ]
 
 let pass = 0

@@ -74,7 +74,7 @@ QQ 消息 ──► SnowLuma（OneBot v11 WS）──► 本桥接进程 ──�
     抓取仍由桥接自己做 SSRF 校验并限制正文大小；**黑话学习默认开启**，会把群聊里提取的词条交给所选的搜索后端。
     数据出机清单见 [LICENSE](LICENSE) 的「数据出机清单」，不需要就关掉黑话自动研究（`slang.autoResearch`）或把 `webSearch.provider` 设为 `bing`。
 - **会话模型**：每个 QQ 会话（私聊/群）对应一个独立的 DSH 会话，统一归组到「QQ 聊天」工作区（不再散落未分组）；映射持久化在 `state/sessions.json`
-- **性格定制**：QQ 会话默认使用 `qq-chat` agent preset，`reserved2` 使用 `qq-chat-v2`；2026-10-26 起另有**两个权限档位 preset** —— `qq-chat-readonly`（白名单会话，只读）与 `qq-chat-owner`（管理员私聊，全工具），由桥接按会话自动选（见下方「权限档位」）。DSH 0.1.7 起 preset 不再是 `~/.dsh/.agent-presets/<名>/` 目录，而是 `plugins/qq-agent-presets/` bundle 生成并插入 profile 的一条 `@deepseek-ai/dsh-agent-preset` 行（重启 DSH 后生效）；人格与默认 DSH 一致（coding agent），仅附加 QQ 场景规则；**角色扮演**是可选机制——由控制台或管理端设置 `state/current-role.json` 注入（群友无法更改）
+- **性格定制**：QQ 会话使用**唯一的** `qq-chat-agent` agent preset（2026-11-07 由 `qq-chat` / `qq-chat-v2` / `qq-chat-readonly` / `qq-chat-owner` 四个合并而来，权限统一按 readonly）。DSH 0.1.7 起 preset 不再是 `~/.dsh/.agent-presets/<名>/` 目录，而是 `plugins/qq-agent-presets/` bundle 生成并插入 profile 的一条 `@deepseek-ai/dsh-agent-preset` 行（**重启 DSH 后生效**）；人格与默认 DSH 一致（coding agent），仅附加 QQ 场景规则；**角色扮演**是可选机制——由控制台或管理端设置 `state/current-role.json` 注入（群友无法更改）
 - **本地控制台**：桥接自带 Web 控制台 `http://127.0.0.1:3100`——左侧按操作任务分为「运行总览 / 会话与审批 / 人格与角色 / 二代仿真 / 一代仿真 / 黑话词库 / 令牌与花费 / 访问与安全 / 调试与运维 / 工具参考」十个页面，右上角搜索框可跨页定位任意功能项；支持**浅色 / 深色双主题**（顶栏一键切换，未选择时跟随系统）；切换运行模式（chat / closed-agent / reserved / reserved2）、设置角色、静默开关、查看活动日志、修改管理员/控制台令牌，全部即时生效；访问需要令牌（`config.json` 的 `consoleToken`，未配置时自动生成并打印在启动日志；控制台内可手动修改或重新生成）
   - **令牌与花费看板**：实时显示 AI 的 token 消耗与折算金额（元），可下钻到**每个群 / 每个好友 / 每一轮对话**（轮次、步数、缓存命中/未命中输入、输出、命中率、花费、峰谷时段），并有**按时间的消耗走势图**（24 小时 / 3 天 / 7 天 / 30 天，柱子按高峰/空闲着色，一眼看出什么时候烧得凶、哪几个小时是 2 倍价）。累计总量取自 DSH 的 `tokenUsage` 投影（精确，含桥接启动前的历史），逐轮明细由 `assistant/message` 的 `usage` 折叠而来；金额按 DeepSeek 官方价目表折算并区分**高峰 / 空闲时段**（高峰单价为空闲的 2 倍，已内置中国法定节假日）。详见 [docs/guides/TOKEN_USAGE_CONSOLE.md](docs/guides/TOKEN_USAGE_CONSOLE.md)
   - **人格（角色扮演）管理**：列表点选即可载入查看/编辑提示词，支持新建、保存修改、改名（自动重命名文件）、另存为副本、删除；超过注入上限或含一代专用指令会实时提示
@@ -85,20 +85,19 @@ QQ 消息 ──► SnowLuma（OneBot v11 WS）──► 本桥接进程 ──�
   - `chat`：白名单群 + 白名单私聊 → qq-chat 安全聊天
   - `closed-agent`：仅私聊 owner（config.json 的 ownerQQ，可在控制台设置）→ 完整工具（默认用 DSH 自己声明的默认 preset，即 `standard`；可在控制台「closed-agent preset」下拉改为任意 DSH preset），可在 QQ 上操控 DSH
   - `reserved`（一代仿真）：仿真群友，观望/活跃/试探/退场状态机，选择性参与、按空格分句发送、主动收尾
-  - `reserved2`（二代仿真，运行 `setup-dsh.mjs` 后 DSH 默认）：文本不自动转发，AI 通过 `qq_get_unread_messages` / `qq_send_message` 等工具自主看消息、发言、等待、设置唤醒/潜水；DSH 端使用 `qq-chat-v2` preset
-  - **权限档位**（2026-10-26 起，`chat` / `reserved` / `reserved2` 内部再按会话分三档，见 [RULES.md](RULES.md)「三档权限分级」）：
-    - **Owner（全工具）** = `private:<ownerQQ>` → `qq-chat-owner`：能读写文件、执行命令、**并把本机文件发到 QQ**（`qq_send_file`）；宿主/开发/装载权类工具仍然拒绝。**owner 优先于白名单**（同一个号两处都在时按 Owner）
-    - **发文件的边界**（2026-10-26 新增）：只有 Owner 档能发（群聊/白名单会话调用一律 403）；只发绝对路径的**普通文件**；扩展名白名单（文档/图片/音视频/压缩包，默认 47 种，可配置）；敏感路径黑名单（`.dsh`/`.ssh`/`.aws`、系统目录、SnowLuma 的 `onebot_*.json`、桥接自己的 `state/` 与 `config.json`）与密钥类文件名一律拒绝；默认上限 30MB、每分钟 3 个。配置见 `socialV2.files`，规则细节见 [RULES.md](RULES.md)「发文件」
-    - **白名单（只读）** = `allow.private` / `allow.groups` 里**显式列出**的会话 → `qq-chat-readonly`：能看文件（read / read_image / glob / grep），不能改、不能执行
-    - **其他（仅聊天）** = 陌生私聊 / 未收录群 → `qq-chat-v2`：与分级前完全一致
+  - `reserved2`（二代仿真，运行 `setup-dsh.mjs` 后 DSH 默认）：文本不自动转发，AI 通过 `qq_get_unread_messages` / `qq_send_message` 等工具自主看消息、发言、等待、设置唤醒/潜水；DSH 端使用 `qq-chat-agent` preset
+  - **权限档位**（2026-10-26 起有分级，**2026-11-07 合并后三档已指向同一个 preset**，见 [RULES.md](RULES.md)「三档权限分级」）：
+    - ⚠️ **合并后不再有全工具档**：`private:<ownerQQ>`、白名单会话、陌生会话拿到的**都是同一个** `qq-chat-agent`（只读权限）。三档判定仍然存在，但它只决定"这个会话记不记"，不再改变工具面。
+    - **发文件的边界**：`qq_send_file` 只允许管理员本人私聊调用，群聊/白名单会话一律 403；此外还有绝对路径、扩展名白名单（文档/图片/音视频/压缩包，默认 47 种，可配置）、敏感路径黑名单（`.dsh`/`.ssh`/`.aws`、系统目录、SnowLuma 的 `onebot_*.json`、桥接自己的 `state/` 与 `config.json`）与密钥类文件名限制；默认上限 30MB、每分钟 3 个。配置见 `socialV2.files`，规则细节见 [RULES.md](RULES.md)「发文件」
     - **黑名单** = `deny` → 连消息都不入库（不注入上下文、不唤醒、不烧 token）
-    - 核对当前档位：`GET /api/permission-tiers`（回 `tier` / `preset` / `available`）；改 `ownerQQ` 或白名单后旧会话会在下一条消息到达时自动退役重建
+    - 核对当前档位：`GET /api/permission-tiers`（回 `tier` / `preset` / `available`；现在三档的 `preset` 字段会是一样的值，这是预期）；改 `ownerQQ` 或白名单后旧会话会在下一条消息到达时自动退役重建
     - 真实工具面探针：`node scripts/probe-permission-tiers.mjs`（需 DSH 在跑）
 - **交互增强**：
   - agent 通过 `ask_user_question` 提问时，问题会转发到 QQ，回复即自动应答
   - agent 请求工具审批时，转发到 QQ，回复「通过」/「拒绝」即可决策
   - 支持 DSH 斜杠命令（如 `/model`）与 `/reset`（重置会话上下文）
   - 群聊引用/回复会解析成「被引用人 + 原文」注入 DSH（如 `[引用 Derp：El Psy Kongroo是啥]机关的走狗`），让 AI 判断这句话是对谁说的，不会把群友之间引用第三方的对话误当成指向自己；引用机器人自己时会被视为必回
+  - **B站分享卡片内联展开**：群友转 B站视频时，卡片不再是四个字的 `[卡片消息]`，而是桥接侧解析成一行 `[B站] 标题 · UP 主 · 时长 · 播放量 · BV号`（短链 `b23.tv` 跟随重定向拿真实地址，再打官方只读接口）。**刻意不做成工具**：工具的描述 + schema 每轮都要随 prompt 重发（本仓库实测 44 个工具约 1 万 token/轮），而内联展开只是「这条消息多 50 个字符」——她零工具调用、零额外往返就能接话。同一视频 30 分钟内不重复请求，解析失败静默降级回 `[卡片消息]`。见 `src/card-parse.js`、`socialV2.cards`
   - **图片/表情（含动图 GIF）**：表情包优先走 QQ 的 CDN 直链，`get_image` 失败时用 `emoji_id` 推出 CDN 地址兜底；媒体元数据保留 `emoji_id`/`summary`/`sub_type` 等字段。下载走同一套 SSRF 防护传输，并修掉了「DNS 先返回 IPv6、本机没有 IPv6 出口 → 每次白等 20 秒」的根因（改为 **IPv4 优先 + 逐地址故障切换**），动图表情不再时好时坏。单条消息上限默认 8MB / 64MP / 5 张（`socialV2.media`）
   - MCP 发送工具支持可选 `replyToMessageId`，并新增专用 `qq_reply` 工具：AI 可以先用 `qq_get_group_history` 拿到真实消息 id，再引用/回复某条消息（是否允许 AI 主动使用由人格/策略决定；桥接会检测发送类工具调用并自动跳过该回合的重复自动转发）
   - 一代仿真模式（`reserved`）下，AI 可以只输出 `[SILENT]` 表示“潜水/不接话”，桥接会静默不发送
@@ -134,10 +133,11 @@ npm install        # 安装依赖（postinstall 会自动修补 @snowluma/sdk �
 | `snowluma.followDiscoveredEndpoint` | 默认 `true`。换 QQ 账号后 token 与端口都会变，桥接会自愈：重新发现并**跟随** SnowLuma 的端点（同时写回 `config.json`）。**想跑第二个实例 / 指向另一份 SnowLuma 安装（多账号、测试）时设为 `false`** —— 那时只自愈 token，绝不动 URL，也不写回 URL。详见「已知行为」 |
 | `snowluma.silenceWarnMs` | 上游静默告警阈值（毫秒），默认 `600000`（10 分钟）。已连接但这么久没收到任何事件包（含心跳）时打警告；这只是**提示**，不确定性的判断交给 `good` |
 | `snowluma.launcherPath` / `homeDir` | SnowLuma 安装目录（用于 token/端点自发现）。⚠️ 桥接**不会**启动或停止 SnowLuma（见 `LICENSE`） |
-| `agentPreset` | QQ 会话使用的 DSH agent preset，默认 `qq-chat`（改性格见下文）。⚠️ 只对**仅聊天档**生效：owner / 白名单会话的 preset 由权限档位决定（`qq-chat-owner` / `qq-chat-readonly`），本项不覆盖它们 |
-| `socialV2.agentPreset` | `reserved2` 模式使用的 DSH agent preset，默认 `qq-chat-v2`。⚠️ 同上，只对**仅聊天档**生效 |
+| `agentPreset` | QQ 会话使用的 DSH agent preset，默认 `qq-chat-agent`（改性格见下文）。⚠️ 2026-11-07 合并后三档 preset 同值，本项实际只影响 `chat` / `reserved` 这两个不走分级的模式 |
+| `socialV2.agentPreset` | `reserved2` 模式使用的 DSH agent preset，默认 `qq-chat-agent`。⚠️ 同上 |
 | `socialV2.initialPromptMaxChars` | 会话「初始提示词」（控制台为某个群/私聊预写的环境说明）的字数上限，默认 2000，允许 100~8000。越界值会在启动时收敛并保持原文件不动 |
 | `socialV2.media` | 图片/表情的上限：`maxBytes`（单条消息总字节，默认 8MB）、`maxPixels`（单张像素，默认 64MP）、`maxCount`（单条最多处理几张，默认 5）。越界值启动时收敛 |
+| `socialV2.cards` | **B站分享卡片内联展开**（默认开）。QQ 卡片进消息流时在桥接侧解析成一行 `[B站] 标题 · UP · 时长 · 播放 · BV号`，她零工具调用就知道群友转的是什么视频——比给她一个独立工具省得多（工具 schema 每轮都要随 prompt 重发）。`enabled` 总开关、`bili` 只认 B站、`timeoutMs` 单卡超时（默认 2500，实测一张 0.5s）、`cacheTtlMs` 同视频不重复请求（默认 30 分钟）、`titleMaxChars`/`upMaxChars` 截断、`includeStats` 播放量、`includeDesc` 简介（默认关，B站简介多为空或话题标签）。解析失败一律**静默降级**回 `[卡片消息]`，绝不影响消息投递；出网走与 `web_fetch` 同一套 SSRF 防护 |
 | `webSearch.provider` | 联网搜索后端：`auto`（默认，优先 DeepSeek、失败回退 Bing）/ `deepseek`（仅 DeepSeek，无凭据时报错）/ `bing` |
 | `webSearch.apiKeyEnv` / `apiKey` | 搜索凭据的环境变量名（默认 `DEEPSEEK_API_KEY`）/ 直接写死 key（不推荐）。都不设置时读 DSH 的 `$DSH_HOME/.credentials.yaml` 里同名 ref |
 | `webSearch.baseURL` / `model` / `maxUses` / `maxResults` | 搜索端点（默认 `https://api.deepseek.com/anthropic/v1`，必须 https 且解析到公网）、模型（默认 `deepseek-v4-flash`）、单次搜索最多用几次工具、返回条数上限 |
@@ -153,13 +153,13 @@ npm install        # 安装依赖（postinstall 会自动修补 @snowluma/sdk �
 
 ### DSH 端安装（必做：装 preset + 挂 MCP）
 
-桥接和控制台能跑起来还不够，DSH 端还需要安装四个 agent preset（`qq-chat` / `qq-chat-v2` / `qq-chat-owner` / `qq-chat-readonly`）并挂载 MCP。**单机新装同样必须执行这一步**（不是只有「另一台设备」才需要），装完还要**重启 DSH**：
+桥接和控制台能跑起来还不够，DSH 端还需要安装 agent preset（**只有一个** `qq-chat-agent`）并挂载 MCP。**单机新装同样必须执行这一步**（不是只有「另一台设备」才需要），装完还要**重启 DSH**：
 
 ```bash
 node scripts/setup-dsh.mjs
 ```
 
-> 全新环境下脚本会把 DSH 默认模式设为 **`reserved2`（二代仿真）**，并创建本地 `state/mode.json` 兜底；这样 AI 使用 `qq_send_message` 等工具收发消息时，DSH 会自动使用 `qq-chat-v2` 模式。如果本机已存在旧的 `state/mode.json` 或 DSH 设置值，脚本会保留不覆盖。之后可在**桥接控制台**（默认 `http://127.0.0.1:3100`）顶部按钮切换模式，控制台会同时写入 DSH 设置与本地兜底文件。
+> 全新环境下脚本会把 DSH 默认模式设为 **`reserved2`（二代仿真）**，并创建本地 `state/mode.json` 兜底；这样 AI 使用 `qq_send_message` 等工具收发消息时，DSH 会自动使用 `qq-chat-agent` preset。如果本机已存在旧的 `state/mode.json` 或 DSH 设置值，脚本会保留不覆盖。之后可在**桥接控制台**（默认 `http://127.0.0.1:3100`）顶部按钮切换模式，控制台会同时写入 DSH 设置与本地兜底文件。
 
 详细步骤见 **[docs/guides/DSH_SETUP.md](docs/guides/DSH_SETUP.md)**。
 
@@ -184,7 +184,7 @@ node scripts/setup-dsh.mjs
    node scripts/setup-dsh.mjs
    ```
    装完**必须重启 DSH**——preset 与 MCP 只在 DSH 启动时加载。
-   跳过这步桥接不会崩，但群聊会话拿不到 `qq-chat` preset，桥接会**拒绝建会话**（有意的安全设计：绝不回退到带 bash/文件工具的默认 preset），表现同样是 QQ 上没反应。
+   跳过这步桥接不会崩，但群聊会话拿不到 `qq-chat-agent` preset，桥接会**拒绝建会话**（有意的安全设计：绝不回退到带 bash/文件工具的默认 preset），表现同样是 QQ 上没反应。
 
 4. **下载并解压 SnowLuma**
    - 下载：<https://github.com/SnowLuma/SnowLuma/releases/latest> 选 `SnowLuma-v<版本>-win-x64.zip`（完整版，自带 Node 运行时；Lite 版需本机 Node 22.13+）
@@ -277,8 +277,9 @@ qq-bridge/
     audits/             # 审查与优化报告（体检、控制台、token）
     legacy/             # 历史归档（已被取代或问题已全部修复的旧报告）
   audio/                # 语音库：把准备好的音频放这里，可作 QQ 语音发出（用法见 docs/README.md 文档索引）
-  dsh/agent-presets/    # 四个 DSH agent preset 的权威源（qq-chat / qq-chat-v2 / qq-chat-owner / qq-chat-readonly）
-  plugins/qq-mode-console  # DSH 插件：注册 qq-mode 设置命名空间（仅 host 半，UI 卡片未实现）
+  dsh/agent-presets/    # DSH agent preset 的权威源。现在只有 qq-chat-agent 一个（2026-11-07 由四个旧预设合并）
+  plugins/qq-agent-presets # DSH bundle：把 qq-chat-agent 作为 preset 行插入 profile + 带 qq-tool-restrict 安全守卫
+  plugins/qq-mode-console  # DSH 插件：注册 qq-mode 设置命名空间（只管 mode / ownerQQ，**不含 preset**；仅 host 半，UI 卡片未实现）
   src/
     bridge.js           # 主程序
     dsh-client.js       # Node 版 DSH API 客户端（WS 下行）

@@ -48,6 +48,26 @@ export const inject = ['settings'];
 export const QQMODE_NAMESPACE = 'qq-mode';
 
 /**
+ * 职责边界（别再混淆，这里是唯一权威说明）
+ * ────────────────────────────────────────
+ * 本插件**只做一件事**：给 DSH 设置页暴露一个 `qq-mode` 命名空间，
+ * 里面只有 `mode` 和 `ownerQQ` 两个字段，让桥接能读写「桥接工作在哪种模式」。
+ *
+ * 它**不含任何 agent preset**：
+ *   · 没有「四个预设」（qq-chat / qq-chat-v2 / qq-chat-readonly / qq-chat-owner
+ *     已于 2026-11-07 合并成唯一一个 `qq-chat-agent`）；
+ *   · 也不声明 `@deepseek-ai/dsh-agent-preset` 行 —— 那是 `qq-agent-presets`
+ *     这个**另一个** bundle 的职责（见 ../qq-agent-presets/package.json）。
+ *   两个插件装在同台机器上并不冲突：一个管 mode，一个管 preset，互不覆盖。
+ *   历史上确实容易看错，因为都存在 `plugins/` 下、都带 `qq-` 前缀、都由
+ *   `setup-dsh.mjs` 一起挂进来，所以这里显式写清楚。
+ *
+ * 另外注意 `mode` 的取值是**模式名**，不是 preset 名：
+ *   `chat` / `closed-agent` / `reserved` / `reserved2` / `simulation`（规范名，等价 reserved2）。
+ *   看到 `reserved2` 不要理解成“第二个 preset”，它是二代仿真模式。
+ */
+
+/**
  * 独立的 schema（历史遗留：0.1.x 的 `settings.register()` 需要它）。
  * 现在**不参与** DSH 的 settings 定位（那用的是下面导出的 `Config`），
  * 但仓库里的静态测试会用它验证非法 mode 被拒绝，故保留。

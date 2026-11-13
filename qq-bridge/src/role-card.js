@@ -38,12 +38,22 @@ function stripModeTags(heading) {
 
 /**
  * 按标题把人格卡拆成小节。
+ *
+ * ⚠️ 必须先抹掉 `\r`（2026-11-08 修的一个真 bug）：
+ *   人格卡在 Windows 上普遍是 CRLF，而 JS 正则里的 `.` **不匹配行终止符**，
+ *   `\r` 正是行终止符之一 —— 于是 /^(#{1,6})\s+(.*)$/ 对 "## 标题\r" 整行匹配失败，
+ *   每一行都被当成"普通正文"，全部塞进开头那个 section。
+ *   结果就是**模式标记从来没生效过**：〔一代〕/〔二代〕小节在两种模式下都会注入。
+ *   这个 bug 没有任何报错，只在 roleSectionReport 里表现为"永远只有 1 个小节"。
+ *
  * @returns {{mode: 'all'|'v1'|'v2', heading: string|null, lines: string[]}[]}
  */
 export function parseRoleSections(text) {
   const sections = [];
   let current = null;
-  for (const line of String(text ?? '').split('\n')) {
+  for (const rawLine of String(text ?? '').split('\n')) {
+    // 只去掉行尾的 \r，不 trim 行首/行尾空格（缩进和空行本身有意义）。
+    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
     const heading = /^(#{1,6})\s+(.*)$/.exec(line);
     if (!heading) {
       if (!current) {

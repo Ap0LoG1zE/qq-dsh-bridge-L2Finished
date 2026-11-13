@@ -14,14 +14,35 @@ import * as wait from '../src/v2-wait.js';
 import * as safeFetch from '../src/safe-fetch.js';
 import * as mediaNormalize from '../src/media-normalize.js';
 import * as forward from '../src/forward.js';
-import * as slang from '../src/slang-learner.js';
+// slang-learner.js 已随黑话功能下线而删除（qq_slang_* 工具一并移除）。
+// 这里不再 import，改成空对象摊入 —— 保持下面 `...slang` 的写法不破，且不会引到不存在的模块。
+const slang = {};
 import * as sticker from '../src/sticker-lib.js';
 import * as modelPrices from '../src/model-prices.js';
 import * as tokenLedger from '../src/token-ledger.js';
-import * as voiceLib from '../src/send-voice-lib.js';
+import * as ttsLib from '../src/tts.js';
+// 记忆子系统：bridge.js 顶层从这三个模块解构了十几个函数（selectFactsForInjection /
+// addFact / createStore / createRecall / bumpAffinity …）。它们以前**从没注入过 VM**，
+// 于是 selectFactsForInjection 在 VM 里是 undefined —— buildWakePromptV2 里那个
+// 「事实库坏了不能影响整轮唤醒」的 try/catch 把 ReferenceError 悄悄吞了。
+// 后果：所有依赖记忆注入的断言其实都在测「注入失败」这条分支，长期是假绿。
+import * as memoryFacts from '../src/memory-facts.js';
+import * as memorySearch from '../src/memory-search.js';
+import * as memoryStore from '../src/memory-store.js';
+import * as affinity from '../src/affinity.js';
+// 角色卡：bridge.js 顶层从 role-card.js 解构了 selectRoleText / parseRoleSections 等。
+// 之前没注入，于是 /api/socialV2/prompt 在这个 VM 里直接 500「selectRoleText is not defined」——
+// 真实进程里没事（那是真 import），但测试里整条 prompt 路径都测不了。
+import * as roleCard from '../src/role-card.js';
 import * as presetPrompt from '../src/preset-prompt.js';
 import * as sendFileLib from '../src/send-file-lib.js';
 import * as stateAcl from '../src/state-acl.mjs';
+// B站分享卡片内联展开（2026-11-12）。bridge.js 顶层 import 了 setCardConfig /
+// summarizeCard，VM 里 import 被剥掉、必须在这里摊进 context —— 否则 loadConfig 在
+// `cfg.socialV2.cards = setCardConfig(...)` 处直接 ReferenceError，整个 harness 起不来。
+// 注意别用 `...card` 整包摊：它导出的 formatDuration（m:ss）会和 card-parse 的
+// 同名导出（给人读的时长文案）撞车，后摊的覆盖前者 ⇒ 语音相关的既有断言会静默失真。
+import { setCardConfig, summarizeCard } from '../src/card-parse.js';
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
@@ -147,7 +168,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
   source = source.slice(0, source.indexOf("process.on('SIGINT'"));
   source = source.replace('  bot.onPrivateMessage(async (event) => {', `
   return {
-    ensureSession, ensureSlangLearnerSession, resolvePresetName, deliverPrompt, drainPromptQueue,
+    ensureSession, resolvePresetName, deliverPrompt, drainPromptQueue,
     sendToQQ, sendStickerV2, handleIncoming, startConsoleServer, cfg, state, api, promptQueues,
     getSocialV2State, appendSocialV2Message, recordSentMessagesV2,
     buildWakePromptV2, buildWakeSnapshotV2, sendWakePromptV2, socialV2,
@@ -161,16 +182,42 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     extractMediaFromSegments, segmentsToText, fetchOneBotImage, fetchMediaData, resolveMediaList,
     emojiCdnCandidates, getImageDimensions, acceptImageBuffer, MAX_MEDIA_BYTES, bot,
     isConversationBusyV2, v2TurnStartAt, turnLeaseNoted, TURN_BUSY_LEASE_MS,
+    // 唤醒在途租约的原始状态：新链路测试要模拟「一轮真的跑完了」，
+    // 就必须像 pumpMux 在 turn/end 里那样解除 key 的在途标记，
+    // 否则第二次唤醒会被判忙、压根不投递，测出来的"没有重复提示"是假的。
+    pendingWakeKeys, disarmPendingWakeLease, busyReasonV2,
     settingFromDshNamespace, selfIdentityTextV2, buildWakeReminderPromptV2,
     getMode() { return currentMode; },
+    // 共用组级的「初始提示词是否已注入」判定（bootstrapSent）。
+    // ⚠️ 它**不再**决定冷启动那两句提示发不发 —— 那个只看 coldStartRegistry。
+    // 判据按组算，否则同一段初始提示词会发两遍。
+    groupBootstrapSent,
+    markGroupBootstrapSent,
+    // 冷启动（新会话 / 刚压缩过）的唯一判定与写入点。测试必须能直接观察到它，
+    // 而不是绕过真实投递路径去调 buildWakePromptV2 —— 那个函数现在只是"读标记"的一方。
+    coldStartRegistry,
+    markColdStart,
+    coldStartStateOf,
+    commitColdStart,
+    shareGroupOf,
+    memoryKeyOf,
+    // 全局记忆（2026-11-10 定稿）：长期三类全局一份、短期两类按会话。
+    memoryKeyFor,
+    globalMemoryOf,
+    resolveImpressionTarget,
+    formatMemberImpressionsV2,
+    // 记忆写入/发送者标签：共用组下三类长期记忆都要按组绑定，
+    // 私聊的 sender 也不能再是字面量「私聊」（见 test-memory-sharing.mjs）。
+    appendMemoryV2,
+    v2SenderLabelFor,
+    formatMemoryV2,
     setSelfIdentity(display, id) {
       selfDisplayName = String(display ?? '');
       selfUserId = String(id ?? '');
       selfNickname = selfDisplayName.toLowerCase() || 'deepseek';
     },
     flushQueue, retireSession,
-    voiceCfg, voiceLibrary, resolveVoicePathForV2, resolveVoicePathForOperator,
-    voiceBudgetCheck, sendVoiceV2, sendVoiceForV2, assertOutboundAuditOk,
+    assertOutboundAuditOk,
     setMode(value) { currentMode = value; },
     setReady(value) { dshReady = value; },
     setPresets(value) { dshPresetIds = value; dshDefaultPreset = 'standard'; },
@@ -193,7 +240,33 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     SnowLumaWebSocketClient: FakeBot, text: (s) => s,
     discoverDshLaunchToken: () => '', unwrap, createTurnCollector,
     ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...slang, ...sticker,
-    ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...presetPrompt, ...sendFileLib,
+    ...modelPrices, ...tokenLedger, ...stateAcl, ...presetPrompt, ...sendFileLib,
+    // 记忆子系统（见顶部 import 处的说明）：bridge.js 里大多用具名解构，名字与导出名一致，
+    // 直接摊开即可；只有下面这几个是**改名解构**的，必须显式补，否则那条路径在 VM 里
+    // 依然是 undefined（异常被 try/catch 吞掉 = 永久假绿）。
+    ...memoryFacts,
+    ...memorySearch,
+    ...memoryStore,
+    ...affinity,
+    ...roleCard,
+    selectFactsForInjection: memoryFacts.selectForInjection,
+    createMemoryStore: memoryStore.createStore,
+    AFFINITY_INITIAL: affinity.INITIAL_SCORE,
+    AFFINITY_STAGES: affinity.STAGES,
+    AFFINITY_SCORE_MIN: affinity.SCORE_MIN,
+    AFFINITY_SCORE_MAX: affinity.SCORE_MAX,
+    affinityStageOf: affinity.stageOf,
+    synthesizeTts: ttsLib.synthesize,
+    ttsServerReady: ttsLib.ttsReady,
+    // bridge.js 顶层 import 了 tts.js 的 TTS_DEFAULTS / synthesize / ensureTtsServer /
+    // ttsReady / normalizeTtsConfig；VM 里 import 被剥掉，缺了这些绑定时 loadConfig
+    // 会在 `tts: { ...TTS_DEFAULTS }` 处直接 ReferenceError，整个 harness 起不来。
+    // 只摊入纯函数与常量；ensureTtsServer 真会 spawn 进程，这里桩掉。
+    TTS_DEFAULTS: ttsLib.TTS_DEFAULTS,
+    synthesize: ttsLib.synthesize,
+    ttsReady: ttsLib.ttsReady,
+    normalizeTtsConfig: ttsLib.normalizeTtsConfig,
+    ensureTtsServer: async () => ({ ok: false, reason: 'stub: 测试环境不启动 TTS 进程' }),
     // 桥接的出图出口会调归一化（体积/动图抽帧）：VM 里必须能拿到这几个函数。
     normalizeImageForModel: mediaNormalize.normalizeImageForModel,
     sniffImage: mediaNormalize.sniffImage,
@@ -218,6 +291,11 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
           : (changed ? `音量 ${Math.round(v * 100)}%` : '原始音量')
       };
     },
+    // B站分享卡片：setCardConfig 会改写模块级配置（VM 与真实环境共用同一份模块实例），
+    // 所以测试里改开关后必须显式复原；summarizeCard 直通真实实现，但测试不该出网 —— 
+    // 卡片断言用 fixture JSON 且不开 enabled，需要真实解析的用例放到 test-card-parse.mjs。
+    setCardConfig,
+    summarizeCard,
     cleanupTemp: () => {},
     ...globals,
   });

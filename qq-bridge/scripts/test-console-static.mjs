@@ -18,7 +18,8 @@ console.log('## 元素 ID');
 const ids = [...html.matchAll(/\sid="([A-Za-z0-9_-]+)"/g)].map((m) => m[1]);
 const dups = [...new Set(ids.filter((v, i) => ids.indexOf(v) !== i))];
 ok(dups.length === 0, 'ID 唯一', dups.length ? `重复：${dups.join(', ')}` : `共 ${ids.length} 个`);
-for (const id of ['voiceList', 'voiceRefreshBtn', 'voiceSendBtn', 'voiceSendTarget', 'voiceSendDryRun', 'voiceMsg']) {
+// 语音库面板已删除（2026-11-12），下面这段改成反向断言，见后面的「语音库已移除」小节。
+for (const id of []) {
   const n = (html.match(new RegExp(`id="${id}"`, 'g')) ?? []).length;
   ok(n === 1, `语音面板元素 ${id}`, `${n} 处`);
 }
@@ -26,19 +27,33 @@ for (const id of ['voiceList', 'voiceRefreshBtn', 'voiceSendBtn', 'voiceSendTarg
 console.log('## 视图 / 页面契约');
 const views = [...new Set([...html.matchAll(/data-view="([a-z0-9-]+)"/g)].map((m) => m[1]))].sort();
 const pages = [...new Set([...html.matchAll(/data-page="([a-z0-9-]+)"/g)].map((m) => m[1]))].sort();
-ok(JSON.stringify(views) === JSON.stringify(pages), 'data-view 与 data-page 一一对应', `${views.length} 个：${views.join(', ')}`);
+// 真正的契约只有一半：
+//   · 每个导航按钮（data-view）**必须**有对应页面，点过去不能是空白 —— 这条永远成立；
+//   · 反过来不成立：`social-v1`（一代仿真）与 `slang` 已从导航里移除，
+//     但页面 DOM 与 id 保留了（轮询脚本仍按 id 读写，删掉会 null 引用；
+//     见 console.html 里 `.is-retired` 的注释），所以存在无导航入口的孤儿页面是**有意为之**。
+// 旧断言要求两个集合完全相等，等于把「遗留隐藏页」判成缺陷，会逼着人去删还敢留的 DOM。
+const orphanPages = pages.filter((p) => !views.includes(p));
+const missingPages = views.filter((v) => !pages.includes(v));
+ok(missingPages.length === 0, '每个导航按钮都有对应页面', missingPages.length ? `缺：${missingPages.join(', ')}` : `${views.length} 个：${views.join(', ')}`);
+ok(orphanPages.every((p) => ['social-v1', 'slang'].includes(p)), '无导航入口的遗留页仅限已知白名单', orphanPages.length ? `遗留：${orphanPages.join(', ')}（DOM 保留，不展示）` : '无');
+
 
 console.log('## 工具开关');
 const tools = [...html.matchAll(/data-v2-tool="([A-Za-z]+)"/g)].map((m) => m[1]);
-ok(tools.includes('sendVoice'), 'sendVoice 开关存在', `共 ${tools.length} 个开关`);
+ok(!tools.includes('sendVoice'), 'sendVoice 开关已移除', `共 ${tools.length} 个开关`);
 ok(new Set(tools).size === tools.length, '工具开关无重复');
 
-console.log('## 语音面板接线');
-ok(/id="voiceRefreshBtn"/.test(html) && /getElementById\('voiceRefreshBtn'\)\.addEventListener/.test(html), '刷新按钮已绑定事件');
-ok(/getElementById\('voiceSendBtn'\)\.addEventListener/.test(html), '试发按钮已绑定事件');
-ok(/api\('\/api\/voice\/list/.test(html), '面板调用 /api/voice/list（操作者通道，无需 key）');
-ok(/api\('\/api\/voice\/send'/.test(html), '面板调用 /api/voice/send');
-ok(/typeof loadVoiceLibrary === 'function'|async function loadVoiceLibrary/.test(html), 'loadVoiceLibrary 已定义');
+console.log('## 语音库已移除');
+// 语音库面板已按操作者要求删除（2026-11-12）。这里改成**反向**断言：
+// 这些元素/端点/函数不许再出现，防止谁又加回来。
+// 现在用的是纯语音 TTS（桥接把文字合成为语音条），与语音库无关。
+for (const id of ['voiceList', 'voiceRefreshBtn', 'voiceSendBtn', 'voiceSendTarget', 'voiceSendDryRun', 'voiceMsg']) {
+  ok(!html.includes(`id="${id}"`), `语音面板元素 ${id} 已移除`, html.includes(`id="${id}"`) ? '仍存在' : '已清除');
+}
+ok(!html.includes('/api/voice/list'), '不再调用 /api/voice/list');
+ok(!html.includes('/api/voice/send'), '不再调用 /api/voice/send');
+ok(!html.includes('loadVoiceLibrary'), 'loadVoiceLibrary 已清除');
 
 console.log('## JS 语法');
 const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
@@ -70,8 +85,6 @@ if (!hasVoiceTool()) {
 
 console.log('## fixture mock 覆盖');
 const fixture = fs.readFileSync(path.join(ROOT, 'scripts', 'console-ui-fixture.mjs'), 'utf8');
-ok(fixture.includes("case '/api/socialV2/voices'"), 'fixture mock 了 /api/socialV2/voices');
-ok(fixture.includes("case '/api/voice/send'"), 'fixture mock 了 /api/voice/send');
 
 console.log(bad === 0 ? '\n全部通过' : `\n${bad} 项失败`);
 if (bad > 0) process.exit(1);

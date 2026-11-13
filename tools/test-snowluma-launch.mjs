@@ -30,9 +30,9 @@ const brief = (d, n = 320) => { const s = JSON.stringify(d); return s.length > n
 
 // ── 1) 带 query 的路由能不能命中 exact 匹配 ────────────────────────────────
 console.log('【1】带 query 的请求是否命中 kind:exact 路由')
-const bare = await call('/dsh-thinking-zh/qq-bigfish/persona')
+const bare = await call('/qq-dsh-panel/qq-bigfish/persona')
 console.log(`  不带 query            → HTTP ${bare.status}  ${brief(bare.data, 120)}`)
-const withQ = await call('/dsh-thinking-zh/qq-bigfish/persona?name=' + encodeURIComponent('小鲸鱼'))
+const withQ = await call('/qq-dsh-panel/qq-bigfish/persona?name=' + encodeURIComponent('小鲸鱼'))
 console.log(`  带 ?name=小鲸鱼        → HTTP ${withQ.status}  ${brief(withQ.data, 200)}`)
 if (withQ.status === 404) {
   console.log('  ✗ 结论：exact 匹配把 query 也算进 path —— 人格页签"选中角色后读取全文"会失效，需要改成 POST 或路径参数。')
@@ -44,25 +44,25 @@ if (withQ.status === 404) {
 
 // ── 2) SnowLuma 启动前状态 ────────────────────────────────────────────────
 console.log('\n【2】启动前的 SnowLuma 状态')
-const before = await call('/dsh-thinking-zh/qq-bigfish')
+const before = await call('/qq-dsh-panel/qq-bigfish')
 console.log(`  connected=${before.data?.snowluma?.connected}  accountOnline=${before.data?.snowluma?.accountOnline}`)
 
 // ── 3) 一键启动 ───────────────────────────────────────────────────────────
 console.log('\n【3】调用 launch-snowluma（真的启动本机 SnowLuma，最多等 45 秒）')
-const launched = await call('/dsh-thinking-zh/qq-bigfish/launch-snowluma', 'POST')
+const launched = await call('/qq-dsh-panel/qq-bigfish/launch-snowluma', 'POST')
 console.log(`  HTTP ${launched.status}`)
 console.log(`  ${brief(launched.data, 500)}`)
 
 // ── 4) 启动后状态 ─────────────────────────────────────────────────────────
 console.log('\n【4】启动后等 8 秒再看状态')
 await new Promise((r) => setTimeout(r, 8000))
-const after = await call('/dsh-thinking-zh/qq-bigfish')
+const after = await call('/qq-dsh-panel/qq-bigfish')
 const sl = after.data?.snowluma || {}
 console.log(`  connected=${sl.connected}  accountOnline=${sl.accountOnline}  good=${sl.good}  hint=${sl.hint || '(无)'}`)
 
 // ── 5) 打开 WebUI（会真的弹浏览器，用于扫码场景） ─────────────────────────
 console.log('\n【5】open-snowluma?target=webui（会真的打开浏览器窗口）')
-const opened = await call('/dsh-thinking-zh/qq-bigfish/open-snowluma?target=webui')
+const opened = await call('/qq-dsh-panel/qq-bigfish/open-snowluma?target=webui')
 console.log(`  HTTP ${opened.status}  ${brief(opened.data, 200)}`)
 
 console.log('\n完成。')

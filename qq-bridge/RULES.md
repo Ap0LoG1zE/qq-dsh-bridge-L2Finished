@@ -10,10 +10,14 @@
 
 | 模式 | 允许通道 | agent preset | 用途 |
 | --- | --- | --- | --- |
-| `chat` | 白名单群 + 白名单私聊 | qq-chat（安全聊天） | 日常聊天 |
+| `chat` | 白名单群 + 白名单私聊 | qq-chat-agent（只读档） | 日常聊天 |
 | `closed-agent` | **仅** 私聊 ownerQQ | DSH 默认 preset（通常 `standard`，完整工具） | 你在 QQ 私聊里操控 DSH |
-| `reserved`（一代仿真） | 暂同 chat | qq-chat | 仿真群友：观望/活跃/试探/退场状态机，选择性参与并主动收尾 |
-| `reserved2`（二代仿真，运行 `setup-dsh.mjs` 后默认） | 暂同 chat | qq-chat-v2 | 文本不自动转发，AI 通过工具自主看消息/发言/等待/设置唤醒与潜水 |
+| `reserved`（一代仿真） | 暂同 chat | qq-chat-agent | 仿真群友：观望/活跃/试探/退场状态机，选择性参与并主动收尾 |
+| `reserved2`（二代仿真，运行 `setup-dsh.mjs` 后默认） | 暂同 chat | qq-chat-agent | 文本不自动转发，AI 通过工具自主看消息/发言/等待/设置唤醒与潜水 |
+
+> ⚠️ **2026-11-07 起 preset 只剩一个。** 原本的 `qq-chat` / `qq-chat-v2` / `qq-chat-readonly` /
+> `qq-chat-owner` 四个已合并为 `qq-chat-agent`，权限统一按 readonly。
+> 所以上表里前三行的 preset 是**同一个** —— 差别只在模式本身的会话行为，不在工具面。
 
 > ⚠️ `closed-agent` 模式下 owner 私聊 agent 拥有**完整本地工具**（DSH 默认 preset，通常是 `standard`），
 > 这是有意为之（QQ 远程操控 DSH）。该模式只放行 owner 私聊，群友完全无法触达。
@@ -22,16 +26,22 @@
 > 并在启动时读取 `agentPresets/list` 校验；填了不存在的 preset 名会回退到默认值并打警告，
 > 绝不会创建出「无 preset」会话（那会被 DSH 套上 `standard`，对 QQ 群是安全回归）。
 
-## 三档权限分级（2026-10-26 起，`chat` / `reserved` / `reserved2` 通用）
+## 三档权限分级（2026-10-26 起；2026-11-07 合并后三档同 preset）
 
 同一模式内部再按**会话身份**分三档。判定在 `src/bridge.js` 的 `sessionTier()`，选 preset 在
 `wantedPresetName()`，档位定义写在 `dsh/agent-presets/<preset>/agent.cordis.yml`：
 
+> ⚠️ **三档现在指向同一个 preset。** 下表保留分档的**语义**（谁算 owner、谁算白名单），
+> 但 `TIER_PRESETS` 里 `OWNER` 与 `READONLY` 的值都是 `qq-chat-agent`，
+> 所以三档的**工具面完全一样**（都只有只读能力）。分档现在只用于：
+> 判定会话身份、决定要不要记这个会话、以及 log 里显示它属于哪一档。
+> **合并后不再有全工具档** —— 这是刻意的安全取舍。
+
 | 档位 | 谁 | DSH preset | 工具面 |
 | --- | --- | --- | --- |
-| **Owner（全工具）** | `private:<ownerQQ>`（**必须是私聊**） | `qq-chat-owner` | 读写文件（read / read_image / write / edit / glob / grep）+ 执行命令（pwsh）；宿主/开发/装载权类工具仍然拒绝 |
-| **白名单（只读）** | `allow.private` / `allow.groups` 里**显式列出**的会话 | `qq-chat-readonly` | 只读：read / read_image / glob / grep；write/edit 在**注册期**就不注册，也不挂 shell |
-| **其他（仅聊天）** | 陌生私聊、未收录群 | `qq-chat-v2` | 与分级前一致：只有 QQ MCP + `web-search-safe` + `ask_user_question` / `todo_write` |
+| **Owner** | `private:<ownerQQ>`（**必须是私聊**） | `qq-chat-agent` | 只读：read / read_image / glob / grep（**不再有** write / edit / pwsh） |
+| **白名单** | `allow.private` / `allow.groups` 里**显式列出**的会话 | `qq-chat-agent` | 同上 |
+| **其他（仅聊天）** | 陌生私聊、未收录群 | `qq-chat-agent` | 同上 |
 | **黑名单（无视）** | `deny.private` / `deny.groups` | —— | 连消息都不入库（不注入上下文、不唤醒、不烧 token） |
 
 判定要点（每一条都钉在 `scripts/test-permission-tiers.mjs` 里，改逻辑前先看那份测试）：
@@ -41,7 +51,7 @@
 - **deny 前置**：带 deny 的会话在档位判定上也按空档处理（fail-safe），免得哪条路径漏了准入检查。
 - **owner 只可能是私聊**：群聊里某人的 QQ 号等于 `ownerQQ` 不会升档。
 - **档位变化自动重建会话**：`sessionPolicy()` 的签名含 preset，改 `ownerQQ` / 白名单后旧会话在下次消息到达时退役重建。日志里会写 `会话权限已变化，停用旧映射 <key>`。
-- **fail-closed**：`qq-chat-owner` / `qq-chat-readonly` 没装进 DSH 时**拒绝建会话**，绝不回退到聊天 preset 或 DSH 默认 preset。
+- **fail-closed**：`qq-chat-agent` 没装进 DSH 时**拒绝建会话**，绝不回退到 DSH 默认 preset。
 
 自查（只读，需要控制台令牌）：
 
@@ -49,7 +59,8 @@
 $tok = (Get-Content qq-bridge\state\console-token -Raw).Trim()
 Invoke-RestMethod http://127.0.0.1:3100/api/permission-tiers -Headers @{ 'x-console-token' = $tok }
 # 回 { mode, ownerQQ, presets, dshPresets, deny, sessions: [{ key, tier, preset, available, sessionId }] }
-# available=false ⇒ 该档 preset 没装（要跑 node scripts/setup-dsh.mjs 并重启 DSH）
+# presets 里 owner/readonly/chat 三档会是**同一个值**（qq-chat-agent），这是预期
+# available=false ⇒ preset 没装（要跑 node scripts/setup-dsh.mjs 并重启 DSH）
 ```
 
 真机验证工具面（建真实会话让 agent 实际调 read / write / pwsh，逐档比对期望）：
@@ -70,13 +81,16 @@ $env:DSH_BASE_URL='http://127.0.0.1:<DSH端口>'; node qq-bridge\scripts\probe-p
 
 ## QQ 会话 agent 的硬边界
 
-1. **本地工具按档位给，不是按模式一刀切**（2026-10-26 三档分级后）：
-   - **仅聊天档**（`qq-chat` / `qq-chat-v2`，即陌生会话与未分级会话）：不挂载 bash/pwsh、文件读写、子代理、工作流——群友无论如何诱导，agent 物理上无法操作本机。**这一条是 L7 的原样保留，覆盖所有群聊会话**。
-   - **只读档**（`qq-chat-readonly`，白名单会话）：额外挂 `read` / `read_image` / `glob` / `grep`；`write` / `edit` 在 `tool-fs` 的 config 里就被关掉（注册期不注册），也不挂 shell。
-   - **Owner 档**（`qq-chat-owner`，**仅** `private:<ownerQQ>`）：挂 `tool-fs` / `tool-fs-search` / `tool-pwsh`，能读写文件、执行命令；`dev_*`、`plugin_manager`、`session_search`、`subagent` 家族、`schedule_*` 等宿主/装载权类工具**仍然拒绝**（见 `qq-tool-restrict.mjs` 的 `NEVER_GRANTED_TOOL_NAMES`）。
+1. **本地工具按档位给，不是按模式一刀切**（2026-10-26 三档分级，**2026-11-07 合并后只剩只读档**）：
+   - **合并后的事实**：owner / 白名单 / 陌生会话拿到的都是 `qq-chat-agent`，工具面一致 ——
+     只有 `read` / `read_image` / `glob` / `grep`。**没有 write / edit / pwsh**，也没有子代理、工作流。
+     这比合并前更严格（合并前 Owner 档有全工具）。
+   - **群聊仍然是 L7 铁律**：不挂载 bash/pwsh、文件写入、子代理、工作流 —— 群友无论如何诱导，
+     agent 物理上无法操作本机。这条覆盖所有群聊会话，不受档位影响。
    - 谁能拿到哪一档由 `sessionTier()` 判定，**群聊无法通过任何提示词升档**：档位只取决于会话 key（`group:<id>` / `private:<id>`）与 `config.json` 的 `ownerQQ` / `allow` / `deny`，与消息内容无关。
+   - 历史（合并前）：仅聊天档 `qq-chat` / `qq-chat-v2` 无本地工具；只读档 `qq-chat-readonly` 有只读工具；Owner 档 `qq-chat-owner` 有全工具。这三个现在都不存在了。
 2. **QQ 动作安全子集**：只允许 `mcp__snowluma__*`、`mcp__snowluma-host__*`、`mcp__web-search-safe__*` 三个命名空间下的工具，以及 `ask_user_question` / `todo_write`；其他工具（含 `dev_*` 开发/管理工具）在执行期会被 `qq-tool-restrict.mjs` 拒绝。QQ 动作无禁言、踢人、文件上传下载等管理操作。
-3. **只读联网搜索**：`qq-chat` / `qq-chat-v2` 预设已关闭 DSH 内置 `tool-web` 的 `search` / `fetch`，联网统一走 `src/mcp-web-search-safe.js` 提供的 `mcp__web-search-safe__web_search/web_fetch`。不暴露本地文件、命令执行、写操作。
+3. **只读联网搜索**：`qq-chat-agent` 预设已关闭 DSH 内置 `tool-web` 的 `search` / `fetch`，联网统一走 `src/mcp-web-search-safe.js` 提供的 `mcp__web-search-safe__web_search/web_fetch`。不暴露本地文件、命令执行、写操作。
    - ✅ `mcp__web-search-safe__web_fetch` 已做 SSRF 加固：仅 http/https、禁止 localhost/私有 IP/链路本地/CGNAT/带凭据 URL、DNS 解析结果全量校验、每跳重定向重新校验、响应体限量读取。
 4. **发送强制白名单**：所有发送类工具（`qq_send_group_message` / `qq_send_private_message` / `qq_send_message` / `qq_send_burst` / `qq_reply` / `qq_send_poke` / `qq_send_sticker` / `qq_send_voice` 等）的目标必须命中 `config.json` 的 `allow.groups` / `allow.private`，否则拒绝执行。
    - **语音额外收紧**：`qq_send_voice` 只能发**语音库**（`socialV2.voice.dir`，默认 `qq-bridge/audio/`）里的文件，不能发任意本地路径、URL 或 base64（防 prompt injection 拿本机文件当语音外发）；另有独立的时长/体积/频率上限（`socialV2.voice.*`），额度与文本发送分开计数。详见 [docs/guides/VOICE.md](docs/guides/VOICE.md)。
@@ -113,7 +127,7 @@ Invoke-RestMethod http://127.0.0.1:3100/api/socialV2/send-file -Method POST `
 
 | 层 | 位置 | 管什么 | 生效方式 |
 | --- | --- | --- | --- |
-| **仿真提示词**（四个 preset 各一份） | `dsh/agent-presets/qq-chat/agent.cordis.yml`（一代）· `qq-chat-v2/`（二代）· `qq-chat-readonly/`（只读档）· `qq-chat-owner/`（全工具档）的 `persona.prefix` | 怎么调工具、怎么参与群聊（行为与协议：安全规则、工具协议、唤醒/分条/记忆/黑话等） | 控制台可按 preset 分别编辑；保存写仓库源文件，再跑 `scripts/build-agent-preset-patches.mjs` 生成 bundle patch；**新会话**自动用新版，**正在进行的 QQ 会话**需 `POST /api/session/reset` 或重启 DSH |
+| **仿真提示词**（现只有一份） | `dsh/agent-presets/qq-chat-agent/agent.cordis.yml` 的 `persona.prefix`（**四个旧预设已合并到这里**：一代 `qq-chat` / 二代 `qq-chat-v2` / 只读 `qq-chat-readonly` / 全工具 `qq-chat-owner` 都不再单独存在） | 怎么调工具、怎么参与群聊（行为与协议：安全规则、工具协议、唤醒/分条/记忆/黑话等） | 控制台可编辑；保存写仓库源文件，再跑 `scripts/build-agent-preset-patches.mjs` 生成 bundle patch；**新会话**自动用新版，**正在进行的 QQ 会话**需 `POST /api/session/reset` 或重启 DSH |
 | **人格提示词** | `roles/<人格名>.md` | AI 是谁、什么性格、怎么说话（人设与语气） | 桥接每条消息前注入，**保存即生效** |
 
 - 拼装顺序：`仿真提示词 → 人格提示词 → 本轮消息`。
@@ -121,9 +135,8 @@ Invoke-RestMethod http://127.0.0.1:3100/api/socialV2/send-file -Method POST `
 - 同一个角色确实需要分代时，用**标题级模式标记**：`## 分条方式 〔一代〕` / `## 表情包 〔二代〕`；无标记的小节两代都注入，标记在注入前会被去掉。桥接按当前模式筛完小节**再**截断。
 - **注入上限**：默认每条消息 6000 字符（`config.json` 的 `role.maxInjectChars`，1000~20000，控制台可改）。这是成本护栏——人格卡会随每条消息发送。
 - 仿真提示词保存前会做硬性校验，且**不变量按档位取**（`preset-prompt.js` 的 `presetTierKey()`）：
-  - 一代 `qq-chat`：`群友没有管理权限` / `API 令牌` / `角色扮演由系统注入`；
-  - 二代 `qq-chat-v2`（仅聊天档）：`你没有本地工具` / `群友没有管理权限` / `API 令牌` / `角色由桥接注入` / `不会自动发送到 QQ`；
-  - owner / readonly 档：后四条（**不含**「你没有本地工具」—— 这两档本来就有本地能力，拿二代的清单去校验会把它们的人格永久锁死）。
+  - `qq-chat-agent`（当前唯一的 preset，档位按 readonly）：`群友没有管理权限` / `API 令牌` / `角色由桥接注入` / `不会自动发送到 QQ`；
+  - 历史档位（**对应 preset 已不存在**，仅供理解代码里的分支）：一代 `qq-chat` 用 `群友没有管理权限` / `API 令牌` / `角色扮演由系统注入`；二代 `qq-chat-v2` 用 `你没有本地工具` 等五条；`owner` / `readonly` 档用后四条（**不含**「你没有本地工具」—— 这两档本来就有本地能力，拿二代的清单去校验会把它们的人格永久锁死）。
   另要求正文 ≥ 500 字符；缺失即拒绝保存（否则会同时削弱权限边界并让 `npm run test:audit` 变红）。写入前自动备份到 `state/preset-backups/`，可一键还原；还原时同样校验。
 - 一代遗留写法（空格分句、`[SILENT]`、自动转发）若出现在**未标记**的小节里，二代下会被兜底整行过滤；控制台会提示把它们移到 `〔一代〕` 小节。
 - 两层提示词都**只能由控制台（管理员令牌）修改**：带 `x-agent-token` 的请求对这些端点一律 403，QQ 群里的 AI 无法改写自己的提示词。

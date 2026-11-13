@@ -52,6 +52,19 @@ async function withServer(h, run) {
   finally { await new Promise((resolve) => server.close(resolve)); }
 }
 
+/**
+ * 让这个 harness 能真的建出会话。
+ *
+ * reserved2 下 readonly 档需要 preset "qq-chat-agent"，而 harness 默认只装了
+ * standard / qq-chat 系列 / owner / readonly。缺了它 ensureSession 会 fail-closed 直接抛，
+ * **一条 prompt 都投不出去** —— 那两条"必须真的投递一次 prompt"的用例
+ * 就是因为这个才失败的（与冷启动链路无关）。
+ */
+function withMutsumiPreset(h) {
+  h.setPresets(['standard', 'qq-chat', 'qq-chat-v2', 'qq-chat-owner', 'qq-chat-readonly', 'qq-chat-agent']);
+  return h;
+}
+
 const ENV_TEXT = '这是一个二次元 + 技术混合的群：群友喜欢玩梗、聊模型和本地部署。\n氛围轻松，别长篇大论；有人问配置问题要直接给结论。';
 
 // ── 1. 保存 / 读取 / key 归一化 / 持久化 ─────────────────────────────────────
@@ -227,7 +240,7 @@ await test('initial-prompts.json 损坏时降级为只读，保存失败且原�
 
 // ── 7. 控制台「立即唤醒」在首次唤醒时升级为 bootstrap ────────────────────────
 await test('手动唤醒在会话未 bootstrap 时必须走 bootstrap（否则初始提示词永远发不出去）', async () => {
-  const h = await bridgeHarness();
+  const h = withMutsumiPreset(await bridgeHarness());
   try {
     h.setMode('reserved2');
     h.setInitialPrompt('group:456', ENV_TEXT);
@@ -255,7 +268,7 @@ await test('手动唤醒在会话未 bootstrap 时必须走 bootstrap（否则�
 
 // ── 8. 端到端：真实进线消息 → bootstrap 唤醒 → 投递的 prompt 带环境说明 ────────
 await test('端到端：群消息进线触发的首次唤醒，投递给 DSH 的 prompt 带初始提示词', async () => {
-  const h = await bridgeHarness({ config: { socialV2: { wake: { batchWindowMs: 1000 } } } });
+  const h = withMutsumiPreset(await bridgeHarness({ config: { socialV2: { wake: { batchWindowMs: 1000 } } } }));
   try {
     h.setMode('reserved2');
     h.setInitialPrompt('group:456', ENV_TEXT);
@@ -271,8 +284,11 @@ await test('端到端：群消息进线触发的首次唤醒，投递给 DSH 的
     for (let i = 0; i < 100 && !h.calls.prompts.length; i += 1) await new Promise((resolve) => setTimeout(resolve, 50));
     assert.equal(h.calls.prompts.length, 1, '首条消息应触发恰好一次 bootstrap 唤醒');
     const delivered = h.calls.prompts[0].content.map((c) => String(c?.text ?? '')).join('\n');
-    assert.ok(delivered.includes('【引导】'), '首次唤醒走的是 bootstrap 文案');
+    // 2026-11-13 操作者要求：【引导】整段已删除（那些要求 preset 里常驻，
+    // 且它常因优先级撞合并窗被丢）。这里改成钉"初始提示词在不在" ——
+    // 那才是 bootstrap 文案真正独有、且真正有用的东西。
     assert.ok(delivered.includes(ENV_TEXT), 'bootstrap prompt 必须带操作者预写的环境说明');
+    assert.ok(!delivered.includes('【引导】'), '【引导】已按操作者要求删除');
 
     // 第二条消息（非首次唤醒）不得再注入
     const second = { ...event, message_id: 4243, message: [{ type: 'text', data: { text: '有没有人在' } }], raw_message: '有没有人在' };

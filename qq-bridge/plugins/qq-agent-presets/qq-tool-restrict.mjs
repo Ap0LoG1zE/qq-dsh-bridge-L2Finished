@@ -3,9 +3,14 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-// 本文件是 qq-agent-presets bundle 里的**唯一权威实现**，由 qq-chat / qq-chat-v2 两个
-// agent preset 的 qq-tool-restrict 行共同引用（dsh/agent-presets/<preset>/qq-tool-restrict.mjs
+// 本文件是 qq-agent-presets bundle 里的**唯一权威实现**，由唯一 preset `qq-chat-agent`
+// 的 qq-tool-restrict 行引用（dsh/agent-presets/qq-chat-agent/qq-tool-restrict.mjs
 // 只是个 re-export 壳，避免出现两份会漂移的实现）。
+//
+// ⚠️ 2026-11-07 合并前，这里写的是「由 qq-chat / qq-chat-v2 两个 preset 共同引用」。
+//    那四个预设（qq-chat / qq-chat-v2 / qq-chat-readonly / qq-chat-owner）已经合并成
+//    唯一的 `qq-chat-agent`，权限档位统一按 readonly。下面 MODES 里的三档仍然保留，
+//    因为工具守卫本身是通用的、要能应付任意档位配置；只是当前部署只用 readonly。
 //
 // 为什么引用方式是「包名/子路径」而不是 `./qq-tool-restrict.mjs`（DSH 0.1.7 的机制变化）：
 //   0.1.5 的 preset 是 ~/.dsh/.agent-presets/<preset>/ 目录，相对名按 preset 目录解析；
@@ -265,17 +270,23 @@ const SAFE_EXACT = new Set([
   'todo_write',
 ])
 
-// ── 会话权限分级：三档 mode（2026-10-26 新增） ──────────────────────────────
+// ── 会话权限分级：三档 mode（2026-10-26 新增，2026-11-07 合并后只用 readonly） ──
 //
-// 同一份守卫实现被三个 preset 共用，靠**行级 config.mode** 区分档位：
-//   · strict（默认；`config: {}` —— qq-chat / qq-chat-v2）：现状不变，只放行
+// 同一份守卫实现靠**行级 config.mode** 区分档位。
+// ⚠️ 历史背景：这套三档原本对应三个 preset —— strict ↔ qq-chat / qq-chat-v2，
+//    readonly ↔ qq-chat-readonly，open ↔ qq-chat-owner。**那四个 preset 已经合并成
+//    唯一的 `qq-chat-agent`（权限按 readonly）**，所以当前部署只用 readonly 这一档，
+//    strict / open 没有 preset 在用。它们仍然保留，是因为守卫本身要通用：
+//    换个部署想加回全工具档时，改 preset 的 config.mode 就行，不必重写守卫。
+//
+//   · strict（`config: {}` 的默认档）：只放行
 //     QQ MCP 命名空间与两个无害模型侧工具，其余一律拒绝（L7 的仿真会话边界）。
-//   · readonly（qq-chat-readonly，白名单会话）：额外放行**只读**文件工具
+//   · readonly（qq-chat-agent 当前用的档）：额外放行**只读**文件工具
 //     （read / read_image / glob / grep），读写与执行类仍然拒绝。
-//   · open（qq-chat-owner，ownerQQ 私聊）：不再限制本地能力（那是 owner 自己的
-//     机器），但**仍然拒绝** NEVER_GRANTED_TOOL_NAMES —— 宿主/开发/装载权类
-//     工具即使 owner 会话也不授予，避免"开全权限"顺手把 dev_inject_plugin /
-//     plugin_manager / session_search 之类一起放出去。
+//   · open：不再限制本地能力（那是 owner 自己的机器），但**仍然拒绝**
+//     NEVER_GRANTED_TOOL_NAMES —— 宿主/开发/装载权类工具即使 owner 会话也不授予，
+//     避免"开全权限"顺手把 dev_inject_plugin / plugin_manager / session_search
+//     之类一起放出去。
 //
 // ⚠️ 为什么 open 不能直接拿 KNOWN_DANGEROUS_GLOBAL_TOOLS 当拒绝名单：
 //    那份名单按设计包含 read/write/edit/pwsh/glob/grep 等**可授予**的能力，
@@ -286,7 +297,9 @@ const SAFE_EXACT = new Set([
 //    只有显式登记进 OWNER_GRANTABLE_TOOL_NAMES 才可能在 open 模式下放行。
 export const MODES = Object.freeze({ STRICT: 'strict', READONLY: 'readonly', OPEN: 'open' })
 
-/** open（owner）模式下**允许**放行的本地能力：与 qq-chat-owner 实际挂载的行一一对应。 */
+/** open 模式下**允许**放行的本地能力：与旧 qq-chat-owner 预设曾挂载的行一一对应。
+ *  ⚠️ 当前唯一的 preset `qq-chat-agent` 用的是 readonly，**不会**走到这个分支；
+ *  保留它是为了将来若要加回全工具档时，放行面仍然是这张显式清单。 */
 const OWNER_GRANTABLE_TOOL_NAMES = new Set([
   // dsh-tool-fs → read / read_image / write / edit
   'read', 'read_image', 'write', 'edit',

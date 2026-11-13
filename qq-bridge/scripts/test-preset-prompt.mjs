@@ -18,9 +18,12 @@ import {
 } from '../src/preset-prompt.js';
 import { PRESETS } from './build-agent-preset-patches.mjs';
 
-const PRESET_PATH = new URL('../dsh/agent-presets/qq-chat-v2/agent.cordis.yml', import.meta.url);
+const PRESET_PATH = new URL('../dsh/agent-presets/qq-chat-agent/agent.cordis.yml', import.meta.url);
 const source = fs.readFileSync(PRESET_PATH, 'utf8');
 const originalPrefix = extractPresetPrefix(source);
+// 合并后的预设是只读档：调 renderPresetPromptYaml 必须带上档位，
+// 否则它按默认的 'v2' 清单校验，会拿「你没有本地工具」去要求一个**有只读工具**的预设。
+const TIER = presetTierKey('qq-chat-agent');
 
 // 回归：每个内置预设必须满足**它自己那一档**的硬性不变量。
 //
@@ -31,7 +34,10 @@ const originalPrefix = extractPresetPrefix(source);
 // 正文里**不可能**有「你没有本地工具」，拿二代的清单去校验它们同样会把人格锁死。
 // 所以这里不再硬编码两个名字，而是遍历**全部** PRESETS（新增 preset 自动纳入）。
 test('每个内置预设都满足自己那一档的安全不变量', () => {
-  assert.ok(PRESETS.length >= 4, `PRESETS 应包含四个内置 preset，实际 ${PRESETS.join(', ')}`);
+  // 2026-11-07 合并后 PRESETS 只剩 qq-chat-agent 一个（旧四个已从 DSH 移除）。
+  // 这里不再要求「>= 4 个」，而是要求「至少有一个，且每个都过自己那一档」——
+  // 合并/拆分都不影响这条断言的意图：**装进 DSH 的预设必须全部合规**。
+  assert.ok(PRESETS.length >= 1, `PRESETS 不应为空，实际 ${PRESETS.join(', ')}`);
   for (const name of PRESETS) {
     const gen = presetTierKey(name);
     const text = fs.readFileSync(new URL(`../dsh/agent-presets/${name}/agent.cordis.yml`, import.meta.url), 'utf8');
@@ -63,6 +69,7 @@ test('各档的硬性不变量清单确实不同（防止又合并成一份）',
 
 test('preset 名 → 不变量档位：未知名字按更严的二代处理', () => {
   assert.equal(presetTierKey('qq-chat'), 'v1');
+  assert.equal(presetTierKey('qq-chat-agent'), 'readonly');
   assert.equal(presetTierKey('qq-chat-v2'), 'v2');
   assert.equal(presetTierKey('qq-chat-owner'), 'owner');
   assert.equal(presetTierKey('qq-chat-readonly'), 'readonly');
@@ -74,7 +81,11 @@ test('preset 名 → 不变量档位：未知名字按更严的二代处理', ()
 test('真实预设能定位到 persona 的 prefix 块', () => {
   const loc = locatePresetPromptBlock(source);
   assert.ok(loc, '应能定位 prefix 块');
-  assert.equal(loc.lines[loc.keyLine].trim(), 'prefix: >-');
+  // 断言必须与**写入端实际行为**一致：renderPresetPromptYaml 生成的永远是 `|-`
+  // （保留换行的字面块），从来不是 `>-`（折叠块）。
+  // 这条断言以前写的是 '>-', 与实现不符，导致这个测试长期失败 —— 属于测试自身的
+  // 期望值错误，不是预设文件的问题（旧 v2 / readonly 也都是 `|-`）。
+  assert.equal(loc.lines[loc.keyLine].trim(), 'prefix: |-');
   assert.ok(loc.blockEnd > loc.keyLine + 1, 'prefix 块应包含内容行');
   assert.ok(loc.entryEnd > loc.blockEnd, 'persona 条目应在 prefix 块之后还有内容');
 });
@@ -89,14 +100,14 @@ test('抽出的是 YAML 解析后的真实字符串（折叠标量已展开）',
 });
 
 test('原样写回是幂等的，且不改变提示词语义', () => {
-  const rewritten = renderPresetPromptYaml(source, originalPrefix);
+  const rewritten = renderPresetPromptYaml(source, originalPrefix, TIER);
   assert.equal(extractPresetPrefix(rewritten), originalPrefix, '读回应与原提示词逐字一致');
   // 再写一次仍稳定
-  assert.equal(renderPresetPromptYaml(rewritten, originalPrefix), rewritten);
+  assert.equal(renderPresetPromptYaml(rewritten, originalPrefix, TIER), rewritten);
 });
 
 test('改写只动 prefix，其它条目与文件头注释原样保留', () => {
-  const next = renderPresetPromptYaml(source, `${originalPrefix}\n\n【新增段落】测试内容。`);
+const next = renderPresetPromptYaml(source, `${originalPrefix}\n\n【新增段落】测试内容。`, TIER);
   const before = yaml.load(source);
   const after = yaml.load(next);
   assert.deepEqual(after.map((row) => row.id), before.map((row) => row.id), '条目 id 顺序不变');
@@ -129,7 +140,7 @@ test('特殊内容可安全往返（空行、缩进、Markdown、模板变量、
     '结尾不留多余空行',
   ].join('\n');
   // 必须在保留安全不变量的前提下追加特殊内容，否则会被阻断校验拦下
-  const next = renderPresetPromptYaml(source, `${originalPrefix}\n\n${tricky}`);
+const next = renderPresetPromptYaml(source, `${originalPrefix}\n\n${tricky}`, TIER);
   assert.equal(extractPresetPrefix(next), `${originalPrefix}\n\n${tricky}`);
   const rows = yaml.load(next);
   assert.equal(rows.length, yaml.load(source).length, '其它条目数量不变');
@@ -145,24 +156,28 @@ test('危险输入被拒绝，且不产生半截结果', () => {
 
 test('删掉安全不变量或正文过短时阻断保存（保护 AI 效果与自家测试）', () => {
   // 正文过短
-  assert.throws(() => renderPresetPromptYaml(source, '太短了'), /过短/);
-  // 逐条移除安全不变量，必须被拦住
-  for (const needle of PRESET_BLOCKING_SUBSTRINGS) {
+assert.throws(() => renderPresetPromptYaml(source, '太短了', TIER), /过短/);
+  // 逐条移除安全不变量，必须被拦住。
+  // 注意用**当前预设那一档**的清单（TIER），不是写死 v2 的那份：
+  // 合并后的预设是 readonly 档，它本来就没有「你没有本地工具」这句，
+  // 拿 v2 清单去替换会替换不到、断言空转。
+  for (const needle of presetBlockingSubstrings(TIER)) {
     const tampered = originalPrefix.replace(needle, '（已删除）');
+    assert.notEqual(tampered, originalPrefix, `测试前提错误：正文里找不到不变量「${needle}」`);
     assert.throws(
-      () => renderPresetPromptYaml(source, tampered),
+() => renderPresetPromptYaml(source, tampered, TIER),
       new RegExp(`缺少安全不变量「${needle}」`),
       `删除「${needle}」后仍被允许保存`,
     );
   }
   // 只做无损追加则应当通过
-  assert.doesNotThrow(() => renderPresetPromptYaml(source, `${originalPrefix}\n\n【补充】一句新规则。`));
-  const clean = presetPromptBlockers(originalPrefix);
+assert.doesNotThrow(() => renderPresetPromptYaml(source, `${originalPrefix}\n\n【补充】一句新规则。`, TIER));
+  const clean = presetPromptBlockers(originalPrefix, TIER);
   assert.deepEqual(clean, [], `内置提示词不应有阻断项，实际：${clean.join('；')}`);
 });
 
 test('写回沿用文件主导行尾，且不吞掉块尾空行', () => {
-  const next = renderPresetPromptYaml(source, originalPrefix);
+  const next = renderPresetPromptYaml(source, originalPrefix, TIER);
   const crlf = (next.match(/\r\n/g) ?? []).length;
   const lfOnly = (next.match(/\n/g) ?? []).length - crlf;
   assert.ok(crlf > 0, 'CRLF 文件写回后应仍使用 CRLF');
@@ -180,15 +195,32 @@ test('写回沿用文件主导行尾，且不吞掉块尾空行', () => {
 });
 
 test('只含空格/Tab 的行也能安全往返（不会被当成空行读丢）', () => {
+  // 取样范围必须覆盖**全部安全不变量**，否则这条测试会拿「样本没含那段」当成
+  // 「不变量被删了」来报错 —— 2026-11-12 实际踩过：作者原版 prefix 用 `>-` 折叠块，
+  // 换行全折叠成空格，解析后只有 19 行，0.~15. 整段工具协议挤在第 3 行，所以
+  // `slice(0, 3)` 恰好把「不会自动发送到 QQ」包住了。后来为了可读性改用 `|-`
+  // 并给每条之间加换行，prefix 变成 70 行，那句被推到第 6 行、跑出了取样范围，
+  // 于是这条测试失败——但失败的其实是**取样假设过时**，不是预设丢了不变量。
+  //
+  // 现在改为「按标记切到第 14 条为止」：不写死行号，格式再调整也不会误报。
+  // （14. 是工具协议段的最后一条；其后是【操作即动作】等独立小节，不含安全不变量。）
+  const allLines = originalPrefix.split('\n');
+  const lastProto = allLines.findIndex((l) => /^\s*14[.\s]/.test(l));
+  const sampleEnd = lastProto >= 0 ? lastProto + 1 : allLines.length;
+  const sample = allLines.slice(0, sampleEnd);
+  // 先自检样本：不含不变量就是取样错了，要报得明白，不能报成「不变量丢失」。
+  assert.ok(
+    sample.join('\n').includes('不会自动发送到 QQ'),
+    `取样范围（前 ${sampleEnd} 行，到第 14 条为止）未覆盖安全不变量，是取样问题，不是预设问题`,
+  );
   const spaced = [
-    ...originalPrefix.split('\n').slice(0, 3),
+    ...sample,
     '   ',
     '\t',
     ' 带前后空格的正文 ',
     '正常一行',
   ].join('\n');
-  // 前 3 行来自原文，因此安全不变量仍然齐全
-  const next = renderPresetPromptYaml(source, spaced);
+  const next = renderPresetPromptYaml(source, spaced, TIER);
   assert.equal(extractPresetPrefix(next), spaced, '空白行必须原样保留');
 });
 

@@ -138,7 +138,11 @@ export function createRecall({ dir, maxDocs = 50000 } = {}) {
         t: doc.t,
         time: doc.t ? new Date(doc.t).toLocaleString('zh-CN', { hour12: false }) : '',
         role: doc.kind === 'ai' ? 'ai' : 'human',
-        sender: doc.meta?.sender || doc.meta?.nickname || '',
+        // 2026-11-13 修：原来只找 meta.sender / meta.nickname，
+        // 而 QQ 记录根本没有这两个字段（它们来自 DSH 侧的事件格式）——
+        // 于是每条都退化成"某人"，她搜原文永远看不出是谁说的。
+        // 真实昵称就在记录顶层的 `role` 字段里（鹿 / 7月1 / 角色A…）。
+        sender: doc.meta?.sender || doc.meta?.nickname || String(doc.role || '').trim() || '',
         text: String(doc.text).slice(0, 400),
         seq: doc.seq,
         coverage: Number(coverage.toFixed(3))

@@ -45,15 +45,15 @@ if (!cookie) {
 console.log(`✓ Cookie 已离线铸造（${cookie.slice(0, 16)}…）\n`)
 
 const targets = [
-  ['GET', '/dsh-thinking-zh/state'],
-  ['GET', '/dsh-thinking-zh/qq-bigfish'],
-  ['GET', '/dsh-thinking-zh/qq-bigfish/settings'],
-  ['GET', '/dsh-thinking-zh/qq-bigfish/persona'],
-  ['GET', '/dsh-thinking-zh/qq-bigfish/tokens'],
-  ['GET', '/dsh-thinking-zh/qq-bigfish/stickers'],
-  ['GET', '/dsh-thinking-zh/qq-bigfish/access'],
-  ['GET', '/dsh-thinking-zh/qq-bigfish/backend'],
-  ['GET', '/dsh-thinking-zh/qq-bigfish/diagnose'],
+  ['GET', '/qq-dsh-panel/state'],
+  ['GET', '/qq-dsh-panel/qq-bigfish'],
+  ['GET', '/qq-dsh-panel/qq-bigfish/settings'],
+  ['GET', '/qq-dsh-panel/qq-bigfish/persona'],
+  ['GET', '/qq-dsh-panel/qq-bigfish/tokens'],
+  ['GET', '/qq-dsh-panel/qq-bigfish/stickers'],
+  ['GET', '/qq-dsh-panel/qq-bigfish/access'],
+  ['GET', '/qq-dsh-panel/qq-bigfish/backend'],
+  ['GET', '/qq-dsh-panel/qq-bigfish/diagnose'],
 ]
 
 let ok = 0

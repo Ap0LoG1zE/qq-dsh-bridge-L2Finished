@@ -22,7 +22,50 @@ function presetStatusFixture(preset) {
   };
 }
 
-// ── 令牌与花费：离线示例数据 ──────────────────────────────────────────────
+// ── 好感度：离线示例数据 ──────────────────────────────────────────────────
+// 字段口径与 bridge.js 的 GET /api/socialV2/affinity 一致（people/stages/text + 单人形态）。
+// 分数刻意铺开五档，让刻度尺、徽章、进度条在预览里都有东西可看。
+const AFFINITY_STAGES_FIXTURE = [
+  { id: 'distant', label: '疏远', min: -20 },
+  { id: 'neutral', label: '平淡', min: 0 },
+  { id: 'caring', label: '在意', min: 30 },
+  { id: 'reliant', label: '依赖', min: 90 },
+  { id: 'lover', label: '喜欢', min: 400 },
+  { id: 'beloved', label: '偏爱', min: 1000 },
+];
+function affinityStageOfFixture(score) {
+  const n = Number(score) || 0;
+  if (n >= 1000) return { id: 'beloved', label: '偏爱' };
+  if (n >= 400) return { id: 'lover', label: '喜欢' };
+  if (n >= 90) return { id: 'reliant', label: '依赖' };
+  if (n >= 30) return { id: 'caring', label: '在意' };
+  if (n >= 0) return { id: 'neutral', label: '平淡' };
+  return { id: 'distant', label: '疏远' };
+}
+function affinityPeopleFixture() {
+  const now = Date.parse(timestamp);
+  return [
+    { userId: '10001', label: '主人', score: 1080, count: 62, lastAt: now - 3_600_000, manualAt: 0 },
+    { userId: '10002', label: '10002', score: 96, count: 8, lastAt: now - 7_200_000, manualAt: 0 },
+    { userId: '10003', label: '10003', score: 12, count: 3, lastAt: now - 86_400_000, manualAt: now - 40_000_000 },
+    { userId: '10004', label: '10004', score: -6, count: 1, lastAt: now - 172_800_000, manualAt: 0 },
+  ].map((p) => ({ ...p, stage: affinityStageOfFixture(p.score).id, stageLabel: affinityStageOfFixture(p.score).label }));
+}
+function affinityFixture(url) {
+  const key = url.searchParams.get('key') || 'group:123456789';
+  const people = affinityPeopleFixture();
+  const wantUser = url.searchParams.get('userId');
+  if (wantUser) {
+    const p = people.find((x) => String(x.userId) === String(wantUser));
+    return p
+      ? { ok: true, key, userId: wantUser, label: p.label, stage: p.stage, stageLabel: p.stageLabel, score: p.score, count: p.count, lastAt: p.lastAt, manualAt: p.manualAt, stages: AFFINITY_STAGES_FIXTURE, text: `${p.label}：${p.stageLabel}\n  互动 ${p.count} 次` }
+      : { ok: true, key, userId: wantUser, label: wantUser, stage: 'new', stageLabel: '没聊过', score: 0, count: 0, lastAt: 0, manualAt: 0, stages: AFFINITY_STAGES_FIXTURE, text: `${wantUser}：还没有互动记录。` };
+  }
+  const text = people.length ? people.map((p) => `${p.label}：${p.stageLabel}`).join('\n') : '还没有任何互动记录。';
+  return { ok: true, key, total: people.length, people, stages: AFFINITY_STAGES_FIXTURE, text };
+}
+
+
 // 字段口径与 src/token-ledger.js 的 summary()/conversation()/recent() 保持一致，
 // 这样控制台渲染路径在离线预览与真实环境走的是同一套形状。
 const USAGE_SYMBOL = '¥';
@@ -452,9 +495,11 @@ export async function startConsoleFixture({ port = 0, original = false, htmlPath
           case '/api/social': return json({ config: state.social, states: state.socialStates, pendingSummaries: { 'group:123456789': 2 } });
           case '/api/socialV2/config': return json({ ok: true, config: state.v2 });
           case '/api/socialV2/activity': return json({ ok: true, paused: state.paused });
+          case '/api/socialV2/tts': return json({ ok: true, enabled: false, ready: false, baseUrl: 'http://127.0.0.1:9872' });
           case '/api/socialV2/tool-log': return json({ ok: true, entries: state.toolLog });
           case '/api/socialV2/feedback': return json({ ok: true, entries: state.feedback });
           case '/api/socialV2/memory': return json({ ok: true, raw: { activeTopics: [{ text: '周末的阅读计划', pendingQuestion: '有没有推荐的书？' }], pendingThoughts: [{ text: '分享一张风景照片', motivation: '轻松交流' }], memberImpressions: { 演示群友: { traits: ['友善', '喜欢技术'], interactionCount: 6 } } } });
+          case '/api/socialV2/affinity': return json(affinityFixture(url));
           case '/api/socialV2/state': return json({ ok: true, key: url.searchParams.get('key'), wakeConfig: { mode: 'diving', infinite: false, sleepUntil: '2026-09-20T09:00:00.000Z', triggers: { atMention: true, keywords: ['小鲸鱼'] }, wakeCount: 4 }, wakeSafety: { guaranteed: true }, unreadCount: 2, lastWakeReason: 'atMention' });
           case '/api/socialV2/states': return json({ ok: true, conversations: state.sessions.map(x => ({ key: x.key, phase: 'diving', unreadCount: 2 })) });
           case '/api/socialV2/initial-prompt': {
@@ -474,19 +519,6 @@ export async function startConsoleFixture({ port = 0, original = false, htmlPath
               createdAt: Date.now(), updatedAt: Date.now(), maxChars: 2000, writable: true
             });
           }
-          // 语音库（离线示例：不含任何真实音频路径）
-          case '/api/voice/list':
-          case '/api/socialV2/voices': return json({
-            ok: true,
-            key: url.searchParams.get('key') || 'group:123456789',
-            count: 2,
-            voices: [
-              { name: '演示-问候.mp3', ok: true, bytes: 20480, detail: '2秒 · 20.0 KB · mp3 · 24.0kHz · 单声道', seconds: 2 },
-              { name: '演示-太长.wav', ok: false, bytes: 99999999, error: '时长 12分00秒 超过上限 5分00秒' },
-            ],
-            limits: { maxSeconds: 300, maxBytes: 20971520, maxPerMinute: 2, maxPerHour: 10 },
-            hint: '用 qq_send_voice 传 name 即可把其中一个当语音发出去',
-          });
           case '/api/slang': return json({ ok: true, entries: state.slang, config: state.slangConfig });
           // state/ 的 ACL 收紧结果：用离线示例值演示「未收紧」的告警条（Windows 上未提权时的真实情况）
           // 命令本身必须来自 `src/state-acl.mjs`，不能在这里另抄一份：这里曾经抄的是
@@ -571,10 +603,6 @@ export async function startConsoleFixture({ port = 0, original = false, htmlPath
             return json({ ok: true });
           case '/api/console/token': return json({ ok: true, token: body.token || 'offline-demo-token-123456', generated: !body.token });
           case '/api/test-send': return json({ ok: true, message_id: 'mock-message-001' });
-          // 语音试发（操作者通道）：离线只回执，不产生任何真实 QQ 消息
-          case '/api/voice/send': return json(body.dryRun
-            ? { ok: true, dryRun: true, target: body.target, file: body.file, detail: '2秒 · 20.0 KB · mp3 · 24.0kHz · 单声道', verified: false }
-            : { ok: true, target: body.target, file: body.file, detail: '2秒 · 20.0 KB · mp3', messageId: 9001, verified: true, limits: { maxSeconds: 300, maxBytes: 20971520, maxPerMinute: 2, maxPerHour: 10 } });
           case '/api/console/notify-ai': return json({ ok: true, sessionId: 'mock-dsh-session' });
           case '/api/restart': return json({ ok: true, message: '离线预览：已模拟重启，实际服务未改变。' });
           case '/api/workspace/reset': state.sessions = []; return json({ ok: true, archivedCount: 3 });
@@ -594,6 +622,14 @@ export async function startConsoleFixture({ port = 0, original = false, htmlPath
           case '/api/socialV2/memory-clear':
           case '/api/socialV2/memory-update':
           case '/api/socialV2/memory-remove': return json({ ok: true });
+          // 纯语音开关：离线预览固定"已关闭、服务未就绪"，不去真拉 TTS 进程。
+          case '/api/socialV2/tts': return json({ ok: true, enabled: false, ready: false, baseUrl: 'http://127.0.0.1:9872' });
+          // 好感度手工调整：离线预览里回显一次即可（真实桥接会写 state/social-v2.json）。
+          case '/api/socialV2/affinity': {
+            const score = Math.max(-20, Math.min(600, Math.round(Number(body.score) || 0)));
+            const stage = affinityStageOfFixture(score);
+            return json({ ok: true, key: body.key, userId: body.userId, label: String(body.userId) === '10001' ? '主人' : body.userId, score, stage: stage.id, stageLabel: stage.label, written: [body.key], text: `${body.userId}：${stage.label}` });
+          }
           case '/api/tokens/reset': return json({ ok: true });
         }
       }
