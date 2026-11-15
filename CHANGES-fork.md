@@ -407,8 +407,12 @@ qq_recall_message(key, token, text)   →   "✅ 已撤回"
 
 | 原 | 现 |
 |---|---|
-| `dsh-plugins/qq-dsh-panel` | `dsh-plugins/qq-dsh-panel` |
-| 预设 id `qq-chat-agent` | `qq-chat-agent` |
+| 插件目录 `<旧角色名>-control-panel` | `dsh-plugins/qq-dsh-panel` |
+| 预设 id `qq-chat-<旧角色名>` | `qq-chat-agent` |
+
+> 旧名里含作者的角色名，这里不写出原文。如果你是从更早的版本升级上来、
+> 想确认自己有没有残留旧引用，用这条命令查（把 `<旧名>` 换成你记忆里的那个）：
+> `git grep -rn '<旧名>'` —— 命中说明还有地方没改，需要同步成新名。
 
 **脱敏**：作者的 QQ 号 / 群号 / 机器人 QQ / GitHub 用户名 / 角色名 / 群友 QQ
 全部换成占位符（`10001` / `20001` / `30001` / `70001~70008` / `角色A` / `群友A`）。
