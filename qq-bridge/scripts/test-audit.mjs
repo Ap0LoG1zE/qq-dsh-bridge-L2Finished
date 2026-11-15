@@ -16,6 +16,19 @@ const tests = [
   'test-dsh-inbox-projection.mjs',
   'test-md-to-plain.mjs', 'test-mux-reconnect.mjs',
   'test-token-economy.mjs', 'test-qq-model-view.mjs', 'test-qq-preset-contract.mjs',
+  // 收尾前观望（2026-11-14）：mark_read / set_wake_config 的 10 秒空转抓到新消息后
+  // **必须贴给模型**。旧实现把 observeBeforeSleepV2 的返回值扔掉，指望下面的
+  // uncovered 分支，而那道分支在 anyMessage/active 会话（私聊正是）上恒不成立
+  // ⇒ 观望第 1 秒来的消息被静默标成已读、她只收到一句「收尾完成」。
+  'test-observe-before-sleep.mjs',
+  // 发送后提示已全部砍掉（2026-11-14 操作者要求）：拆句提醒 / 中文空格提醒。
+  // 这两条都是**发完之后**才生成，撤不回也改不了，纯占上下文。用例用"旧实现必报警"
+  // 的三组输入去撞返回，断言 warn / splitWarn / hint 都不存在，同时确认
+  // 观望贴消息的 `text` 没被误伤。
+  'test-no-post-send-hints.mjs',
+  // 撤回自己刚发的消息（2026-11-15）：只按 **seq** 撤（她唯一看得到的句柄），
+  // message_id 藏在桥接内部；只能撤自己发的；超过 2 分钟直接拦下不尝试。
+  'test-recall-message.mjs',
   'test-reply-wait.mjs', 'test-preset-prompt.mjs', 'test-role-card.mjs',
   // 预设完整性：按"累积改动清单"核对，防止改一处把别处弄没（2026-11-12 加）。
   // 起因：拿旧备份回滚时，把操作者在控制台改的记忆段落整段盖掉了。

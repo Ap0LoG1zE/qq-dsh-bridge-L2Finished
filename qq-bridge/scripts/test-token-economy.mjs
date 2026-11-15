@@ -15,6 +15,11 @@ let tests = 0;
 async function test(name, run, { observe = false } = {}) {
   tests++;
   const h = await bridgeHarness({ config: { socialV2: {
+    // 收尾前观望（qq_mark_read / qq_set_wake_config 的 10 秒空转）在这里关掉。
+    // 本文件测的是**水位与未读语义**，不是观望；而观望会把每次 mark-read 拖到 10 秒，
+    // 超过下面 request 的 4 秒预算 ⇒ 整文件 26 个用例集体超时（断言根本没跑到）。
+    // 观望本身的回归在 test-observe-before-sleep.mjs 里单独测。
+    observeBeforeSleepMs: 0,
     wake: { preSleepWaitEnabled: observe, preSleepWaitMs: 1000 },
     wait: { minMs: 100, maxMs: 2000, minQuietAfterNewMs: 0 },
     proactive: { enabled: false },

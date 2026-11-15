@@ -357,6 +357,7 @@ const TOOL_CONFIG_FLAGS = {
   qq_set_wake_config: 'setWakeConfig',
   qq_send_burst: 'sendBurst',
   qq_send_message: 'sendMessage',
+  qq_recall_message: 'recallMessage',
   qq_wait_for_messages: 'waitMessages',
   qq_report_feedback: 'feedback',
   qq_get_my_recent_messages: 'getMyRecent',
@@ -710,7 +711,7 @@ server.tool(
 
 server.tool(
   'qq_get_unread_messages',
-  '查看未读消息，不自动标记已读。返回的是和【本轮消息】一样的文本行（`[群] #123 某人 userId:10001·时间（多久前）：内容`），首行带「读到 #N」水位。**只返回还没出现在你上下文里的那些**：已经写进【本轮消息】的消息不会再给一遍，所以看到「没有新消息」不代表真的没有（对比 unreadCount 和 skippedSeen）。典型用法：快照写着「还有消息没显示」或 partial=true 时，用 afterSeq=readThroughSeq 从水位后补读；从最早未读开始传 0。想重看某条已展示过的消息，用 qq_get_recent_messages 或 qq_get_message_detail。',
+  '查看未读消息，不自动标记已读。返回的是和【本轮消息】一样的文本行（`[群] #123 某人·时间（多久前）：内容`），首行带「读到 #N」水位。**只返回还没出现在你上下文里的那些**：已经写进【本轮消息】的消息不会再给一遍，所以看到「没有新消息」不代表真的没有（对比 unreadCount 和 skippedSeen）。典型用法：快照写着「还有消息没显示」或 partial=true 时，用 afterSeq=readThroughSeq 从水位后补读；从最早未读开始传 0。想重看某条已展示过的消息，用 qq_get_recent_messages 或 qq_get_message_detail。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【令牌】）'),
@@ -798,10 +799,19 @@ server.tool(
   },
   async ({ key, token, throughSeq }) => {
     try {
-      // 2026-11-12：这两个收尾工具会先等约 10 秒观望新消息（见 bridge.js 的
-      // observeBeforeSleepV2），必须给足超时，否则必然报「请求超时」（观望 10s + 余量 → 25s）。
-      // 其他工具仍用默认 15s —— 它们不等待，RTT 通常 <1s，不该跟着变长。
-      const data = await agentApi('/api/socialV2/mark-read', { method: 'POST', body: JSON.stringify({ key, throughSeq }), headers: { 'x-agent-token': token }, timeoutMs: 25000 });
+      // 2026-11-12：这两个收尾工具会先观望新消息（见 bridge.js 的 observeBeforeSleepV2），
+      // 必须给足超时，否则必然报「请求超时」。
+      //
+      // ⚠️ 2026-11-14：观望语义改成「安静窗」后上限变长了：
+      //   · observeBeforeSleepMs（没人说话干等，默认 10s）
+      //   · observeQuietMs（来消息后等安静，默认 5s，连发时每来一条就重置）
+      //   · observeHardCapMs（总时长硬上限，默认 20s，bridge 侧 clamp 到 ≤20000）
+      // 所以最坏情况是 20s 才回，原来 25s 只剩 5s 余量 —— 事件循环忙一下
+      // （同时在做 TTS/抽帧/发消息）就可能被 AbortSignal 掐断，模型看到的是「超时」，
+      // 而桥接其实已经把消息贴出去了，白丢一次结果。
+      // 提到 32s：20s 硬上限 + 12s 余量。比这更大的观望上限会被 bridge 的
+      // clamp（≤20000）挡掉，所以 32s 覆盖了所有合法配置。
+      const data = await agentApi('/api/socialV2/mark-read', { method: 'POST', body: JSON.stringify({ key, throughSeq }), headers: { 'x-agent-token': token }, timeoutMs: 32000 });
       // 2026-11-12 精简：直接回桥接给的纯文本，不再 serializeModelData。
       // 原来会把 {ok, key, markedCount, readThroughSeq, unreadCount} 整个 JSON 塞进上下文，
       // 而那几个字段和 text 里那句话完全重复（key 是她自己传的、unreadCount 成功时恒为 0）。
@@ -859,8 +869,9 @@ server.tool(
   },
   async ({ key, token, config, throughSeq }) => {
     try {
-      // 同上：set_wake_config 也会先观望 10 秒。给它单独的 25s 预算。
-      const data = await agentApi('/api/socialV2/wake-config', { method: 'POST', body: JSON.stringify({ key, config, throughSeq }), headers: { 'x-agent-token': token }, timeoutMs: 25000 });
+      // 同上（见 mark_read 那处）：观望上限已从「固定 10s」变成
+      // 「安静窗 + 20s 硬上限」，统一给 32s 预算。
+      const data = await agentApi('/api/socialV2/wake-config', { method: 'POST', body: JSON.stringify({ key, config, throughSeq }), headers: { 'x-agent-token': token }, timeoutMs: 32000 });
       // 2026-11-12 精简：同 mark_read —— 直接回桥接给的纯文本。
       // 这一句里已经有「标记几条、什么模式、读到哪个水位、当前唤醒条件」，
       // 再套一层 {ok, key, markedCount, readThroughSeq, unreadCount, text} 只是把
@@ -920,7 +931,21 @@ server.tool(
         headers: { 'x-agent-token': token },
         timeoutMs: 300000
       });
-      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      // 2026-11-14：只挑她用得上的，别把整个 JSON 回显（ok/key/delays 都是噪音）。
+      // 发送后那 5 秒观望里如果来了新消息，`text` 里就是 `【N 条新消息】` + 消息行，
+      // 与 qq_mark_read 的格式完全一致，直接接在后面。
+      //
+      // ⚠️ 2026-11-14 二次改（操作者要求）：**不再回显任何发送后提示**。
+      // 这里原来还遍历 `['hint','warn','splitWarn']` 把桥接的软提醒拼上来，
+      // 比如「第 1、2 条之间像是把同一句话拆开了…」「消息内部有中文空格…」。
+      // 操作者的意见是：**这条消息已经发出去了，提示既撤不回也改不了，纯占上下文。**
+      // 桥接侧那两个检测函数已经连根删掉（见 bridge.js 的说明），
+      // 这里也不再把它们当字段读 —— 两边都清掉，以后不会有人以为"还能拿到"。
+      const sentN = Number(data?.sent) || 0;
+      const failedN = Number(data?.failed) || 0;
+      const parts = [failedN > 0 ? `⚠️ 发出 ${sentN} 条，${failedN} 条失败。` : `✅ 已发出 ${sentN} 条。`];
+      if (data?.text) parts.push(String(data.text));
+      return { content: [{ type: 'text', text: parts.join('\n') }] };
     } catch (error) {
       return { content: [{ type: 'text', text: `分条发送失败：${error?.message ?? error}` }], isError: true };
     }
@@ -972,22 +997,61 @@ server.tool(
       //   ok / key      她传进去的参数，回显没意义
       //   delays        每条之间的随机间隔毫秒数 —— 纯内部调度数据，她读了也不做决策
       //   quoted        引用目标的信息 —— 引用是她自己指定或桥接自动选的
-      // 保留 sent/failed（发成功几条）和三种提醒（连发过多 / 中文间空格 / 断句不当），
-      // 那些是她真的会据此调整行为的。
+      //
+      // ⚠️ 2026-11-14（操作者要求）：原来这里还遍历 `['hint','warn','splitWarn']`
+      // 拼上"发完之后才生成"的软提醒（拆句 / 中文空格）。这些**一点用都没有**：
+      // 消息已经在 QQ 上了，提示撤不回也改不了，还每轮占上下文。
+      // 桥接侧的检测函数已连根删除，这里也不再读那几个字段。
       const sentN = Number(data?.sent) || 0;
       const failedN = Number(data?.failed) || 0;
       const parts = [];
       parts.push(failedN > 0 ? `⚠️ 发出 ${sentN} 条，${failedN} 条失败。` : `✅ 已发出 ${sentN} 条。`);
-      for (const k of ['hint', 'warn', 'splitWarn']) {
-        const v = data?.[k];
-        if (v) parts.push(String(v));
-      }
+      // 2026-11-14：发送后的观望结果。
+      // 空转那 5 秒里如果有新消息进来，桥接会以和 qq_mark_read 完全相同的格式
+      // 贴回来（`【N 条新消息】` + 消息行）。这里原样接在后面 —— 她看到就知道
+      // 对方已经接话了，可以继续回，不必等下一次唤醒。
+      if (data?.text) parts.push(String(data.text));
       return { content: [{ type: 'text', text: parts.join('\n') }] };
     } catch (error) {
       return { content: [{ type: 'text', text: `发送失败：${error?.message ?? error}` }], isError: true };
     }
   }
 );
+
+// ── 撤回自己刚发出的消息（2026-11-15）────────────────────────────────
+//
+// 设计约束（操作者定的）：
+//   · **按原文撤回**：她把自己刚说过的那句话传进来，桥接自动匹配是哪一条。
+//     不用 seq（她自己的消息本来就没有 seq，那是入站未读水位的编号），
+//     也不用 message_id（一长串可能为负的数字，让她记没意义）。
+//   · 输入输出都要精简：三个参数，回一句结果。
+//   · 超过 2 分钟的直接不管（QQ 的撤回时限就是 2 分钟，提前拦下省一次往返）。
+if (cfg.socialV2?.tools?.recallMessage !== false) {
+  server.tool(
+    'qq_recall_message',
+    '撤回自己刚发出的一条消息（2 分钟内）。text 传你刚说的那句原文（或其中一段），桥接会自动找到是哪条。只记得最近 2 分钟内自己发的内容。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【令牌】）'),
+      text: z.string().describe('要撤回的那句话原文，或其中一段')
+    },
+    async ({ key, token, text }) => {
+      try {
+        const data = await agentApi('/api/socialV2/recall-message', {
+          method: 'POST',
+          body: JSON.stringify({ key, text }),
+          headers: { 'x-agent-token': token },
+          // 撤回是轻量 API 调用（不像发送后要空转），15 秒足够。
+          timeoutMs: 15000
+        });
+        return { content: [{ type: 'text', text: data?.text ? String(data.text) : '✅ 已撤回' }] };
+      } catch (error) {
+        // 失败原因桥接已压成一句中文（超过 2 分钟 / 没找到 / 撤不了），直接透传。
+        return { content: [{ type: 'text', text: String(error?.message ?? error) }] };
+      }
+    }
+  );
+}
 
 if (cfg.socialV2?.tools?.sendPoke !== false) {
   server.tool(

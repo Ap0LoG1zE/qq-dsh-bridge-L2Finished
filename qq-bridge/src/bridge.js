@@ -1,4 +1,4 @@
-// QQ ↔ DeepSeek Harness 桥接主程序。
+﻿// QQ ↔ DeepSeek Harness 桥接主程序。
 //
 // 链路：
 //   QQ 消息 → SnowLuma (OneBot v11 WS) → 本进程 → DSH Web API session.prompt
@@ -1004,6 +1004,14 @@ function loadConfig() {
       // 纯语音（文字 → 睦的声音）：她照常打字，桥接把文字合成语音再发。
       // 默认关闭。开关在控制台「运行概览 → 暂停/恢复」那一排。
       tts: { ...TTS_DEFAULTS },
+      // ── 收尾前观望（mark_read / set_wake_config 的"空转"）───────────────
+      // 三个值原来有两处是硬编码的 `?? 10000` 兜底，配置里根本没有声明，
+      // 于是控制台看不到、也没法调。现在显式列出来。
+      observeBeforeSleepMs: 10000,   // 没人说话时干等多久（没来消息就照常收尾）
+      observeQuietMs: 5000,          // 来了消息后，等它安静多久再合并贴给她
+      // 总时长硬上限。必须 < mcp-snowluma-safe.js 里 mark_read / wake-config 的
+      // timeoutMs(25000)，否则工具会先被 AbortSignal 掐断，模型只看到「超时」。
+      observeHardCapMs: 20000,
       wake: {
         defaultMode: 'diving',
         preSleepWaitEnabled: true,      // 沉睡前强制观察窗口开关：防止 AI 聊两句就潜水
@@ -1056,13 +1064,41 @@ function loadConfig() {
         longGapMaxMs: 10000,
         maxSendPerMinute: 8,
         maxSendPerHour: 60,
-        // 同一会话两次发送之间的最小间隔（2026-11-13）。0 = 关闭。
-        // 5 秒是操作者定的：既能挡住观望循环里的连发，又不至于让正常对话明显变慢。
-        minSendIntervalMs: 5000,
+        // 同一会话**两次工具调用**之间至少隔多久（跨回合防砸屏）。
+        //
+        // ⚠️ 2026-11-15 澄清：这个值**不是**"数组内多条消息之间的间隔"
+        // （那个由 burstIntervalMinMs/MaxMs/maxGapMs 管，上限 10 秒），
+        // 也**不是**"发送后空转多久"（那个是下面的 observeAfterSendMs）。
+        // 她一次调用发 3 条数组时，条与条之间只隔 1~3 秒，和这里无关。
+        //
+        // 注意：负责读它的 sendThrottleRemainMsV2 目前**没有调用方**（死代码），
+        // 所以实际生效的只有发送后空转（用 observeAfterSendMs）。保留这个键是
+        // 为了控制台面板还能看/改，以及以后要接回节流时不至于缺字段。
+        minSendIntervalMs: 10000,
+        // 发送后空转多久看对方接不接（2026-11-15 操作者定 30 秒）。
+        //
+        // 语义：`Σ(数组内间隔) + 这 30 秒`。间隔部分由 sendMessagesV2 真的 sleep 掉，
+        // 所以这里只补 30 秒那一截。详细推演见 paceAfterSendV2 的注释。
+        //
+        // 20 → 30（2026-11-15 第二次调整）：操作者说"每次聊天得发很快才能卡在
+        // 5 秒内"，说明等待窗口整体不够用。两处一起放宽：
+        //   空转 20→30（没新消息时干等多久）
+        //   安静窗 5→10（来了消息后等它安静多久，见下面的 observeQuietMs）
+        observeAfterSendMs: 30000,
         maxMessageChars: 500,
         maxGapMs: 10000,
         gapBaseMs: 800,
         gapPerCharMs: 20,
+        // 发送后空转期间，**来了一条消息之后再等多久**才算对方说完。
+        //
+        // 语义：每来一条新消息就把计时器重置为这个值；安静满它才返回，
+        // 把那几条合并成一次贴给她。所以操作者"两条消息间隔超过它就看不到"
+        // 的观感是对的 —— 5 秒太紧（打字快一点就接不上），现在 10 秒。
+        //
+        // 上限：paceAfterSendV2 里 hardCapMs = observeAfterSendMs + 这个值
+        // = 30 + 10 = 40 秒，这是单次发送工具调用的最长耗时。
+        // MCP 侧 agentApi 是 300 秒、DSH toolCallTimeoutMs 是 725 秒，余量充足。
+        observeQuietMs: 10000,
         recommendedHint: '普通闲聊建议一次 1~3 条，条间 1~3 秒；讲故事/回忆可以 5~10 秒间隔；不要连续刷屏。'
       },
       wait: {
@@ -3070,7 +3106,10 @@ async function main() {
     const st = socialV2.conversations.get(key);
     if (st) {
       // 保留旧 token 在脱敏集合中，但撤销它的调用权限。
-      st.agentToken = crypto.randomBytes(24).toString('hex');
+      // 2026-11-15：token 从 48 字符缩到 8 字符（操作者要求省上下文）。
+      // 8 位十六进制 = 40 亿种，配合「只接受本机会话 + 白名单」够用；
+      // 原来 48 字符 × 每次工具调用，300 次就是 14k 字符的白烧。
+      st.agentToken = crypto.randomBytes(4).toString('hex');
       rememberAgentToken(key, st.agentToken);
       st.bootstrapSent = false;
       // 共用会话：整组一起复位。只复位自己会让组里其它 key 仍然「已引导」，
@@ -4543,7 +4582,7 @@ async function main() {
           // tools：只接受布尔开关
           // 注意 'fact' 已移除（2026-11-10）：长期事实并入 qq_memory_append 的 longTerm 类别，
           // 写入闸门走 'memory'。留在这里会让旧配置的 tools.fact 被重新写回。
-          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'sendFile'];
+          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'sendFile', 'recallMessage'];
           if (body.tools && typeof body.tools === 'object') {
             merged.tools = { ...(current.tools ?? {}), ...body.tools };
             for (const k of toolFlags) {
@@ -4571,10 +4610,22 @@ async function main() {
             if (merged.wake.defaultMode !== 'active') merged.wake.defaultMode = 'diving';
             if (merged.wake.recommendedHint !== undefined) merged.wake.recommendedHint = String(merged.wake.recommendedHint ?? '');
           }
+          // 收尾前观望（2026-11-14）：三个毫秒值都走统一归一化。
+          // 硬上限额外 clamp 到 20 秒以内 —— MCP 那边 mark_read / wake-config
+          // 是 timeoutMs:25000，配置成更大就会变成「工具超时、消息丢掉」。
+          for (const k of ['observeBeforeSleepMs', 'observeQuietMs', 'observeHardCapMs']) {
+            if (body[k] !== undefined) {
+              const n = Number(body[k]);
+              merged[k] = Number.isFinite(n) ? Math.max(0, Math.round(n)) : current[k] ?? 0;
+            }
+          }
+          if (merged.observeHardCapMs !== undefined) {
+            merged.observeHardCapMs = Math.min(20000, Math.max(0, merged.observeHardCapMs));
+          }
           // send：数值归一化
           if (body.send && typeof body.send === 'object') {
             merged.send = { ...(current.send ?? {}), ...body.send };
-            for (const k of ['burstMaxMessages', 'burstIntervalMinMs', 'burstIntervalMaxMs', 'longGapProbability', 'longGapMinMs', 'longGapMaxMs', 'maxSendPerMinute', 'maxSendPerHour', 'maxMessageChars', 'maxGapMs', 'gapBaseMs', 'gapPerCharMs']) {
+            for (const k of ['burstMaxMessages', 'burstIntervalMinMs', 'burstIntervalMaxMs', 'longGapProbability', 'longGapMinMs', 'longGapMaxMs', 'maxSendPerMinute', 'maxSendPerHour', 'maxMessageChars', 'maxGapMs', 'gapBaseMs', 'gapPerCharMs', 'minSendIntervalMs', 'observeQuietMs', 'observeAfterSendMs']) {
               if (merged.send[k] !== undefined) {
                 const n = Number(merged.send[k]);
                 merged.send[k] = Number.isFinite(n) ? n : current.send?.[k] ?? 0;
@@ -4689,7 +4740,7 @@ async function main() {
             'recommendedSleepMinMs', 'recommendedSleepMaxMs',
             'recommendedProbability', 'recommendedKeywords',
             'recommendedAtMention', 'recommendedNameMention', 'recommendedQuestion', 'recommendedPoke',
-            'sleepMinMs', 'sleepMaxMs', 'batchWindowMs'
+            'sleepMinMs', 'sleepMaxMs', 'batchWindowMs',
           ];
           const wakeDefaultChanged = body.wake && typeof body.wake === 'object' &&
             WAKE_DEFAULT_KEYS.some((k) => Object.prototype.hasOwnProperty.call(body.wake, k));
@@ -4889,6 +4940,7 @@ async function main() {
             reply: 'qq_reply',
             sendBurst: 'qq_send_burst',
             sendMessage: 'qq_send_message',
+            recallMessage: 'qq_recall_message',
             waitMessages: 'qq_wait_for_messages',
             feedback: 'qq_report_feedback',
             getMyRecent: 'qq_get_my_recent_messages',
@@ -5333,19 +5385,22 @@ async function main() {
           // （旧 preset 与「没有水位」的收尾调用；见 acknowledgeMessagesV2 的注释与
           // test-token-economy 的 legacy 用例）。当前 preset 会明确要求带上 readThroughSeq 水位。
           const throughSeq = requestedReadThroughSeqV2(st, body, !!req.headers['x-agent-token']);
-          // ── 收尾前观望 10 秒（2026-11-12）──────────────────────────────────
-          // 操作者方案：即使没返回新消息，也先空转 10 秒；
-          // 这期间桥接收到新消息，就把那几条给她，让她决定接不接。
-          // 没来消息就照常收尾。
+          // ── 收尾前观望：**已删除**（2026-11-15，操作者要求）────────────────
           //
-          // 放在算 uncovered 之前：等完再统计，才能把观望期间到的消息算进去。
-          // 只在"她打算收尾"时才等（有 throughSeq，或唤醒配置是潜水），
-          // 控制台的普通调用不付这个延迟。
-          if (req.headers['x-agent-token'] && !body.skipObserve) {
-            // 观望：等 10 秒看有没有新消息。来了就继续往下（下面的 uncovered
-            // 分支会把它们贴给她），不再单独回一次 —— 否则同一批消息会被写两遍。
-            await observeBeforeSleepV2(st, key, Number(cfg.socialV2?.observeBeforeSleepMs ?? 10000));
-          }
+          // 这里原来会 `await observeForCloseV2(st, key)` 空转 10~20 秒盯新消息，
+          // 抓到就把那几条贴在返回里。现在整个去掉了，原因：
+          //
+          //   ① **它解决不了问题**。操作者实测：如果消息落在「两个工具调用之间」，
+          //      它照样进 unread，然后要等**下一次**等待才被带出来 ——
+          //      见 2026-11-15 那条 `【2 条新消息】#127 / #131` 的例子。
+          //      也就是说观望只覆盖了"收尾这一瞬间"，覆盖不了真正的空隙，
+          //      而空隙才是丢消息的地方。
+          //   ② **它很贵**。每次收尾都白等 10 秒起步（连发时更久），一天上百次收尾
+          //      就是几十分钟的纯空转；而这期间她什么也做不了。
+          //   ③ 真要"等对方说完"，正确工具是 `qq_wait_for_messages(purpose="reply")`，
+          //      它有明确的静默窗语义，而且是她**主动**要等。
+          //
+          // 删掉之后，收尾的行为回到最朴素的：算 uncovered → 没读的贴出来 → 标已读。
           // 如果当前已经是“潜水”唤醒配置，且还有**模型没看过**的消息，不允许用 mark_read 直接收尾，
           // 避免把没看到的消息一起标成已读。
           //
@@ -5357,7 +5412,13 @@ async function main() {
           const uncovered = (st.unread || []).filter((m) => !seenSet.has(m.seq));
           const uncoveredSeq = uncovered.reduce((mx, m) => Math.max(mx, Number(m.seq) || 0), 0);
           const coverAll = Number.isSafeInteger(throughSeq) && throughSeq >= uncoveredSeq;
-          if (isSleepingConfigV2(st.wakeConfig) && preSleepWaitBlockedV2(st, key) && !coverAll) {
+          log(`[mark] ${key} throughSeq=${throughSeq} uncovered=` + JSON.stringify(uncovered.map((m) => m.seq)) + ` uncoveredSeq=${uncoveredSeq} coverAll=${coverAll} sleeping=${isSleepingConfigV2(st.wakeConfig)} blocked=${preSleepWaitBlockedV2(st, key)}`);
+          // 判定（2026-11-15 简化）：原来这里还有一道 `observedFresh.length > 0`
+          // （「观望期间真的来了新消息」），随收尾观望一起删掉。现在只剩：
+          // 「这个会话本来就该拦」（潜水配置 + 还有她没看过的消息），
+          // 且她自己没给出覆盖式水位（!coverAll 防止"读完即收尾"被硬拦回去）。
+          const blockedBySleep = isSleepingConfigV2(st.wakeConfig) && preSleepWaitBlockedV2(st, key);
+          if (!coverAll && blockedBySleep) {
             // ── 2026-11-12：不再返回"错误"，直接把没读的消息给她 ────────────────
             //
             // 原来的行为是 400 + 一段错误文案，让她「自己去调 get_unread 再回来」。
@@ -5374,25 +5435,33 @@ async function main() {
             // 但把内容放在 `text` 里，模型直接读即可。
             const now = Date.now();
             const label = chatLabelForV2(key);
-            const lines = uncovered.map((m) => renderOneMessageLine(compactModelMessage(m, { now }), { label }));
-            const maxSeq = uncoveredSeq;
+            // 贴给她那一批 = uncovered（她没看过的未读）。2026-11-15 收尾观望删掉后
+            // 不再需要跟 observedFresh 取并集，直接用它，顺序按 seq 升序。
+            const merged = uncovered.slice().sort((a, b) => (a.seq || 0) - (b.seq || 0));
+            const lines = merged.map((m) => renderOneMessageLine(compactModelMessage(m, { now }), { label }));
+            const maxSeq = merged.reduce((mx, m) => Math.max(mx, Number(m.seq) || 0), 0);
             const totalUnread = (st.unread || []).length;
             const seenCount = Math.max(0, totalUnread - uncovered.length);
             // ⚠️ 关键（2026-11-12 修重复）：**贴出去就等于她看过了**。
             // 以前不记这一笔，于是 she 立刻再调 mark_read / set_wake_config 时，
             // 这批消息仍被判为"没读过"，又被完整贴一遍 —— 实测连着三轮同一条消息。
             // 记进 modelSeenSeqs 之后，下一次调用只会贴「这之后新到的」。
-            try { noteModelMessagesV2(st, uncovered); } catch { /* 记录失败不影响本次返回 */ }
+            try { noteModelMessagesV2(st, merged); } catch { /* 记录失败不影响本次返回 */ }
             // 2026-11-12：不再报"未读总数 / 另外 N 条已在【本轮消息】里"。
             // 那两个数字每次调用都在变（群友在持续说话、她已经看过一部分），
             // 既解释不清也没有决策价值 —— 她只需要知道「下面这几条是新的」。
-            const head = `【${uncovered.length} 条新消息】`;
+            const head = `【${merged.length} 条新消息】`;
             const text = [head, ...lines].join('\n');
+            // 观望期间被压掉的唤醒要补排：这批消息虽然贴给她了，但她**还没处理**，
+            // 万一这一轮她因为别的原因没接上（比如马上又要收尾），也该有一次唤醒兜底。
+            // 注意：贴出后已记进 modelSeenSeqs，所以下面这个判断会因此为假 ——
+            // 这是有意的：贴过就等于她已经看见了，不再重复叫醒。
+            try { resumeWakeAfterObserveV2(key); } catch { /* 补排失败不影响本次返回 */ }
             sendJson({
               ok: false,
-              error: `还有 ${uncovered.length} 条没读，已经贴在下面了。`,
+              error: `还有 ${merged.length} 条没读，已经贴在下面了。`,
               text,
-              uncoveredCount: uncovered.length,
+              uncoveredCount: merged.length,
               uncoveredSeq: maxSeq,
               suggestedThroughSeq: maxSeq
             }, 400);
@@ -5548,18 +5617,9 @@ async function main() {
               return;
             }
           }
-          // ── 设置潜水前观望 10 秒（2026-11-12）────────────────────────────
-          // 操作者方案：这一步也空转 10 秒。如果这期间来了新消息，
-          // 就**退回 mark_read 那一步** —— 把那几条贴给她，让她看完再决定：
-          // 要么回话（回到 mark_read 循环），要么明确放弃（抬高 throughSeq）。
-          //
-          // 这样"收尾前还有人在说话"就变成同一个回合内的事，
-          // 不会像回复窗口那样每句话触发一次独立唤醒。
-          if (req.headers['x-agent-token'] && !body.skipObserve && isSleepingConfigV2(next)) {
-            // 观望 10 秒。来了新消息就交给下面的 uncovered 分支统一贴出，
-            // 不在这里单独回一次 —— 否则同一批消息会被写两遍。
-            await observeBeforeSleepV2(st, key, Number(cfg.socialV2?.observeBeforeSleepMs ?? 10000));
-          }
+          // ── 设置潜水前观望：**已删除**（2026-11-15，操作者要求）────────────
+          // 与 mark_read 那处同一个决定，理由也相同（见那边的长注释）：
+          // 观望覆盖不了「两个工具调用之间」的空隙，却很贵，所以整个去掉。
           // ── 沉睡前拦截（2026-11-12：改成"直接贴出没读的消息"）──────────────
           // 与 mark_read 用同一个 preSleepWaitBlockedV2，判定只有三条：
           //   ① preSleepWaitEnabled !== false ② 最近没有结束语 ③ st.unread 里有没展示的
@@ -5568,24 +5628,30 @@ async function main() {
           // 原来返回 400 + 「还需等待约 X 分钟」的文案：那个数字是假的，
           // 而 wait_for_messages 立刻返回 ⇒ 模型只会白转一圈再撞同一面墙。
           // 现在直接把没读的几条贴出来，读完即可重新设置。
-          if (isSleepingConfigV2(next) && preSleepWaitBlockedV2(st, key)) {
+          //
+          // 2026-11-15：收尾观望删掉后，这里只剩 blockedBySleep 一道门
+          //（原来还有个 blockedByObserve，依赖观望抓到的消息，已经不存在）。
+          const blockedBySleep = isSleepingConfigV2(next) && preSleepWaitBlockedV2(st, key);
+          if (blockedBySleep) {
             const seenSet = st.modelSeenSeqs instanceof Set ? st.modelSeenSeqs : new Set(st.modelSeenSeqs || []);
             const uncovered = (st.unread || []).filter((m) => !seenSet.has(m.seq));
-            const uncoveredSeq = uncovered.reduce((mx, m) => Math.max(mx, Number(m.seq) || 0), 0);
+            // 同 mark_read：直接贴 uncovered，按 seq 升序。
+            const merged = uncovered.slice().sort((a, b) => (a.seq || 0) - (b.seq || 0));
+            const uncoveredSeq = merged.reduce((mx, m) => Math.max(mx, Number(m.seq) || 0), 0);
             const now = Date.now();
             const label = chatLabelForV2(key);
-            const lines = uncovered.map((m) => renderOneMessageLine(compactModelMessage(m, { now }), { label }));
+            const lines = merged.map((m) => renderOneMessageLine(compactModelMessage(m, { now }), { label }));
             const totalUnread = (st.unread || []).length;
             const seenCount = Math.max(0, totalUnread - uncovered.length);
             // 同上：贴出即视为看过，避免下一次调用重复贴同一批。
-            try { noteModelMessagesV2(st, uncovered); } catch { /* ignore */ }
+            try { noteModelMessagesV2(st, merged); } catch { /* ignore */ }
             // 同上：不报总数之类的动态数字，只说「下面这几条是新的」。
-            const head = `【${uncovered.length} 条新消息】`;
+            const head = `【${merged.length} 条新消息】`;
             sendJson({
               ok: false,
-              error: `还没设置潜水：下面这 ${uncovered.length} 条你还没读过，已经直接贴给你了。`,
+              error: `还没设置潜水：下面这 ${merged.length} 条你还没读过，已经直接贴给你了。`,
               text: [head, ...lines].join('\n'),
-              uncoveredCount: uncovered.length,
+              uncoveredCount: merged.length,
               uncoveredSeq,
               suggestedThroughSeq: uncoveredSeq
             }, 400);
@@ -5843,22 +5909,31 @@ async function main() {
             if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
             const delays = computeGapsV2(messages, 'auto', undefined, undefined, sendCfg);
             const sentMessages = await sendMessagesV2(key, messages, delays);
-            recordSentMessagesV2(key, sentMessages);
+            recordSentMessagesV2(key, sentMessages, sentMessages?.ids);
             st.lastAiReplyAt = now;
             st.lastActionAt = now;
             st.wakeConfig.noActionCount = 0;
             saveSocialV2State();
             // 发送后空转：代替"节流拦截"，只让这次调用慢一点，不产生额外回合。
-            if (sentMessages.length > 0) await paceAfterSendV2(st, Date.now());
+            // 发送后空转 + 观察新消息（2026-11-14）：
+            // 空转期间有新消息就提前结束，把那几条按【本轮消息】同格式带回去，
+            // 让她能在同一个回合里接着回 —— 省掉一次完整唤醒。
+            let postSendObserve = null;
+            if (sentMessages.length > 0) {
+              postSendObserve = await paceAfterSendV2(st, key, Date.now());
+            }
             log(`[reserved2] 工具分条发送 ${key}: 成功 ${sentMessages.length}/${messages.length} 条`);
             appendActivity(`${key} [reserved2] 工具分条发送：成功 ${sentMessages.length}/${messages.length} 条`);
             if (sentMessages.length > 0) scheduleReplyCheckV2(key);
-            const spaceWarn = findCjkSpaceWarning(messages);
-            const splitWarn = findSplitBoundaryWarning(messages);
-            sendJson({ ok: true, key, sent: sentMessages.length, failed: messages.length - sentMessages.length, ...(spaceWarn ? { warn: spaceWarn } : {}), ...(splitWarn ? { splitWarn } : {}) });
+            // 2026-11-14 操作者要求：**不再回任何发送后提示**（warn / splitWarn）。
+            // 理由：消息已经发出去了，事后再告诉她"第 1、2 条之间像把一句话拆开了"
+            // 或者"消息内部有中文空格"，她既不能撤回、也没法改，纯属事后指责；
+            // 而且每轮都往上下文里塞一句，白烧 token。这些检查（findCjkSpaceWarning /
+            // findSplitBoundaryWarning）连同函数本体一起删掉了，见下方注释。
+            sendJson({ ok: true, key, ...(postSendObserve?.text ? { text: postSendObserve.text, arrived: true, arrivedCount: postSendObserve.count } : {}), sent: sentMessages.length, failed: messages.length - sentMessages.length });
           } catch (error) {
             if (error?.sent?.length) {
-              recordSentMessagesV2(key, error.sent);
+              recordSentMessagesV2(key, error.sent, error?.sentIds);
               log(`[reserved2] 工具分条发送部分成功 ${error.sent.length}/${messages.length} 条，已记录已发消息`);
             }
             // 失败/未发出的消息回滚预占的发送额度，避免假 429。
@@ -5996,22 +6071,27 @@ async function main() {
           }
           try {
             const sentMessages = await sendMessagesV2(key, messages, delays, actualReplyToMessageId, atUserId);
-            recordSentMessagesV2(key, sentMessages);
+            recordSentMessagesV2(key, sentMessages, sentMessages?.ids);
             st.lastAiReplyAt = now;
             st.lastActionAt = now;
             st.wakeConfig.noActionCount = 0;
             saveSocialV2State();
             // 发送后空转：代替"节流拦截"，只让这次调用慢一点，不产生额外回合。
-            if (sentMessages.length > 0) await paceAfterSendV2(st, Date.now());
+            // 发送后空转 + 观察新消息（2026-11-14）：
+            // 空转期间有新消息就提前结束，把那几条按【本轮消息】同格式带回去，
+            // 让她能在同一个回合里接着回 —— 省掉一次完整唤醒。
+            let postSendObserve = null;
+            if (sentMessages.length > 0) {
+              postSendObserve = await paceAfterSendV2(st, key, Date.now());
+            }
             log(`[reserved2] 工具统一发送 ${key}: 成功 ${sentMessages.length}/${messages.length} 条`);
             appendActivity(`${key} [reserved2] 工具统一发送：成功 ${sentMessages.length}/${messages.length} 条`);
             if (sentMessages.length > 0) scheduleReplyCheckV2(key);
-            const spaceWarn = findCjkSpaceWarning(messages);
-            const splitWarn = findSplitBoundaryWarning(messages);
-            sendJson({ ok: true, key, sent: sentMessages.length, failed: messages.length - sentMessages.length, delays, quoted: quotedInfo, ...(spaceWarn ? { warn: spaceWarn } : {}), ...(splitWarn ? { splitWarn } : {}) });
+            // 同上（send-message 路径）：不再回发送后提示，见 send-burst 那处的说明。
+            sendJson({ ok: true, key, ...(postSendObserve?.text ? { text: postSendObserve.text, arrived: true, arrivedCount: postSendObserve.count } : {}), sent: sentMessages.length, failed: messages.length - sentMessages.length, delays, quoted: quotedInfo });
           } catch (error) {
             if (error?.sent?.length) {
-              recordSentMessagesV2(key, error.sent);
+              recordSentMessagesV2(key, error.sent, error?.sentIds);
               log(`[reserved2] 工具统一发送部分成功 ${error.sent.length}/${messages.length} 条，已记录已发消息`);
             }
             // 失败/未发出的消息回滚预占的发送额度，避免假 429。
@@ -6024,6 +6104,66 @@ async function main() {
             if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
             saveSocialV2State();
             sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
+          }
+          return;
+        }
+        // ── 撤回（qq_recall_message）──────────────────────────────────────
+        //
+        // 操作者定的方式：**她按原文输入，桥接自动判断是哪一条**。
+        //
+        // 为什么不用 seq / messageId：
+        //   · 她自己的消息**没有 seq**（seq 是入站未读水位的编号）；
+        //   · messageId 是一长串可能为负的数字，让她记没意义。
+        //   她复述自己刚说过的话，是最自然、也不需要动上下文格式的方式。
+        //
+        // 输入：{ key, text }。输出：成功一句 `✅ 已撤回`，失败一句中文原因。
+        //
+        // 超过 2 分钟直接不管（QQ 撤回时限就是 2 分钟）—— 提前拦下省一次网络往返。
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/recall-message') {
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          if (!req.headers['x-agent-token']) { sendJson({ ok: false, error: '撤回必须携带 agent token' }, 403); return; }
+          if (!agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          if (socialV2.paused) { sendJson({ ok: false, error: '二代 AI 已暂停' }, 403); return; }
+          const wantText = String(body.text ?? '').trim();
+          if (!wantText) {
+            sendJson({ ok: false, error: '要撤回哪句？把她说过的那句原文传进来' }, 400);
+            return;
+          }
+          if (wantText.length > 500) {
+            sendJson({ ok: false, error: '原文太长，传那句话的关键部分就行' }, 400);
+            return;
+          }
+          const st = getSocialV2State(key);
+          const receipt = findReceiptByTextV2(st, wantText);
+          if (!receipt) {
+            // 没有匹配 ⇒ 要么不是这个会话发的、要么早就撤过了。
+            sendJson({ ok: false, error: '没找到这句（只记得最近 2 分钟内自己发的内容）' }, 400);
+            return;
+          }
+          const ageMs = Date.now() - Number(receipt.at || 0);
+          if (ageMs > RECALL_WINDOW_MS) {
+            // 超过 2 分钟：操作者要求"别管了"，直接给一句话，不做任何尝试。
+            sendJson({ ok: false, error: '超过 2 分钟，撤不回了' }, 400);
+            return;
+          }
+          try {
+            await onebotHttpAction('delete_msg', { message_id: Number(receipt.id) });
+            dropSentReceiptV2(st, receipt);
+            // recentMessages 里那条**保留**：她的上下文里还在，抹掉反而对不上；
+            // 原文库是事实来源，撤回只影响 QQ 侧。
+            saveSocialV2State();
+            log(`[recall] ${key} 撤回「${String(receipt.text).slice(0, 20)}」（message_id=${receipt.id}，${Math.round(ageMs / 1000)}s 前发出）`);
+            sendJson({ ok: true, text: '✅ 已撤回' });
+          } catch (error) {
+            const raw = String(error?.message ?? error);
+            const text = /not found or not retractable/i.test(raw) ? '这条撤不了（可能已过期）'
+              : /no authoritative QQ sequence/i.test(raw) ? '这条撤不了（QQ 没给可撤回的序列号）'
+              : `撤回失败：${raw}`;
+            sendJson({ ok: false, error: text }, 400);
           }
           return;
         }
@@ -6450,6 +6590,9 @@ async function main() {
           return;
         }
         // 管理端表情库接口（控制台）
+        //
+        // withUrl: true —— 这是**面板**（人看的），必须带图片地址才能渲染缩略图。
+        // 模型走 /api/socialV2/sticker-list，那边保持精简（不带 url 省 token）。
         if (req.method === 'GET' && url.pathname === '/api/stickers') {
           const query = String(url.searchParams.get('query') ?? '').trim();
           const maxCount = Math.max(1, Number(cfg.socialV2?.sticker?.maxListCount) || 100);
@@ -6457,7 +6600,7 @@ async function main() {
           // GET 不再触发强制同步（写副作用不能挂在读接口上）：请用 POST /api/stickers/sync。
           try {
             const synced = await syncStickerLibrary(false);
-            const list = formatStickerList(synced?.entries ?? stickerEntries, query, count);
+            const list = formatStickerList(synced?.entries ?? stickerEntries, query, count, { withUrl: true });
             sendJson({ ok: true, ...list, syncedAt: synced?.syncedAt ?? stickerSyncedAt, fromCache: synced?.fromCache ?? false, writable: stickerStoreWritable });
           } catch (error) {
             sendJson({ ok: false, error: `获取表情失败：${error?.message ?? error}` }, 500);
@@ -8443,20 +8586,26 @@ async function main() {
             noteSendCallV2(st, now);  // 节流按"调用"记账，不按条数
             if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
             const sentMessages = await sendMessagesV2(key, [message], [], actualReplyToMessageId, atUserId);
-            recordSentMessagesV2(key, sentMessages);
+            recordSentMessagesV2(key, sentMessages, sentMessages?.ids);
             st.lastAiReplyAt = now;
             st.lastActionAt = now;
             st.wakeConfig.noActionCount = 0;
             saveSocialV2State();
             // 发送后空转：代替"节流拦截"，只让这次调用慢一点，不产生额外回合。
-            if (sentMessages.length > 0) await paceAfterSendV2(st, Date.now());
+            // 发送后空转 + 观察新消息（2026-11-14）：
+            // 空转期间有新消息就提前结束，把那几条按【本轮消息】同格式带回去，
+            // 让她能在同一个回合里接着回 —— 省掉一次完整唤醒。
+            let postSendObserve = null;
+            if (sentMessages.length > 0) {
+              postSendObserve = await paceAfterSendV2(st, key, Date.now());
+            }
             log(`[send] ${url.pathname} ${key}: 成功 ${sentMessages.length}/1 条`);
             appendActivity(`${key} [send] 成功 ${sentMessages.length}/1 条：${message.slice(0, 80)}`);
             if (sentMessages.length > 0) scheduleReplyCheckV2(key);
-            sendJson({ ok: true, key, sent: sentMessages.length, failed: sentMessages.length ? 0 : 1, quoted: quotedInfo });
+            sendJson({ ok: true, key, ...(postSendObserve?.text ? { text: postSendObserve.text, arrived: true, arrivedCount: postSendObserve.count } : {}), sent: sentMessages.length, failed: sentMessages.length ? 0 : 1, quoted: quotedInfo });
           } catch (error) {
             if (error?.sent?.length) {
-              recordSentMessagesV2(key, error.sent);
+              recordSentMessagesV2(key, error.sent, error?.sentIds);
               log(`[send] ${url.pathname} ${key} 部分成功 ${error.sent.length}/1 条，已记录已发消息`);
             }
             // 失败/未发出的消息回滚预占的发送额度，避免假 429。
@@ -9522,12 +9671,18 @@ async function main() {
   // 这里加一道「同一会话两次发送之间至少隔 N 秒」的软节流：
   //   · 和 maxSendPerMinute 不同，它不看窗口总数，只看**上一次发送的时刻**；
   //   · 撞上时返回 429 + 剩余秒数，让她知道再等多久（而不是一句"频率超限"）；
-  //   · 配置项 socialV2.send.minSendIntervalMs，默认 5000（操作者定 5 秒）。
+  //   · 配置项 socialV2.send.minSendIntervalMs，默认 10000。
   //
   // 为什么不用"放宽 maxSendPerMinute"：那个阈值是防 QQ 风控的最后一道闸，
   // 调高换来的快，代价是真被冻结 —— 比一次 429 严重得多。
+  //
+  // ⚠️ 2026-11-15：**本函数目前没有调用方（死代码）**。
+  // 它读的 `lastSendCallAt` 现在由 paceAfterSendV2 写成"预期返回时刻"，
+  // 语义已经不对（那个值恒在未来 20 秒），如果哪天要接回节流，
+  // 必须先改成用"上一次发送完成时刻"或独立的字段，否则一接回来就会
+  // 把每次发送都判成超频。
   function sendThrottleRemainMsV2(st, now = Date.now()) {
-    const minGap = Math.max(0, Number(cfg.socialV2?.send?.minSendIntervalMs ?? 5000));
+    const minGap = Math.max(0, Number(cfg.socialV2?.send?.minSendIntervalMs ?? 10000));
     if (!minGap) return 0;
     // 2026-11-13 修：**按"上一次调用"算，不按"上一次发出去的消息"算**。
     //
@@ -9550,38 +9705,119 @@ async function main() {
   }
 
   /**
-   * 发送成功后的短暂空转（2026-11-13）。
+   * 发送成功后的短暂空转（2026-11-13，2026-11-14 加"观察新消息"）。
    *
-   * 为什么不用"拦截"：撞到最小间隔时回 429 会让模型**重新思考、重新组句、重新发**，
-   * 一个回合变成两个，每一步都要重发整段历史 —— 比等几秒贵得多。
-   * 现在改成让这次工具调用多停一会儿再返回：效果一样是"别连发"，
-   * 但代价只是这一个 HTTP 请求慢 N 秒，不产生额外回合，也不消耗上下文。
+   * 两件事一起做：
+   *   ① **节流**：保证「上一次发送调用」与「这一次」至少隔 minSendIntervalMs，
+   *      避免跨回合砸屏。撞上时不是回 429（那会让模型重新思考、重新组句、重新发，
+   *      一个回合变两个，每步都要重发整段历史），而是让这次调用多停一会儿。
+   *   ② **观察**：空转期间如果有新消息进来，**提前结束等待**并把消息带回去
+   *      （见返回值 `arrived`），行为与 qq_mark_read 的 10 秒观望一致。
    *
-   * 语义：保证「上一次调用」与「这一次调用」之间至少隔 minSendIntervalMs。
-   * 调用方在发送前已经调过 noteSendCallV2(st, now)，所以 last 一定存在；
-   * 本函数把 lastSendCallAt 推进到「空转结束时刻」，下次进来才不会重复计算。
+   * 为什么②重要：她刚说完话时对方最可能接话。如果只是干等 5 秒然后返回"发送成功"，
+   * 那条新消息要等到下一个回合才被看到（多一次完整唤醒）。提前返回能让她
+   * 在同一个回合里接着回，省一轮上下文重发。
    *
-   * ⚠️ 2026-11-13 修：原来这里有个"首次直接 return"的分支，
-   * 它在 saveSocialV2State() 之后才写 st，写进去的值没落盘 ——
-   * 于是每次读到的 last 都是 undefined，永远走"首次"分支，**空转一次都没生效**。
-   * 实测 12:25:07 和 12:25:09 两次发送只隔 2 秒，就是这么来的。
+   * @returns {{arrived: boolean, waitedMs: number}} 是否等到了新消息
    */
-  async function paceAfterSendV2(st, now = Date.now()) {
-    if (!st) return;
-    const minGap = Math.max(0, Number(cfg.socialV2?.send?.minSendIntervalMs ?? 5000));
-    if (!minGap) return;
-    const last = Number(st.lastSendCallAt);
-    // last 缺失只可能是异常路径；此时把它记为 now 并落盘，不做等待。
-    if (!Number.isFinite(last) || last <= 0) {
-      st.lastSendCallAt = now;
-      try { saveSocialV2State(); } catch { /* ignore */ }
-      return;
-    }
-    const waitMs = Math.max(0, Math.min(minGap, minGap - (now - last)));
+  async function paceAfterSendV2(st, key, now = Date.now(), opts = {}) {
+    if (!st) return { arrived: false, waitedMs: 0, text: '', count: 0 };
+    const observeMs = Math.max(0, Number(cfg.socialV2?.send?.observeAfterSendMs ?? 30000));
+    // ── 2026-11-15 操作者定义的语义 ─────────────────────────────────────
+    //
+    // 「她调用 qq_send_message 后，空转的时间 = 每条数组之间的随机间隔之和 + 20 秒」
+    //
+    // 关键事实：数组间隔**已经真实流逝了** —— sendMessagesV2 里的
+    // `sendChain.then(() => sleep(d))` 是硬等（见那边的实现），
+    // 所以走到这里时那 1~3 秒 × (N-1) 的间隔已经过去。
+    //
+    // 因此这里只需要补「20 秒」这一截，**不需要**再加间隔时间，
+    // 也不该像旧实现那样拿 minSendIntervalMs 去抵减（那是"两次调用之间的节流"，
+    // 和操作者要的"发完等对方接话"是两件事）。
+    //
+    // 连发 N 条时总等待自然变成 `Σ间隔 + 20s`：
+    //   1 条 → 0 + 20 = 20s
+    //   3 条 → 约 2~6 + 20 = 22~26s
+    //   5 条 → 约 4~12 + 20 = 24~32s
+    // 这正是操作者要的形状（条数越多，整体等得越久，因为前面已经花掉了间隔）。
+    const waitMs = observeMs;
     st.lastSendCallAt = now + waitMs;
-    // 必须落盘：否则下次读到的是旧值，空转就白等了。
     try { saveSocialV2State(); } catch { /* ignore */ }
-    if (waitMs > 0) await sleep(waitMs);
+    if (waitMs <= 0) return { arrived: false, waitedMs: 0, text: '', count: 0 };
+    // ── 观察期间等新消息（2026-11-14）────────────────────────────────────
+    // 与 qq_mark_read 的观望同款：期间来了新消息就提前结束，把那几条贴回去，
+    // 让她在同一个回合里接着回 —— 省掉一次完整唤醒（约 5~9 万 token 的重发）。
+    //
+    // ⚠️ 过滤依据必须是**快照差集**，不能用 `seq > beforeSeq`。
+    // 因为 lastUnreadSeq 在消息入库那一刻就推进了：如果消息恰好在
+    // "发送完成 → 这里"之间到达，beforeSeq 读到的已经是新值，那批消息全被漏掉。
+    // 实测 13:23:09 的日志就是 `arrived=false waitedMs=7011 lastUnreadSeq=92 unread=1`
+    // —— unread 里躺着一条，却被判成"没来新消息"。
+    const seenAtStart = new Set(
+      (Array.isArray(st.unread) ? st.unread : [])
+        .map((m) => (m && Number.isSafeInteger(m.seq) ? m.seq : null))
+        .filter((s) => s !== null)
+    );
+    log(`[pace] ${key} 开始观望 waitMs=${waitMs} 已有未读=${seenAtStart.size}`);
+    // ⚠️ 2026-11-14：这里也改成「安静窗」语义，与 mark_read 完全一致。
+    // 原来的 waitMs 只当总预算用，而且见第一条消息就返回 —— 她刚说完话、对方
+    // 连发两句时，第一句就被单独贴回去，第二句又得等下一次唤醒，正是操作者
+    // 要避免的"碎着给"。
+    //
+    // 参数：waitMs 仍是"没人说话时的干等时长"（= 节流间隔），
+    //       安静窗取 socialV2.send.observeQuietMs（默认 5s，与收尾观望同口径），
+    //       硬上限要**额外**加在 waitMs 之上 —— 不能沿用收尾那边的 20s 绝对值，
+    //       因为这里的节流等待本身就可能接近 10s。
+    const quietMs = Math.max(0, Number(cfg.socialV2?.send?.observeQuietMs ?? 10000));
+    // 硬上限（2026-11-15 重算）：waitMs 已经是 20 秒（minSendIntervalMs），
+    // 再叠加一个安静窗就会到 25~30 秒，逼近/超过传输层能容忍的范围。
+    //
+    // 现在的口径：**总时长封顶在 waitMs + 一个安静窗**，且再兜一个绝对上限。
+    //   · 没人说话 ⇒ 等满 waitMs（20s）就返回，这是"发送后空转"的本体；
+    //   · 有人说话 ⇒ 最多再多等一个 quietMs（把连发的几条合并），然后无论
+    //     安静窗满没满都返回 —— 消息已经带上了，没必要求"满"。
+    //
+    // 为什么不一味抬高：这个 HTTP 请求一挂，她那个回合就卡着，
+    // 而 MCP 侧 agentApi 虽然是 300s、DSH 侧 toolCallTimeoutMs 是 725s，
+    // 但真正体感差的是「等 30 秒才回」本身。20+5=25 秒已经是能接受的上界。
+    const hardCapMs = waitMs + quietMs;
+    // ⚠️ 2026-11-15：观望期间**必须**压住唤醒调度，否则这 20 秒里消息一到
+    // scheduleWakeV2 就会排一个 batchWindowMs 的唤醒，在她还在等的时候就
+    // 准备下一个回合 —— 那批消息会被处理两遍（观望贴一次、唤醒再处理一次）。
+    // 这个 Set 以前只有收尾观望在用，收尾观望删掉后就成了死代码，现在补到这里。
+    const observeStamp = canonicalV2Key(key) ?? key;
+    observingKeys.add(observeStamp);
+    let ob;
+    try {
+      ob = await observeBeforeSleepV2(st, key, waitMs, { quietMs, hardCapMs });
+    } finally {
+      observingKeys.delete(observeStamp);
+    }
+    log(`[pace] ${key} 观望结束 arrived=${ob?.arrived} waitedMs=${ob?.waitedMs} 条数=${ob?.fresh?.length ?? 0} lastUnreadSeq=${st.lastUnreadSeq} unread=${(st.unread || []).length}`);
+    let text = '';
+    let count = 0;
+    let maxSeq = 0;
+    if (ob?.arrived) {
+      // 只取观望期间**新出现**的那几条（不在开始时快照里的）。
+      const fresh = (Array.isArray(st.unread) ? st.unread : [])
+        .filter((m) => m && Number.isSafeInteger(m.seq) && !seenAtStart.has(m.seq));
+      if (fresh.length) {
+        const label = chatLabelForV2(key);
+        const nowMs = Date.now();
+        const rows = fresh.map((m) => renderOneMessageLine(compactModelMessage(m, { now: nowMs }), { label }));
+        count = rows.length;
+        // 格式与 qq_mark_read 的观望输出**完全一致**：`【N 条新消息】` + 消息行。
+        // 两边用同一套排版，她不必为"这是哪个工具贴的"分神。
+        if (count) text = [`【${count} 条新消息】`, ...rows].join('\n');
+        // 水位对齐 mark_read 的 suggestedThroughSeq：她收尾时直接抄这个数，
+        // 不用自己算"我读到哪儿了" —— 那正是以前标错已读的来源。
+        maxSeq = fresh.reduce((mx, m) => Math.max(mx, Number(m.seq) || 0), 0);
+        // 记成"已展示过"：下一轮 get_unread / wait 不会重复贴同一批。
+        try { noteModelMessagesV2(st, fresh); } catch { /* ignore */ }
+        try { saveSocialV2State(); } catch { /* ignore */ }
+      }
+    }
+    return { arrived: !!ob?.arrived, waitedMs: ob?.waitedMs ?? 0, text, count, suggestedThroughSeq: maxSeq || undefined };
   }
 
   function computeGapsV2(messages, gapMode, gapMs, gaps, sendCfg) {
@@ -9619,6 +9855,10 @@ async function main() {
     const [kind, id] = key.split(':');
     const sent = [];
     const failed = [];
+    // 2026-11-15：把每条真正发出去的 message_id 也留下来。
+    // 之前只 push 文本，于是「发出去之后想撤回」根本无 id 可用
+    // （qq_recall_message 需要它）。顺序与 messages 一一对应。
+    const sentIds = [];
     for (let i = 0; i < messages.length; i++) {
       const msg = messages[i];
       const useReply = i === 0 ? replyToMessageId : null;
@@ -9626,8 +9866,11 @@ async function main() {
       sendChain = sendChain
         .then(async () => {
           assertSendAllowed();
-          await onebotSend(kind, id, msg, useReply, useAt);
+          const receipt = await onebotSend(kind, id, msg, useReply, useAt);
           sent.push(msg);
+          // OneBot 的发送回执形如 { message_id: 123 }；拿不到就记 null（不编造）。
+          const mid = receipt && (receipt.message_id ?? receipt.messageId);
+          sentIds.push(Number.isFinite(Number(mid)) ? Number(mid) : null);
         })
         .catch((error) => {
           log(`QQ 发送失败 (${key}):`, error?.message ?? error);
@@ -9642,9 +9885,15 @@ async function main() {
       if (failed.length > 0) {
         const err = new Error(`QQ 发送失败 ${failed.length}/${messages.length} 条：${failed[0]?.message ?? '未知错误'}`);
         err.sent = sent.slice();
+        err.sentIds = sentIds.slice();
         throw err;
       }
-      return sent;
+      // 返回值形状保持"数组"（既有调用方都在用 .length / 遍历），
+      // 但把 id 挂在数组属性上 —— 这样不用改任何既有调用点就能拿到回执。
+      // `${sent}` / for...of 仍然只看到文本，行为不变。
+      const out = sent.slice();
+      out.ids = sentIds.slice();
+      return out;
     });
   }
 
@@ -10010,7 +10259,7 @@ async function main() {
         question: w.recommendedQuestion !== false,
         poke: w.recommendedPoke !== false,
         anyMessage: defaultMode === 'active',
-        probability: Math.min(1, Math.max(0, Number(w.recommendedProbability) || 0))
+        probability: Math.min(1, Math.max(0, Number(w.recommendedProbability) || 0)),
       },
       batchWindowMs: Math.max(1000, Number(w.batchWindowMs) || 8000),
       lastWakeAt: 0,
@@ -10246,9 +10495,9 @@ async function main() {
           if (!val || typeof val !== 'object') continue;
           if (!/^(group|private):\d+$/.test(key)) continue;
           const defaultWc = defaultWakeConfigV2();
-          let agentToken = String(val.agentToken || crypto.randomBytes(16).toString('hex'));
+          let agentToken = String(val.agentToken || crypto.randomBytes(4).toString('hex'));
           if (!agentToken || seenTokens.has(agentToken)) {
-            agentToken = crypto.randomBytes(16).toString('hex');
+            agentToken = crypto.randomBytes(4).toString('hex');
           }
           seenTokens.add(agentToken);
           const st = {
@@ -11867,52 +12116,31 @@ async function main() {
     return out;
   }
 
-  // 检测二代发送内容里“中文之间用空格”的不自然写法，用于给 AI 返回软提醒。
-  // 只检测空格两侧都是中文/中文标点的情况，避免误伤英文单词间隔（如 DeepSeek V3）。
-  function findCjkSpaceWarning(messages) {
-    const bad = [];
-    for (let i = 0; i < (messages || []).length; i++) {
-      const chars = Array.from(String(messages[i] ?? ''));
-      for (let j = 0; j < chars.length; j++) {
-        const ch = chars[j];
-        if (ch !== ' ' && ch !== '\t') continue;
-        const prev = chars[j - 1];
-        const next = chars[j + 1];
-        if (prev && next && isCjkLikeChar(prev) && isCjkLikeChar(next)) {
-          bad.push(i + 1);
-          break;
-        }
-      }
-    }
-    if (!bad.length) return null;
-    const list = [...new Set(bad)];
-    const label = list.length === 1 ? `第 ${list[0]} 条` : `第 ${list.join('、')} 条`;
-    return `${label}消息内部有中文空格，真人一般不这么打；可删掉空格用标点，或拆成数组多条。`;
-  }
-
-  // 检测二代发送内容里“分条断点不自然”的情况：某条消息以逗号/顿号等非终止标点结尾，
-  // 或以“的/了/吗/呢/吧/是/在/把/被/让/给”等通常需要接后续成分的词结尾，下一条又紧跟中文内容，
-  // 说明 AI 很可能把同一句话拆到了两条消息里。这里只做软提醒，不拦截、不改写。
-  function findSplitBoundaryWarning(messages) {
-    if (!Array.isArray(messages) || messages.length <= 1) return null;
-    const INCOMPLETE_TAIL_RE = /(?:的|了|吗|呢|吧|啊|呀|嘛|是|在|把|被|让|给|从|对|向|和|与|或|而|但|然|就|都|还|又|也|很|太|最|更|不|没|有|这|那|哪|啥|什么|怎么|为什么|因为|所以|但是|然后|我|你|他|她|它)$/;
-    // 这些是常见“短句但完整”的结尾，不应因为以“的/了”等结尾就被当成半句话。
-    const COMPLETE_SHORT = new Set(['好的', '行了', '算了', '知道了', '可以了', '没事了', '走了', '睡了', '来了', '懂了', '明白了', '抱歉', '没事', '好吧', '行吧', '算了吧', '好', '行', '嗯', '哦']);
-    const bad = [];
-    for (let i = 0; i < messages.length - 1; i++) {
-      const prev = String(messages[i] ?? '').trim();
-      const next = String(messages[i + 1] ?? '').trim();
-      if (!prev || !next || COMPLETE_SHORT.has(prev)) continue;
-      const nextStartsCjk = isCjkLikeChar(Array.from(next)[0]);
-      const nonTerminalPunct = /[,，、；;:：]$/.test(prev);
-      const incompleteTail = nextStartsCjk && prev.length >= 3 && INCOMPLETE_TAIL_RE.test(prev);
-      if (nonTerminalPunct || incompleteTail) {
-        bad.push(`${i + 1}、${i + 2}`);
-      }
-    }
-    if (!bad.length) return null;
-    return `第 ${bad.join('，')} 条之间像是把同一句话拆开了；如果两条拼起来才完整，请合并成一条，或把断点移到完整句子的边界。`;
-  }
+  // ── 发送后提示已移除（2026-11-14，操作者要求）──────────────────────────
+  //
+  // 这里原来有两个"事后检查"，在消息**已经发出去之后**把结果塞进工具返回值：
+  //
+  //   findCjkSpaceWarning(messages)
+  //     → 「第 N 条消息内部有中文空格，真人一般不这么打；可删掉空格用标点」
+  //   findSplitBoundaryWarning(messages)
+  //     → 「第 1、2 条之间像是把同一句话拆开了；如果两条拼起来才完整，
+  //        请合并成一条，或把断点移到完整句子的边界。」
+  //
+  // 操作者的原话：「这她已经发完了，一点用都没用，而且还占上下文」。
+  //
+  // 判断是对的，而且有两层：
+  //   ① **无法执行**：消息已经在 QQ 上了，看见提示也撤不回、改不了。
+  //      真正能作用于内容的时刻是**发送前**，而那时她没有这些信息。
+  //   ② **纯开销**：每轮发送都往上下文里加一句（短的 30 字、长的 60+ 字），
+  //      而这两个检查本身就是对每条消息做逐字符扫描 / 正则回扫。
+  // 更糟的是它还会**干扰她**：一条本来自然的短句结尾（「那我就先回去了的」这种
+  // 口语）被判成"拆开了"，她可能为了消掉提示而改变自己说话的方式。
+  //
+  // 所以不是"关掉"，是**连同这两个函数一起删掉** —— 留着函数没人调是死代码，
+  // 以后有人看见还会把调用接回去。要恢复请参考 git 历史（v0.2.1-r1 之前）。
+  //
+  // 顺带：MCP 侧 `for (const k of ['hint','warn','splitWarn'])` 的那段遍历也一并删了，
+  // 那边原本是"把桥接回传的提示拼到工具结果后面"的出口。
 
   function currentRoleHintV2() {
     // 先按 〔二代〕/〔一代〕 标记筛小节；下面的逐行过滤只是给「没标记的老卡片」兜底。
@@ -12202,6 +12430,16 @@ async function main() {
     const uid = String(userId ?? '').trim();
     const name = String(rawName ?? '').replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, ' ').trim().slice(0, 64);
     if (!/^\d{4,12}$/.test(uid) || !name) return false;
+    // 2026-11-14 修：**名字等于号码时直接拒绝**。
+    //
+    // 起因：拍一拍事件的 sender 在私聊分支里直接取 senderId（那是 QQ 号），
+    // 于是 noteAliasV2(10001, "10001") 把 primary 设成了号码本身 ——
+    // 之后 displayNameOfV2 每次都返回号码，群友印象面板、记忆渲染全显示成一串数字。
+    //
+    // 为什么这类"名字"没有任何信息量：它和 uid 完全相同，等价于"没有名字"。
+    // 真正该做的是**不写这条**，让 displayNameOfV2 回退到调用方给的原名 / 上一版昵称；
+    // 如果允许写入，它还会把已有的正常昵称顶掉（rec.primary = name）。
+    if (name === uid || /^\d{4,12}$/.test(name)) return false;
     const store = ensureAliasStore();
     const now = Date.now();
     let rec = store[uid];
@@ -12463,14 +12701,84 @@ async function main() {
     return msg;
   }
 
-  function recordSentMessagesV2(key, messages) {
+  // ── 撤回用的发送回执（2026-11-15）────────────────────────────────────
+  //
+  // 键不编号，存的是一条「我发出去过什么」的记录：
+  //   { text: 正文, id: QQ message_id, at: 发送时刻 }
+  //
+  // 为什么按**正文**索引（操作者定的）：
+  //   她自己的消息**没有 seq**（seq 是入站未读水位的编号，自己的消息本来就没号）。
+  //   所以让她「用 seq 撤回」根本无号可指。最自然的方式是她复述自己说过的那句话，
+  //   桥接自己去匹配是哪一条。
+  //
+  // 有界：最多 50 条。撤回窗口只有 2 分钟，一次对话发不到 50 条。
+  const RECALL_RECEIPT_LIMIT = 50;
+  // QQ 私聊与群聊的撤回时限都是 2 分钟。超过就必然失败，直接拦下省一次往返。
+  const RECALL_WINDOW_MS = 120000;
+
+  /** 记一条「我发出去的」回执。 */
+  function noteSentReceiptV2(st, text, messageId, at = Date.now()) {
+    const body = String(text ?? '');
+    if (!st || !body) return;
+    if (!Number.isSafeInteger(messageId) || messageId === 0) return;
+    if (!Array.isArray(st.sentReceipts)) st.sentReceipts = [];
+    st.sentReceipts.push({ text: body, id: messageId, at });
+    if (st.sentReceipts.length > RECALL_RECEIPT_LIMIT) {
+      st.sentReceipts.splice(0, st.sentReceipts.length - RECALL_RECEIPT_LIMIT);
+    }
+  }
+
+  /**
+   * 按正文找最匹配的那条回执。
+   *
+   * 匹配策略（从严格到宽松，命中即返回）：
+   *   ① 完全相等 —— 最常见：她原样复述自己刚说的话；
+   *   ② 包含 —— 她只说了其中一段（或加了引号/省略号）；
+   *   ③ 互相包含 —— 她话里带了额外修饰。
+   *
+   * 多条命中时取**最新**的那条（`at` 最大）：她说"撤回我刚才那句"，
+   * 指的几乎总是最后说的那句；说早期那句时会补上更多上下文让它变成①/②。
+   *
+   * @returns {{id:number, at:number, text:string}|null}
+   */
+  function findReceiptByTextV2(st, text) {
+    const want = String(text ?? '').trim();
+    if (!want || !Array.isArray(st?.sentReceipts) || !st.sentReceipts.length) return null;
+    const norm = (s) => String(s ?? '').trim();
+    const usable = st.sentReceipts.filter((r) => r && Number.isSafeInteger(Number(r.id)));
+    if (!usable.length) return null;
+    const newest = (list) => list.slice().sort((a, b) => Number(b.at || 0) - Number(a.at || 0))[0];
+    const exact = usable.filter((r) => norm(r.text) === want);
+    if (exact.length) return newest(exact);
+    const contains = usable.filter((r) => norm(r.text).includes(want) || want.includes(norm(r.text)));
+    if (contains.length) return newest(contains);
+    return null;
+  }
+
+  /** 撤回成功后删掉对应回执：同一条不该被反复撤（第二次必然失败）。 */
+  function dropSentReceiptV2(st, receipt) {
+    if (!Array.isArray(st?.sentReceipts) || !receipt) return;
+    const i = st.sentReceipts.indexOf(receipt);
+    if (i >= 0) st.sentReceipts.splice(i, 1);
+  }
+
+  function recordSentMessagesV2(key, messages, ids = null) {
     const st = getSocialV2State(key);
     const now = Date.now();
     const recentLimit = Number(cfg.socialV2?.context?.recentLimit) || 100;
     const list = Array.isArray(messages) ? messages : [];
     for (let i = 0; i < list.length; i++) {
       const text = redactKnownTokensOnly(String(list[i] ?? '')).slice(0, 200);
-      st.recentMessages.push({
+      // ── 自己的消息**不带 seq**（2026-11-15 操作者明确要求）──────────────
+      //
+      // 曾经试过给自己的消息也编 seq（独立高位段 1e9+），好让 qq_recall_message
+      // 按 seq 撤。操作者否掉了，理由很直接：**入站消息的 seq 是"未读/已读水位"
+      // 的那套编号，自己的消息本来就没有号**。硬塞一个高位号进来，她看到的消息
+      // 列表会变成混着两种编号的怪物，而那个号对水位毫无意义。
+      //
+      // 现在的做法：自己发的消息照旧不带 seq；撤回按**原文匹配**去找是哪条
+      // （见 /api/socialV2/recall-message 的实现）。
+      const item = {
         sender: '我',
         text,
         plain: text,
@@ -12479,7 +12787,10 @@ async function main() {
         ownerLabel: '我',
         isSelf: true,
         time: now + i * 1000
-      });
+      };
+      // 回执：正文 + message_id + 时刻。撤回时按正文匹配、按时刻判 2 分钟窗口。
+      noteSentReceiptV2(st, text, Number(ids?.[i]), now + i * 1000);
+      st.recentMessages.push(item);
       // 自己发出去的话也是原文的一部分：以后复盘"当时我怎么说的"只能靠它。
       // 用时间戳当 seq，避免与入站消息的本地 seq 撞号。
       //
@@ -12699,30 +13010,123 @@ async function main() {
   // 她也能在同一条上下文里连续处理，不会被切成多个回合。
   //
   // 只做被动等待，不主动改状态：水位、未读都由调用方在这之后重新计算。
-  function observeBeforeSleepV2(st, key, waitMs = 10000) {
+  /**
+   * 观望：在 waitMs 内盯新消息。
+   *
+   * ⚠️ 2026-11-14 **重写判定依据**。原实现比较 `st.lastUnreadSeq > baseSeq`，
+   * 但 lastUnreadSeq 在消息**入库那一刻**就推进了 —— 如果消息恰好在
+   * "发送完成 → 开始观望"之间到达，baseSeq 读到的已经是新值，于是永远
+   * `nowSeq === baseSeq`，判定 arrived=false 却眼睁睁看着 unread 里躺着消息。
+   * 实测日志：`arrived=false waitedMs=7011 lastUnreadSeq=92 unread=1`。
+   *
+   * 现在改成**按未读数组的 seq 集合**判断：观望开始时记下当时 unread 里
+   * 已有的所有 seq（快照），之后只要出现任何**不在快照里**的 seq，就是新消息。
+   * 这样不受 lastUnreadSeq 提前推进的影响，也不怕消息在缝隙里到达。
+   *
+   * ⚠️ 2026-11-14 **二次修：返回值必须真的被用起来**。
+   * 原来只回 `{arrived, waitedMs}`，mark_read / set_wake_config 拿到后压根没读，
+   * 指望后面那个「uncovered 拦截分支」替它把消息贴出去 —— 可那道分支有两道门：
+   *   `isSleepingConfigV2()` 在 active / anyMessage 会话上恒为 false（私聊正是这种），
+   *   `preSleepWaitBlockedV2()` 在最近一句是结束语时也返回 false。
+   * 于是「观望第 1 秒就到消息、空转正确地提前结束」，她收到的却是一句
+   * 「✅ 收尾完成」，那几条消息只躺在 unread 里，要等下一次唤醒才看得见。
+   * 现在把观望期间新到的 `fresh` 一并带出去，由调用方**无条件**贴给她。
+   *
+   * 只做被动等待，不主动改状态：水位、未读都由调用方在这之后重新计算。
+   *
+   * ⚠️ 2026-11-14 **三次修：改成「安静窗」语义（操作者要求）**。
+   *
+   * 原语义是「见到第一条新消息就立刻结束观望」。问题是真人聊天是**连发**的：
+   * 第一句「在吗」到了就返回，她马上开始回，第二句「我跟你说个事」紧跟其后，
+   * 又变成需要下一次唤醒 —— 消息被切成碎片给她，她也容易抢话。
+   *
+   * 现在的语义与 `qq_wait_for_messages` 的 reply 静默窗口**完全一致**：
+   *   · 观望期间来了新消息 ⇒ **不立刻返回**，把「最后一条新消息」的时刻往后推；
+   *   · 只要在 `quietMs` 内又来了新消息，就继续等（再推一次）；
+   *   · 安静满 `quietMs` 没有任何新消息 ⇒ 返回，把那几条**拼成一次**给她。
+   *
+   * 必须有硬上限，否则「一直有人说话」会把她永久挂在这个 HTTP 请求里：
+   *   `hardCapMs` 到了就无条件返回（不管安静窗有没有满），把已经收到的带走。
+   * 这个上限还必须小于 MCP 侧的 `timeoutMs: 25000`（mark_read / wake-config），
+   * 否则工具会先被 AbortSignal 掐断，模型看到的是「超时」而不是消息。
+   */
+  function observeBeforeSleepV2(st, key, waitMs = 10000, opts = {}) {
+    // waitMs 仍然兼容旧调用（= 总预算）。安静窗默认取 waitMs，由调用方覆盖成配置值。
     const budget = Math.max(0, Math.min(120000, Number(waitMs) || 0));
-    if (!budget) return Promise.resolve({ arrived: false, waitedMs: 0 });
-    const baseSeq = Number(st.lastUnreadSeq) || 0;
+    const quietMs = Math.max(0, Math.min(120000,
+      opts.quietMs === undefined ? budget : Number(opts.quietMs) || 0));
+    // 硬上限：默认比 budget 多留出一个安静窗的余量（允许"来消息→再等一轮"），
+    // 但绝不超过 20 秒 —— MCP 那边是 25 秒超时，必须留出网络与序列化余量。
+    const hardCapMs = Math.max(budget, Math.min(20000,
+      opts.hardCapMs === undefined ? budget + quietMs : Number(opts.hardCapMs) || 0));
+    if (!budget && !quietMs) return Promise.resolve({ arrived: false, waitedMs: 0, fresh: [] });
+    // 快照：观望开始的那一刻，unread 里都已经有谁。
+    const seenAtStart = new Set(
+      (Array.isArray(st.unread) ? st.unread : [])
+        .map((m) => (m && Number.isSafeInteger(m.seq) ? m.seq : null))
+        .filter((s) => s !== null)
+    );
     const startedAt = Date.now();
+    // 最后一条「新消息」到达的观测时刻；0 表示观望期间还没来过新消息。
+    let lastNewAt = 0;
+    // 已经见过的最大 seq：用来判断"又来了一条新的"，与快照差集配合。
+    let seenMaxSeq = seenAtStart.size ? Math.max(...seenAtStart) : 0;
     return new Promise((resolve) => {
       let done = false;
+      const collectFresh = () => (Array.isArray(st.unread) ? st.unread : []).filter((m) => {
+        const s = m && Number.isSafeInteger(m.seq) ? m.seq : null;
+        return s !== null && !seenAtStart.has(s);
+      });
       const finish = (arrived) => {
         if (done) return;
         done = true;
         try { clearInterval(timer); } catch { /* ignore */ }
-        resolve({ arrived, waitedMs: Date.now() - startedAt });
+        // 一并把「观望期间新到的」挑出来带走：调用方不必再自己算一遍差集，
+        // 也就不会因为漏算/顺序问题又把消息吞回去。
+        const fresh = arrived ? collectFresh() : [];
+        resolve({ arrived, waitedMs: Date.now() - startedAt, fresh, quietSatisfied: arrived });
       };
-      // 每 250ms 瞄一眼：只要 lastUnreadSeq 涨了，就说明来新消息了。
-      // 用轮询而不是事件回调，是因为这个函数在 HTTP handler 里，没有事件上下文。
       const timer = setInterval(() => {
-        const nowSeq = Number(st.lastUnreadSeq) || 0;
-        if (nowSeq > baseSeq) { finish(true); return; }
-        if (Date.now() - startedAt >= budget) finish(false);
+        const now = Date.now();
+        // 这一轮有没有出现快照之外的新 seq（且 seq 比上次见到的更大）。
+        let newest = 0;
+        for (const m of (Array.isArray(st.unread) ? st.unread : [])) {
+          const s = m && Number.isSafeInteger(m.seq) ? m.seq : null;
+          if (s === null || seenAtStart.has(s)) continue;
+          if (s > newest) newest = s;
+        }
+        if (newest > seenMaxSeq) {
+          // 又来了一条新消息 ⇒ 安静计时器重置（连发场景下继续等）。
+          seenMaxSeq = newest;
+          lastNewAt = now;
+        }
+        // ① 还没有任何新消息：等满最初的 budget 就收（与旧行为一致，不拖长空等）。
+        if (!lastNewAt) {
+          if (now - startedAt >= budget) finish(false);
+          return;
+        }
+        // ② 来过新消息：等安静满 quietMs 再返回（把连发的几条合并成一次）。
+        if (now - lastNewAt >= quietMs) { finish(true); return; }
+        // ③ 硬上限兜底：一直有人在说话也不能把她永久挂住。
+        if (now - startedAt >= hardCapMs) finish(true);
       }, 250);
       // 不要 unref：这个定时器在 HTTP handler 里等待 Promise resolve，
       // unref 会让它不参与事件循环存活判定，极端情况下请求可能永远挂着。
     });
   }
+
+  // ── observeForCloseV2 已删除（2026-11-15）─────────────────────────────
+  //
+  // 它是 mark_read / set_wake_config 收尾观望的统一入口。那两个观望已经被
+  // 操作者要求整个去掉（理由见 mark-read 处理函数里的长注释：观望覆盖不了
+  // 「两个工具调用之间」的空隙，却很贵），所以这个入口也不需要了。
+  //
+  // `observeBeforeSleepV2` 本身**保留** —— `paceAfterSendV2`（发送后等 20 秒）
+  // 仍然用它。两者的区别只是调用参数：发送后那份用 send.minSendIntervalMs
+  // 当"没人说话时的干等时长"。
+  //
+  // `observingKeys` 也保留：paceAfterSendV2 期间同样要压住唤醒调度，
+  // 否则那 20 秒里消息一到就排唤醒，会在她还在等的时候就准备新回合。
 
   function requestedReadThroughSeqV2(st, body, isAgent) {
     if (!Object.prototype.hasOwnProperty.call(body, 'throughSeq')) return null;
@@ -12934,8 +13338,12 @@ async function main() {
         const includeRecent = !isPrivateChat || unread.length > 0;
         if (includeRecent) {
           const unreadSeqs = new Set(unread.map((m) => m.seq));
+          // 2026-11-13 修：**排除她自己发的消息**。
+          // 原来只排除了"仍在未读里的"，于是【之前】里会混进她刚说过的话 ——
+          // 她读起来像是"对方把我的话又说了一遍"，也被逼着回应自己。
+          // 未读那边本来就不含 isSelf（入站才进 unread），所以只有这里要补。
           const past = recent
-            .filter((m) => m && (!Number.isSafeInteger(m.seq) || !unreadSeqs.has(m.seq)))
+            .filter((m) => m && !m.isSelf && (!Number.isSafeInteger(m.seq) || !unreadSeqs.has(m.seq)))
             .slice(-maxRecentPerChat);
           for (const m of past) {
             recentRows.push({
@@ -13101,7 +13509,11 @@ async function main() {
     }
     if (v2ToolEnabled('getRecent') && maxRecent > 0) {
       const unread = new Set(st.unread.map((m) => m.seq));
-      const recent = st.recentMessages.filter((m) => !Number.isSafeInteger(m.seq) || !unread.has(m.seq)).slice(-maxRecent);
+      const recent = st.recentMessages
+        // 2026-11-13 修：同共享会话那条路径 —— 排除她自己发的。
+        // 【之前】是"对方之前说过什么"的上下文，把她自己的话塞进去只会让她回自己。
+        .filter((m) => m && !m.isSelf && (!Number.isSafeInteger(m.seq) || !unread.has(m.seq)))
+        .slice(-maxRecent);
       for (const msg of recent.reverse()) if (!tryAdd('recent', msg)) break;
       packet.recent.reverse();
     }
@@ -14039,6 +14451,40 @@ async function main() {
   }
 
   /** 会话此刻算忙的具体原因（只用于日志，避免排查时只能反复重启加猜）。 */
+  // 正在做「收尾前观望」的会话：观望期间**压住唤醒调度**，观望结束再放开。
+  //
+  // 为什么必须压（2026-11-14）：观望语义从「见消息即返回」改成「安静窗合并」之后，
+  // 它会长到 5~20 秒。而新消息一到，scheduleWakeV2 就会挂一个 batchWindowMs（默认 8 秒）
+  // 的唤醒定时器 —— 定时器会在观望**还没结束**时就到点，于是：
+  //   ① 那一刻她的回合仍在 tool call 里，判定"会话繁忙"，记 pendingWakeReasons；
+  //   ② 回合结束后 replayPendingWakeReasonsV2 补一次唤醒；
+  //   ③ 而观望已经把同一批消息贴给她、她也在同一回合里回过了。
+  // 结果同一批消息被处理两遍：一次在回合内（观望贴出），一次在回合后（补发唤醒）。
+  // 实测日志里 13:52:55 的「计划唤醒 … 8s 后发送」正好落在观望窗口内。
+  //
+  // 压制方式：只**推迟**不丢弃 —— scheduleWakeV2 见到有观望在进行就直接返回，
+  // 观望结束（observeForCloseV2 / paceAfterSendV2）时再把期间来的消息重新排一次。
+  // 用 Set 而不是挂在 st 上：观望是 HTTP handler 内的同步等待，跨会话不会互相影响。
+  const observingKeys = new Set();
+
+  /**
+   * 观望结束后补排唤醒。
+   * 观望期间被压掉的唤醒不会自己回来，必须在这里重新问一次。
+   * 只在她**确实没在收尾**的情况下补：她已经 mark_read 成功、或已设好唤醒配置，
+   * 那批消息她已经看过并处理了，不该再叫醒她。
+   */
+  function resumeWakeAfterObserveV2(key) {
+    if (!key) return;
+    observingKeys.delete(canonicalV2Key(key) ?? key);
+    const st = getSocialV2State(key);
+    if (!st) return;
+    // 还有她没看过的消息 ⇒ 那一轮唤醒仍然值得发（她可能因为繁忙没处理完）。
+    const seen = st.modelSeenSeqs instanceof Set ? st.modelSeenSeqs : new Set(st.modelSeenSeqs || []);
+    if ((st.unread || []).some((m) => !seen.has(m.seq))) {
+      scheduleWakeV2(key, 'message');
+    }
+  }
+
   function busyReasonV2(key, st) {
     if (st?.pendingWakeTimer) return 'pendingWakeTimer';
     if (pendingWakeKeys.has(key)) return 'pendingWakeKey';
@@ -14109,6 +14555,12 @@ async function main() {
   function scheduleWakeV2(key, reason) {
     if (cfg.socialV2?.enabled === false) return;
     if (socialV2.paused) return;
+    // 观望进行中：压住唤醒，等观望结束后由 resumeWakeAfterObserveV2 补排。
+    // 见 observingKeys 处的说明 —— 不压的话同一批消息会在观望内、观望后各处理一遍。
+    if (observingKeys.has(canonicalV2Key(key) ?? key)) {
+      log(`[reserved2] 观望进行中，暂缓计划唤醒 ${key}（${reason}）`);
+      return;
+    }
     if (!isSessionAllowedInCurrentMode(key)) {
       log(`[reserved2] 跳过计划唤醒 ${key}（${reason}）：会话已不在当前模式允许范围内`);
       return;
@@ -14901,11 +15353,24 @@ async function main() {
       appendActivity(`${key} 收到拍一拍事件（非 reserved2，仅记录）：${senderId} -> ${targetId}`);
       return;
     }
+    // 2026-11-14 修：**先查别名表**，再看群成员接口。
+    //
+    // 原来只有群聊分支会解析昵称（resolveGroupMemberName），私聊拍一拍的 sender
+    // 直接就是 QQ 号 —— 那条消息进 recentMessages 后，noteAliasV2 会把号码当成
+    // "名字"写进别名表，把已有的正常昵称顶掉（详见 noteAliasV2 的注释）。
+    //
+    // 现在三级回退：别名表（最快、最准，正常消息早就写进去了）→ 群成员接口 → QQ 号。
+    // 私聊也能命中别名表，因为同一个人只要在群里说过话就已经有记录了。
     let sender = senderId;
-    if (kind === 'group' && senderId) {
-      try {
-        sender = await resolveGroupMemberName(Number(id), senderId) || senderId;
-      } catch {}
+    if (senderId) {
+      const known = displayNameOfV2(senderId, '');
+      if (known && known !== senderId) {
+        sender = known;
+      } else if (kind === 'group') {
+        try {
+          sender = await resolveGroupMemberName(Number(id), senderId) || senderId;
+        } catch {}
+      }
     }
     const targetIsSelf = !!targetId && selfId != null && String(targetId) === String(selfId);
     const isOwner = String(senderId) === String(cfg.ownerQQ ?? '');

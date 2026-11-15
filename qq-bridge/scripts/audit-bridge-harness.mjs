@@ -172,6 +172,13 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     sendToQQ, sendStickerV2, handleIncoming, startConsoleServer, cfg, state, api, promptQueues,
     getSocialV2State, appendSocialV2Message, recordSentMessagesV2,
     buildWakePromptV2, buildWakeSnapshotV2, sendWakePromptV2, socialV2,
+    // 唤醒调度：给「观望期间必须压住唤醒」这条回归用（test-observe-before-sleep.mjs）。
+    // 不导出的话那条断言只能靠等定时器真的触发，慢 8 秒还测不稳定。
+    scheduleWakeV2,
+    // 唤醒判定与优先级：直接断言"什么样的事件会唤醒她"，不必真的投递 prompt。
+    evaluateWakeTriggerV2, wakePriorityV2, defaultWakeConfigV2,
+    // 别名表：昵称 ↔ QQ 号。test-alias-no-number 要直接断言"号码不会当名字写进去"。
+    noteAliasV2, displayNameOfV2, lookupAliasV2,
     syncStickerLibrary, listStickersForV2, getStickerImageData,
     refreshMode, modeAllowed, trackTurnEvent, replayPendingWakeReasonsV2,
     // 三档权限分级：档位判定与「该用哪个 preset」都暴露出来，方便直接断言（不必真建会话）。
@@ -225,6 +232,14 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
   };
   bot.onPrivateMessage(async (event) => {`);
   const timers = new Set();
+  // 注意：setInterval **不能桩成空函数**。
+  // 这里原来写的是 `setInterval: () => ({ unref() {} })`，于是 bridge.js 里
+  // observeBeforeSleepV2 的 250ms 轮询定时器永远不回调 ⇒ 它的 Promise 永不 resolve
+  // ⇒ /api/socialV2/mark-read 整个请求挂死，直到调用方的 4s 超时才断。
+  // 表现为 test-token-economy 里 26 个用例集体超时（而不是断言失败），
+  // 让人误以为是水位算法坏了 —— 其实那条路在测试里从没跑通过。
+  // 现在给真定时器，并登记到 timers，close() 时一并清掉，避免测试进程挂住。
+  const intervals = new Set();
   const context = vm.createContext({
     fs, os, path, http, crypto, fileURLToPath, URL, Buffer, AbortSignal, console: { log() {}, error() {} },
     fetch: fakeFetch,
@@ -235,7 +250,11 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     // 之前只给 pid/platform/kill/exit，导致 `process.env.FFMPEG_PATH` 直接抛 TypeError。
     process: { pid: process.pid, platform: process.platform, kill: process.kill, env: {}, exit: (code) => { throw new Error('unexpected exit ' + code); } },
     setTimeout: (fn, ms) => { const timer = setTimeout(fn, ms); timers.add(timer); return timer; },
-    clearTimeout, setInterval: () => ({ unref() {} }), clearInterval: () => {},
+    clearTimeout,
+    // setInterval 用真实实现（见上面 timers 处的说明）：观望轮询必须真的跑起来。
+    setInterval: (fn, ms) => { const timer = setInterval(fn, ms); intervals.add(timer); return timer; },
+    // clearInterval 也要真的清：否则 close() 之后残留的轮询会一直阻着事件循环。
+    clearInterval: (timer) => { if (timer) intervals.delete(timer); clearInterval(timer); },
     NodeApiClient: class { constructor() { return api; } },
     SnowLumaWebSocketClient: FakeBot, text: (s) => s,
     discoverDshLaunchToken: () => '', unwrap, createTurnCollector,
@@ -312,6 +331,11 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
   bridge.setReady(true);
   return { ...bridge, calls, temp, async close() {
     for (const timer of timers) clearTimeout(timer);
+    // 观望轮询（observeBeforeSleepV2 的 250ms setInterval）也要在这里停掉，
+    // 否则一个用例跑完它的定时器还活着，拖住事件循环、甚至跨用例误触发。
+    for (const interval of intervals) clearInterval(interval);
+    timers.clear();
+    intervals.clear();
     fs.rmSync(temp, { recursive: true, force: true });
   } };
 }
