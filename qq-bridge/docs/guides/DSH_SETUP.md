@@ -13,8 +13,8 @@
 1. **克隆/获取仓库**：
 
    ```bash
-   git clone https://github.com/Derpyu520/qq-bridge.git
-   cd qq-bridge
+   git clone https://github.com/Ap0LoG1zE/qq-dsh-bridge-L2Finished.git
+   cd qq-dsh-bridge-L2Finished/qq-bridge
    ```
 
    > 默认分支 `main` 即当前版本 **v0.1.5**（适配 DSH 0.1.5-rc.1），clone 下来无需切换分支。
@@ -22,7 +22,7 @@
 2. **安装依赖**：
 
    ```bash
-   npm install
+   npm ci
    ```
 
    > `postinstall` 会自动修补 `@snowluma/sdk` 的 ESM 打包 bug。

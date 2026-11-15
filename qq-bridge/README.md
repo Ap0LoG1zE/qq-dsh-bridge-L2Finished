@@ -112,7 +112,7 @@ QQ 消息 ──► SnowLuma（OneBot v11 WS）──► 本桥接进程 ──�
 ## 安装与配置
 
 ```bash
-npm install        # 安装依赖（postinstall 会自动修补 @snowluma/sdk 的 ESM 打包 bug）
+npm ci        # 安装依赖（postinstall 会自动修补 @snowluma/sdk 的 ESM 打包 bug）
 ```
 
 复制 `config.example.json` 为 `config.json` 后编辑：
@@ -172,9 +172,9 @@ node scripts/setup-dsh.mjs
 
 2. **装桥接并复制配置**
    ```bash
-   git clone https://github.com/Derpyu520/qq-bridge.git
-   cd qq-bridge
-   npm install
+   git clone https://github.com/Ap0LoG1zE/qq-dsh-bridge-L2Finished.git
+   cd qq-dsh-bridge-L2Finished/qq-bridge
+   npm ci
    ```
    Windows CMD 用 `copy config.example.json config.json`，其他平台用 `cp config.example.json config.json`。
    **示例模板里 `allow.private` / `allow.groups` 是空数组**——空白名单 + `allowAllWhenEmpty: false` 时桥接不响应任何消息（这是刻意的 fail-closed 默认值）。白名单在第 5 步填。

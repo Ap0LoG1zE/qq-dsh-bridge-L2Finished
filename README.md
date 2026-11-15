@@ -232,9 +232,9 @@ L4  自我认知    selfNote —— 它对自己的叙述（本项目新增）
 
 ```powershell
 cd <你想放仓库的目录>
-git clone <本仓库地址> qq-dsh-bridge
+git clone https://github.com/Ap0LoG1zE/qq-dsh-bridge-L2Finished.git qq-dsh-bridge
 cd qq-dsh-bridge\qq-bridge
-npm install
+npm ci
 ```
 
 #### 4. 生成配置
@@ -319,7 +319,7 @@ powershell -ExecutionPolicy Bypass -File tools\qq-bot.ps1 start
 
 **agent 应该做的事**（你可以拿这个 checklist 盯它）：
 
-1. `npm install`
+1. `npm ci`
 2. 从 `config.example.json` 复制 → 改 `ownerQQ` / `allow` / `snowluma.accessToken`
 3. `node scripts/setup-dsh.mjs desktop`
 4. 配 `qq-agent-context` 的 `tokenFile`

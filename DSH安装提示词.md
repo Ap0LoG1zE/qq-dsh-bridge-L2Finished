@@ -44,7 +44,18 @@
 
 ### 1. 取仓库
 
-解压到不含空格的路径。注意本机工作区若含中文目录名是允许的（我们实测通过），但**不能有空格**。
+从 GitHub 克隆（**推荐**，这样以后能 `git pull` 更新）：
+
+```powershell
+cd <你想放仓库的目录>
+git clone https://github.com/Ap0LoG1zE/qq-dsh-bridge-L2Finished.git qq-dsh-bridge
+```
+
+克隆完的仓库根就是下文说的 `<仓库>`，路径**不能有空格**
+（`dsh plugin` 会把参数拼成命令行）。本机工作区含中文目录名是允许的
+（我们实测通过）。
+
+没有 git 的话，去 GitHub 页面 `Code → Download ZIP` 解压也一样。
 
 ### 2. 安装依赖
 

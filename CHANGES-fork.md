@@ -191,7 +191,7 @@ Promise 永不 resolve，`/api/socialV2/mark-read` 在测试里整个挂死到 4
 `['其实我是想说，', '我 今天 有点 累']`（两条旧提示都会被触发），
 返回只剩 `{"ok":true,"sent":2,"failed":0,"delays":[2418],"quoted":null}`。
 
-### 6. 收尾观望整个删除 + 发送后等 20 秒（2026-11-15，操作者定稿）
+### 6. 收尾观望整个删除 + 发送后等 30 秒（2026-11-15，操作者定稿）
 
 > 这一节**推翻了第 4 节**的做法。第 4 节修的是"观望抓到消息却没给她"，
 > 但操作者随后发现：观望本身就是错的方向。
@@ -356,6 +356,79 @@ qq_recall_message(key, token, text)   →   "✅ 已撤回"
 **测试**：`scripts/test-recall-message.mjs`（7 例），已登记进 `test-audit.mjs`。
 覆盖：自己的消息不带 seq、按原文撤回、片段命中、多条取最新、别人的撤不了、
 超 2 分钟不尝试、空/超长原文拒绝。改前 7 例全红，改后全绿。
+
+### 8. 私聊主动机会的提示词不再说"群里"（2026-11-15）
+
+**症状**：操作者发现「群聊有主动唤醒的提示词，私聊没有」，而且
+「以前什么都没改的时候她会主动找我」。
+
+**排查结论：机制对私聊是生效的**，不需要改调度：
+
+- `scheduleProactiveCheckV2` 没有 `group:` 限制（日志实测
+  `15:50:37 唤醒 private:...（proactiveCheck）` 确实触发了）
+- 配置正常：30~90 分钟检查一次、空闲 15 分钟触发、概率 0.3
+- 上游原版那个 `key.startsWith('group:')` 限制在**一代**社交模式
+  （`cfg.social`），与二代 `reserved2` 无关
+
+**真正的 bug 在文案**：`buildWakePromptV2` 里 `proactiveCheck` 这一档
+不管群聊私聊都用同一句：
+
+```
+（群里安静了一阵，想说什么可以说。）
+```
+
+私聊收到「群里」两个字，会判断成"别人的事"，于是不开口。
+
+**改法**：按会话类型分句 —— 私聊说「这个人有阵子没说话了，想找他可以说」，
+群聊保持原样。两句都沿用 `（对方回你了。）` 那种短口吻，只说明
+"为什么叫醒你"，不写行动要求（那些在 preset 里）。
+
+**测试**：`scripts/test-proactive-prompt.mjs`（3 例）。覆盖私聊不说"群里"、
+群聊文案不变、其它唤醒原因（timeout / replyCheck / poke）没被波及。
+
+### 9. 开源前清理（2026-11-15，让本项目可以被别人部署）
+
+仓库已经推到公开地址，清理前存在真实凭据与个人数据。这一节记录**删了什么、
+改名换成什么**，部署者需要据此理解差异。
+
+**删除的垃圾/一次性文件**：
+
+| 文件 | 原因 |
+|---|---|
+| `qq-bridge/_cfg_rebuild.json`、`config.recovered.json` | 含**真实 SnowLuma accessToken** |
+| `qq-bridge/_bridge.new.js` | `src/bridge.js` 的旧备份（918KB，无任何引用） |
+| `qq-bridge/_snowluma-catalog.json` | 网关工具目录快照 |
+| `qq-bridge/acl-recovery/` | ACL 排错日志，含本机路径 / 用户名 / SID |
+| `qq-bridge/roles/角色A.md` | 作者自己的角色设定（人格全文） |
+| `qq-bridge/docs/PROJECT_HANDBOOK.md` | 作者的运维笔记（本机路径、重启命令、成本分析） |
+| `scripts/_*.mjs`（7 个） | 一次性调试脚本 |
+
+**改名**（标识符，必须全链路同步否则插件装不上 / 接口 404）：
+
+| 原 | 现 |
+|---|---|
+| `dsh-plugins/qq-dsh-panel` | `dsh-plugins/qq-dsh-panel` |
+| 预设 id `qq-chat-agent` | `qq-chat-agent` |
+
+**脱敏**：作者的 QQ 号 / 群号 / 机器人 QQ / GitHub 用户名 / 角色名 / 群友 QQ
+全部换成占位符（`10001` / `20001` / `30001` / `70001~70008` / `角色A` / `群友A`）。
+
+**修硬编码本机路径**（别人 clone 下来跑不了的根因）：
+
+- `src/tts.js`：`refAudio` / `refText` 默认值**清空**。原来指向作者本机的
+  wav 文件，别人没那个文件，一开 TTS 就报"参考音频不存在"。
+- `scripts/tts-*.mjs`：改用环境变量 `TTS_REF_WAV` / `TTS_REF_TEXT` / `TTS_REF_DIR`。
+- `scripts/test-affinity-survives-reset.mjs`：`ROOT` 改为按脚本位置推导
+  （可用 `QQ_BRIDGE_ROOT` 覆盖）。
+- `scripts/test-affinity.mjs`：人格卡不存在时跳过相关检查（开源版不含角色设定）。
+
+**验证方式**：不再用本地 `git grep`（那只证明工作区干净），
+改成 `git clone` 远端到临时目录后全量扫描 —— 扫的是**远端真实内容**。
+255 个文本文件全部扫描，全部敏感串 0 命中。
+
+> ⚠️ **令牌仍需更换**：清理只处理了当前文件，git 历史里（提交 `70c0be0` 等）
+> 令牌与 QQ 号仍可被翻出。仓库是 public，所以**必须去 SnowLuma 重新生成
+> accessToken** —— 换完旧令牌立刻失效，历史里留着只是废字符串。
 
 ---
 
