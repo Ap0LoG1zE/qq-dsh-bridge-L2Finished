@@ -141,6 +141,13 @@ node scripts/setup-dsh.mjs desktop
 
 ### 6. 挂 qq-agent-context（setup-dsh 不含它，必做）
 
+> ⚠️ **这一步有三小步，缺任何一步插件都不会被加载。**
+> 2026-11-15 实测踩过：只做了前两步、junction 建得好好的、YAML 也解析通过，
+> 但 DSH 就是不加载它 —— 因为漏了第 ③ 步「登记进 profile package.json」。
+> 症状是模型拿不到【令牌】，QQ 工具全部被拒，而桥接端点本身是正常的。
+
+**① 建两层 junction**
+
 ```powershell
 $repo = '<仓库>\qq-bridge\plugins\qq-agent-context'
 $l1 = "$env:USERPROFILE\.dsh\plugins\qq-agent-context"
@@ -150,7 +157,7 @@ New-Item -ItemType Junction -Path $l1 -Target $repo | Out-Null
 New-Item -ItemType Junction -Path $l2 -Target $l1 | Out-Null
 ```
 
-在 `%USERPROFILE%\.dsh\profiles\desktop\cordis.patch.yml` 末尾追加：
+**② 在 `<profile>\cordis.patch.yml` 末尾追加**
 
 ```yaml
 - insert:
@@ -161,7 +168,36 @@ New-Item -ItemType Junction -Path $l2 -Target $l1 | Out-Null
         tokenFile: '<仓库>\qq-bridge\state\console-token'
 ```
 
-> 这一步 + `injectViaSystemPrompt: true` 是配套的：身份/令牌改由插件写进系统提示词，唤醒包才干净。**只开开关不装插件 = 模型拿不到令牌，工具全被拒。**
+**③ 登记进 profile 的 `package.json`（最容易漏的一步）**
+
+把 `@local/qq-agent-context` 同时写进 `dependencies` 和 `dsh.profile.bundles`：
+
+```powershell
+$pj = "$env:USERPROFILE\.dsh\profiles\desktop\package.json"
+$j = Get-Content $pj -Raw -Encoding utf8 | ConvertFrom-Json
+$j.dependencies | Add-Member -NotePropertyName '@local/qq-agent-context' `
+  -NotePropertyValue 'link:C:/Users/<你>/.dsh/plugins/qq-agent-context' -Force
+if ($j.dsh.profile.bundles -notcontains '@local/qq-agent-context') {
+  $j.dsh.profile.bundles += '@local/qq-agent-context'
+}
+$j | ConvertTo-Json -Depth 10 | Set-Content $pj -Encoding utf8
+```
+
+然后（镜像别忘记，npmjs 在国内会 ETIMEDOUT）：
+```powershell
+$env:npm_config_registry = 'https://registry.npmmirror.com'
+dsh plugin --profile desktop install
+```
+
+**验收**：重启 DSH 后，桥接日志里应当出现对 `/api/socialV2/agent-context` 的请求
+（插件加载后 `agent/created` 和每 120 秒的刷新都会打这个端点）。
+如果没有这条日志，说明插件仍未被加载 —— 回头检查第 ③ 步。
+
+> 这一步 + `injectViaSystemPrompt: true` 是配套的：身份/令牌改由插件写进系统提示词，
+> 唤醒包才干净（唤醒词里不再有【你的身份】【令牌】两行）。
+> **只开开关不装插件 = 模型拿不到令牌，工具全被拒。**
+> 反过来，如果不想装插件，就把 `injectViaSystemPrompt` 设成 `false`（默认），
+> 身份和令牌会直接写在唤醒词里 —— 这条路更简单，装不上时可以用它兜底。
 
 ### 7. 装悬浮球 qq-dsh-panel（**必装**）
 

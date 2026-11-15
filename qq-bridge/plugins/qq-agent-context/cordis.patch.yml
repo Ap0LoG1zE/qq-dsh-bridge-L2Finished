@@ -1,4 +1,18 @@
+# qq-agent-context 的 DSH bundle patch。
+#
+# ⚠️ 2026-11-15 修：这里原来是 `config: {}`（空配置）。
+# 后果很隐蔽：插件 apply() 里 `tokenFile = config?.tokenFile || DEFAULT_TOKEN_FILE`，
+# 空配置会走默认值；而一旦 profile 侧的 cordis.patch.yml 也写了一份 insert，
+# **两份 config 会互相覆盖**，表现为「tokenFile 明明配了，插件却拿不到」
+# —— 协助者部署时在这一点上卡了三轮（见 2026-11-15 的会话记录）。
+#
+# 现在把默认值写在源头，profile 侧不必再重复写一份（写了也以这份为基线）：
+#   · bridgeUrl 默认 http://127.0.0.1:3100（桥接控制台端口）
+#   · tokenFile 留空 → 走 index.js 里的 DEFAULT_TOKEN_FILE（见那里）。
+#     想自定义的人**只改这一处**，别在 profile 里再写一遍。
+
 - insert:
     - id: qq-agent-context
       name: '@local/qq-agent-context'
-      config: {}
+      config:
+        bridgeUrl: 'http://127.0.0.1:3100'

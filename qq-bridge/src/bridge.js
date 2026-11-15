@@ -3114,7 +3114,7 @@ async function main() {
       // 2026-11-15：token 从 48 字符缩到 8 字符（操作者要求省上下文）。
       // 8 位十六进制 = 40 亿种，配合「只接受本机会话 + 白名单」够用；
       // 原来 48 字符 × 每次工具调用，300 次就是 14k 字符的白烧。
-      st.agentToken = crypto.randomBytes(4).toString('hex');
+      st.agentToken = crypto.randomBytes(16).toString('hex');
       rememberAgentToken(key, st.agentToken);
       st.bootstrapSent = false;
       // 共用会话：整组一起复位。只复位自己会让组里其它 key 仍然「已引导」，
@@ -10503,9 +10503,9 @@ async function main() {
           if (!val || typeof val !== 'object') continue;
           if (!/^(group|private):\d+$/.test(key)) continue;
           const defaultWc = defaultWakeConfigV2();
-          let agentToken = String(val.agentToken || crypto.randomBytes(4).toString('hex'));
+          let agentToken = String(val.agentToken || crypto.randomBytes(16).toString('hex'));
           if (!agentToken || seenTokens.has(agentToken)) {
-            agentToken = crypto.randomBytes(4).toString('hex');
+            agentToken = crypto.randomBytes(16).toString('hex');
           }
           seenTokens.add(agentToken);
           const st = {

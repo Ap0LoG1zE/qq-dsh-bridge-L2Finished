@@ -12,12 +12,36 @@
 // 注意：`text` 是同步函数（DSH 每步装配时同步求值），所以内容必须来自本地缓存，
 // 不能在里面发请求。缓存由 agent/created 与定时刷新维护。
 
+// 这两个是纯函数模块，顶层 import 没有副作用。
+// fileURLToPath 在 Windows 上才能把 import.meta.url 正确转成盘符路径
+// （new URL().pathname 会给 /D:/... 这种形式，拼路径会出错）。
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 const DEFAULT_BRIDGE = 'http://127.0.0.1:3100';
 // 控制台令牌文件：**不要写死绝对路径**（换台机器就再也读不到，而且开源会泄露作者目录）。
-// 优先级：插件 config.tokenFile > 环境变量 QQ_BRIDGE_TOKEN_FILE > 空。
-// 默认留空 = 不注入（降级运行），而不是猜一个大概率不对的路径、让用户以为配好了。
-// 安装时请显式配置：见 README「安装 → 配置 tokenFile」。
-const DEFAULT_TOKEN_FILE = process.env.QQ_BRIDGE_TOKEN_FILE || '';
+// 优先级：插件 config.tokenFile > 环境变量 QQ_BRIDGE_TOKEN_FILE > **自动推导**。
+//
+// ⚠️ 2026-11-15 修：原来最后一档是"空" —— 插件于是静默降级成"不注入"，
+// 配置看起来完全正确、也不报任何错，模型却拿不到【令牌】，QQ 工具全部被拒。
+// 协助者部署时在这个坑上卡了三轮（每轮都以为改对了，实际插件一直在空转）。
+//
+// 现在改成自动推导：插件本体位于 `<仓库>/qq-bridge/plugins/qq-agent-context/index.js`，
+// 往上两级就是 `<仓库>/qq-bridge`，令牌在它下面的 `state/console-token`。
+// 推导成功就不用配任何东西；推导失败会**明确报错**到日志，不再装聋作哑。
+const AUTO_TOKEN_FILE = (() => {
+  try {
+    // 用 fileURLToPath 而不是 new URL().pathname —— Windows 上前者才给正确的盘符路径。
+    const here = fileURLToPath(import.meta.url);          // .../plugins/qq-agent-context/index.js
+    const pluginDir = path.dirname(here);                  // .../plugins/qq-agent-context
+    const pluginsDir = path.dirname(pluginDir);            // .../plugins
+    const bridgeDir = path.dirname(pluginsDir);            // .../qq-bridge
+    return path.join(bridgeDir, 'state', 'console-token');
+  } catch {
+    return '';
+  }
+})();
+const DEFAULT_TOKEN_FILE = process.env.QQ_BRIDGE_TOKEN_FILE || AUTO_TOKEN_FILE;
 const FETCH_TIMEOUT_MS = 1200;
 const REFRESH_MS = 120000;
 const TOKEN_TTL_MS = 60000;
@@ -33,22 +57,40 @@ export function apply(ctx, config) {
   // sessionId → fiber
   const fibers = new Map();
   let tokenCache = { value: '', at: 0 };
+  // 令牌文件相关的问题只报警一次：每轮都刷会把 DSH 日志冲爆。
+  let tokenFileWarned = false;
 
   const textOf = (agent) => cache.get(String(agent.id))?.text ?? '';
 
   // 控制台令牌：桥接的所有 HTTP 路由都要求它。读文件而不是写进配置，
   // 这样令牌轮换后插件自动跟上（缓存 60 秒，避免每轮都读盘）。
   async function consoleToken() {
-    // 没配 tokenFile 就直接空手返回：不读盘、不报错，插件降级为「不注入上下文」。
-    // 这比猜路径好 —— 猜错时表现是"插件装好了但模型什么都看不到"，很难排查。
-    if (!tokenFile) return '';
+    // 2026-11-15：不再"没配就静默返回空"。
+    // 实测这个静默降级是部署时最难查的问题 —— 插件看起来装好了、配置也写了，
+    // 但模型拿不到【令牌】，QQ 工具全被拒，日志里一个字都不提。
+    // 现在：解析不到就**明确写一条警告**（只写一次，避免每轮刷屏）。
+    if (!tokenFile) {
+      if (!tokenFileWarned) {
+        tokenFileWarned = true;
+        console.warn('[qq-agent-context] 没有可用的 tokenFile —— 插件将不注入任何内容。'
+          + ' 请设置环境变量 QQ_BRIDGE_TOKEN_FILE，或在 cordis.patch.yml 的 config.tokenFile 指定。'
+          + ' （正常安装时应当能自动推导到 <仓库>/qq-bridge/state/console-token）');
+      }
+      return '';
+    }
     const now = Date.now();
     if (now - tokenCache.at < TOKEN_TTL_MS) return tokenCache.value;
     try {
       const { readFile } = await import('node:fs/promises');
       const raw = await readFile(tokenFile, 'utf8');
       tokenCache = { value: raw.trim(), at: now };
-    } catch {
+    } catch (error) {
+      // 读失败也要说清楚：路径错 / 权限不足 / 桥接还没跑过（文件未生成）。
+      if (!tokenFileWarned) {
+        tokenFileWarned = true;
+        console.warn(`[qq-agent-context] 读不到 tokenFile: ${tokenFile} —— ${error?.message ?? error}。`
+          + ' 桥接首次启动后才会生成这个文件；如已启动仍报错，检查路径与权限。');
+      }
       tokenCache = { value: tokenCache.value, at: now };
     }
     return tokenCache.value;
