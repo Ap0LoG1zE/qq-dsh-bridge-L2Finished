@@ -38,7 +38,7 @@ try {
     999999999: { traits: ['别名表里也没有这个人'], interactionCount: 1, lastSeenAt: 1000 },
   };
   h.socialV2.aliases = {
-    10001: { primary: 'Ap0LoG1zE', names: ['Ap0LoG1zE'], lastAt: Date.now() },
+    10001: { primary: '群友A', names: ['群友A'], lastAt: Date.now() },
     70001: { primary: '7月1', names: ['7月1'], lastAt: Date.now() },
   };
   g.todos = [
@@ -62,7 +62,7 @@ try {
   console.log('total:', im.total);
   for (const x of im.impressions || []) console.log(`  - ${x.name}（${x.userId}）: ${x.traits.join('、')}`);
   ok('群友印象能读到（原来恒为 0）', im.total === 3);
-  ok('有别名的显示名字', (im.impressions || []).some((x) => x.name === 'Ap0LoG1zE'));
+  ok('有别名的显示名字', (im.impressions || []).some((x) => x.name === '群友A'));
   ok('别名表里没有的退回 QQ 号', (im.impressions || []).some((x) => x.userId === '999999999' && x.name === '999999999'));
   ok('带 userId 字段（面板改名/删除要用）', (im.impressions || []).every((x) => x.userId));
 

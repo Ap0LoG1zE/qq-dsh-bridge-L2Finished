@@ -41,7 +41,7 @@ function seedAll(h, stateDir) {
   const g = h.getSocialV2State('global');
   g.selfNotes = [{ text: 'SELFNOTE-MARKER 我不喜欢被叫大肥鱼', at: Date.now() }];
   g.memberImpressions = {
-    Ap0LoG1zE: { traits: ['IMPRESSION-MARKER 天天改我的提示词'], lastSeenAt: Date.now() }
+    群友A: { traits: ['IMPRESSION-MARKER 天天改我的提示词'], lastSeenAt: Date.now() }
   };
   addFact(stateDir, 'global', { text: 'FACT-MARKER 要说记住了别说记下了', tag: 'agreement' });
 }

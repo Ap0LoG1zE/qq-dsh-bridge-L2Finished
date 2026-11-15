@@ -12,8 +12,15 @@ import path from 'node:path';
 import { readFileSync } from 'node:fs';
 
 const BASE = 'http://127.0.0.1:9872';
-const REF = 'D:\\Desktop\\角色A AI\\ごめんなさい。バンド壊して、ギター下手で、ずっと謝りたかった(2).wav';
-const REF_TEXT = 'ごめんなさい。バンド壊して、ギター下手で、ずっと謝りたかった';
+// 参考音频路径由环境变量提供（2026-11-15 开源清理）：
+// 原来硬编码了作者本机路径，别人跑不了。
+// 用法：set "TTS_REF_WAV=D:\audio\ref.wav"
+const REF = process.env.TTS_REF_WAV || '';
+if (!REF || !fs.existsSync(REF)) {
+  console.error('请先设置环境变量 TTS_REF_WAV 指向一个参考音频文件（.wav）。');
+  process.exit(1);
+}
+const REF_TEXT = process.env.TTS_REF_TEXT || 'ごめんなさい。バンド壊して、ギター下手で、ずっと謝りたかった';
 const OUT = path.join('state', 'ref-free-test');
 fs.mkdirSync(OUT, { recursive: true });
 

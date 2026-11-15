@@ -5,7 +5,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-const ROOT = 'D:\\DSH\\qq-dsh-bridge\\qq-bridge';
+// 桥接根目录默认取脚本所在目录的上一级（2026-11-15 开源清理）。
+// 原来硬编码作者本机路径 <仓库>\...，别人 clone 下来跑不了。
+// 需要指向别处时用环境变量：set "QQ_BRIDGE_ROOT=D:\your\path\qq-bridge"
+const ROOT = process.env.QQ_BRIDGE_ROOT
+  || path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')), '..');
 const STATE = path.join(ROOT, 'state');
 const cfg = JSON.parse(fs.readFileSync(path.join(ROOT, 'config.json'), 'utf8'));
 const token = fs.readFileSync(path.join(STATE, 'console-token'), 'utf8').trim();

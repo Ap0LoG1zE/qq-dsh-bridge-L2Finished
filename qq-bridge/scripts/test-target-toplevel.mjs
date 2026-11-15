@@ -2,7 +2,7 @@
 //
 // 原始失败输入（模型实际发的）：
 //   { category: 'memberImpression', content: '…', key: 'group:20001',
-//     target: 'Ap0LoG1zE', token: '…' }        ← target 在顶层
+//     target: '群友A', token: '…' }        ← target 在顶层
 // 报错：memberImpression 需要 extra.target 指定群友名字
 //
 // 现在两端都收：MCP 侧把顶层 target 并进 extra；桥接侧也认 body.target。
@@ -31,7 +31,7 @@ const { port } = srv.address();
 
 try {
   // 先放一条群消息，让 target 反查能拿到 QQ 号
-  h.appendSocialV2Message(G, 'Ap0LoG1zE', '你是人是鬼', '你是人是鬼', false, true, 'm1', [], '10001', []);
+  h.appendSocialV2Message(G, '群友A', '你是人是鬼', '你是人是鬼', false, true, 'm1', [], '10001', []);
   const token = h.getSocialV2State(G).agentToken;
 
   const post = async (payload) => {
@@ -46,12 +46,12 @@ try {
   const CONTENT = '在群里被问「你是人是鬼」，回了一句就罢。他总爱把话绕回"笨蛋"，绕完又自己说不管。';
 
   // ① 顶层 target（就是刚才失败的那种写法）
-  const r1 = await post({ category: 'memberImpression', content: CONTENT, target: 'Ap0LoG1zE' });
+  const r1 = await post({ category: 'memberImpression', content: CONTENT, target: '群友A' });
   console.log('\n① 顶层 target →', r1.status, JSON.stringify(r1.body).slice(0, 150));
   ok('顶层 target 能写入', r1.status === 200 && r1.body.ok === true);
 
   // ② 老写法 extra.target 仍然可用
-  const r2 = await post({ category: 'memberImpression', content: '第二条观察', extra: { target: 'Ap0LoG1zE' } });
+  const r2 = await post({ category: 'memberImpression', content: '第二条观察', extra: { target: '群友A' } });
   console.log('② extra.target →', r2.status, JSON.stringify(r2.body).slice(0, 150));
   ok('extra.target 老写法仍可用', r2.status === 200 && r2.body.ok === true);
 

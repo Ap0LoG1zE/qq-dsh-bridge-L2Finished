@@ -38,7 +38,7 @@ try {
   // 别名表（名字的唯一真相）。桥接每收到一条消息都会写它；测试里直接注入等价数据。
   h.socialV2.aliases = {
     70001: { primary: '7月1', names: ['7月1'], lastAt: Date.now() },
-    10001: { primary: 'Ap0LoG1zE', names: ['Ap0LoG1zE'], lastAt: Date.now() },
+    10001: { primary: '群友A', names: ['群友A'], lastAt: Date.now() },
   };
 
   // ① 用**展示名**删（面板传的就是这个）

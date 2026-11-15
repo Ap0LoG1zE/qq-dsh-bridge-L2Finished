@@ -21,7 +21,7 @@ h.setMode('reserved2');
 
 try {
   // ① 先写入一个正常昵称
-  h.socialV2.aliases = { [OWNER]: { names: ['Ap0LoG1zE'], primary: 'Ap0LoG1zE', lastAt: Date.now() } };
+  h.socialV2.aliases = { [OWNER]: { names: ['群友A'], primary: '群友A', lastAt: Date.now() } };
 
   // ② 模拟拍一拍把号码当名字写进来
   const changed = h.noteAliasV2(OWNER, OWNER);
@@ -32,7 +32,7 @@ try {
   console.log('  names:', JSON.stringify(rec.names));
 
   ok('拒绝写入（返回 false）', changed === false);
-  ok('primary 仍是正常昵称', rec.primary === 'Ap0LoG1zE');
+  ok('primary 仍是正常昵称', rec.primary === '群友A');
   ok('names 里没有混进号码', !rec.names.includes(OWNER));
 
   // ③ 陌生号码（别名表里还没这个人）也不该被写成 primary=号码
@@ -48,7 +48,7 @@ try {
   const r3 = h.noteAliasV2(OWNER, '123456');
   console.log('\n=== 写入另一个纯数字名字 ===');
   console.log('  noteAliasV2 返回:', r3, '| primary:', JSON.stringify(h.socialV2.aliases[OWNER].primary));
-  ok('纯数字名字也拒绝', r3 === false && h.socialV2.aliases[OWNER].primary === 'Ap0LoG1zE');
+  ok('纯数字名字也拒绝', r3 === false && h.socialV2.aliases[OWNER].primary === '群友A');
 
   // ⑤ 正常昵称仍可写入（并切换 primary）
   const r4 = h.noteAliasV2(OWNER, '主人');

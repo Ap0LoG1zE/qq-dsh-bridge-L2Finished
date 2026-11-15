@@ -107,8 +107,10 @@ assert.match(sections[0].text({}), /跟随用户语言/)
 // --- workspace scoping: only the listed workspaces get the section ---
 // The section is evaluated per assembly with that assembly's agent, so the
 // cwd of the session's header decides whether the rule applies.
-const QQ_CWD = 'D:\\DSH\\qq-dsh-bridge\\qq-bridge\\state\\agents'
-const OTHER_CWD = 'D:\\DSH\\日常'
+// 这两个 cwd 只是用来验证"工作区范围"判定，内容不需要是真实路径
+//（2026-11-15 开源清理：原来写的是作者本机的 <仓库>\...）。
+const QQ_CWD = path.join('D:', 'work', 'qq-bridge', 'state', 'agents')
+const OTHER_CWD = path.join('D:', 'work', 'other-workspace')
 const ctxWithCwd = (cwd) => ({ agent: { session: { header: cwd === undefined ? {} : { cwd } } } })
 
 // The workspace list is read from the Host's registry file; seed one so the

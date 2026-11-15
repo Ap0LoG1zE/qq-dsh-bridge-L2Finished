@@ -23,9 +23,12 @@ const arg = (name, dflt = '') => {
 };
 
 const BASE = arg('base', 'http://127.0.0.1:9872');
-const REF_DIR = 'D:\\Desktop\\角色A AI';
+// 参考音频目录由环境变量提供（2026-11-15 开源清理）：
+// 原来硬编码了作者本机路径，别人跑不了。
+// 用法：set "TTS_REF_DIR=D:\audio"（或直接用 --ref 传单个文件）
+const REF_DIR = process.env.TTS_REF_DIR || '';
 // 默认用页面里已经配好的那一对（参考文本与音频对得上）。
-const REF = arg('ref', path.join(REF_DIR, '(A)そよたちのライブの日なら会えると思う(2).wav'));
+const REF = arg('ref', REF_DIR ? path.join(REF_DIR, '(A)そよたちのライブの日なら会えると思う(2).wav') : '');
 const REF_TEXT = arg('reftext', 'そよたちのライブの日なら会えると思う');
 const REF_LANG = arg('reflang', '日文');
 const TEXT_LANG = arg('lang', '中文');

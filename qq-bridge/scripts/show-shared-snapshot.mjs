@@ -41,7 +41,7 @@ for (const [label, needle] of needStructure) {
 console.log('\n════════ 样张 ════════\n')
 const rows = [
   { chatLabel: chatLabelForV2('group:20001'), seq: 80, who: '辣椒烧土坤', ago: '6分钟前', text: '善' },
-  { chatLabel: chatLabelForV2('group:20001'), seq: 81, who: 'Ap0LoG1zE', ago: '8秒前', text: '@角色A 晚上好' },
+  { chatLabel: chatLabelForV2('group:20001'), seq: 81, who: '群友A', ago: '8秒前', text: '@角色A 晚上好' },
   { chatLabel: chatLabelForV2('private:10001'), seq: 7, who: '主人', ago: '2分钟前', text: '骂回去' },
 ]
 const past = [
