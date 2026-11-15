@@ -5,7 +5,7 @@
 // 中文全变乱码且不可逆（168 个字符直接变成 U+FFFD）。要批量改文本请用
 // node + fs.writeFileSync(..., 'utf8')，别用 PowerShell 的文本 cmdlet。
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { readFileSync, existsSync } from 'node:fs'
 import {
   STAGES, STAGE_HINTS, INITIAL_SCORE, stageOf, scoreForMessage,
   bumpAffinity, decayAffinity, renderAffinityLine, DECAY_DAYS, DECAY_AMOUNT, PENALTY_KEYWORDS, describeAffinity,
@@ -244,10 +244,17 @@ ok('疏远档没有被写暖（冷漠是梯度的真实起点）')
 //   ① 人格卡是每轮常驻注入，等于把关系策略缝进人设里，越写越像行为指令；
 //   ② 一代没有 qq_affinity、也没有好感度，给一代注入这套梯度只会让她
 //      莫名其妙地对人忽冷忽热。
-const roleCard = readFileSync(new URL('../roles/角色A.md', import.meta.url), 'utf8')
-assert.ok(!/关系梯度/.test(roleCard), '人格卡里不该有「关系梯度」小节，它属于预设')
-assert.ok(!/疏远（冷漠）/.test(roleCard), '人格卡里不该写档位定义')
-ok('人格卡里没有关系梯度（归预设管）')
+// 2026-11-15 开源清理：人格卡（roles/*.md）不再随仓库分发 —— 那是作者自己的角色设定。
+// 改成「有就检查、没有就跳过」，否则部署者 clone 下来跑测试会直接 ENOENT。
+const roleCardPath = new URL('../roles/角色A.md', import.meta.url)
+if (existsSync(roleCardPath)) {
+  const roleCard = readFileSync(roleCardPath, 'utf8')
+  assert.ok(!/关系梯度/.test(roleCard), '人格卡里不该有「关系梯度」小节，它属于预设')
+  assert.ok(!/疏远（冷漠）/.test(roleCard), '人格卡里不该写档位定义')
+  ok('人格卡里没有关系梯度（归预设管）')
+} else {
+  ok('未提供人格卡（开源版不含角色设定），跳过该检查')
+}
 
 // 16e. 但预设里必须有：六档齐全，且守住"不变热情"这条红线。
 // 2026-11-10 精简后，预设不再逐档展开描述（那部分与工具返回的 STAGE_HINTS 重复），
