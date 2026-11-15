@@ -62,16 +62,73 @@ function Write-Info($t) { Write-Host "    $t" -ForegroundColor DarkGray }
 
 function Get-DshPort {
   param([int]$ProcessId)
-  # 桌面端一次会监听三个端口（web、web+1、web+2）。
-  # **只有 web 端口（最小的那个）接受桥接离线铸造的 Cookie**；另外两个是内部 API 口，
-  # 只认 Authorization: Bearer，桥接没有那个凭据。旧实现 Select-Object -First 1 是任意顺序，
-  # 经常取到内部口 ⇒ 401 ⇒ 事件流 0 帧 ⇒ dshReady=false。
+
+  # ── 2026-11-15 重写：按 **DSH 指纹** 认端口，不再靠"最小端口"猜 ─────────
+  #
+  # 旧实现取 $ports[0]（最小端口），依据是"桌面端监听三个连续端口，
+  # 只有最小那个接受桥接离线铸造的 Cookie"。
+  #
+  # 那个假设**不成立**。协助者实测：他的 DSH 最小监听端口 58116，
+  # 真正的 Web UI 在 65235 —— 相差 7000 多，根本不连续。
+  # baseUrl 被写成 58116 后桥接只拿到 401，表现为「事件流 0 帧」+「工具全被拒」。
+  #
+  # 现在的判据与 bridge.js 的 probeDshPort **完全一致**（那是本项目里
+  # 唯一被实测验证过的识别逻辑）：
+  #
+  #   GET /         -> 401 + "dsh web authentication required; ..."   <- Web UI
+  #   GET /api/*    -> 401 + "unauthorized"                            <- API 面
+  #   其它 401      -> "missing or invalid Authorization bearer"       <- 内部 API 口
+  #
+  # 三种都可能是 401，所以**只能看正文**，不能只看状态码。
+  # 正文只读前 512 字节，避免被大页面拖慢。
   $ports = @(Get-NetTCPConnection -State Listen -OwningProcess $ProcessId -ErrorAction SilentlyContinue |
        Where-Object { $_.LocalAddress -eq '127.0.0.1' -or $_.LocalAddress -eq '::1' } |
        ForEach-Object { [int]$_.LocalPort } | Sort-Object -Unique)
-  if ($ports.Count -gt 0) { return $ports[0] }
-  return $null
+  if ($ports.Count -eq 0) { return $null }
+  if ($ports.Count -eq 1) { return $ports[0] }
 
+  # 候选顺序：先试最小（多数机器上仍然对，不多花请求），失败再试其余。
+  $ordered = @($ports[0]) + @($ports | Select-Object -Skip 1)
+
+  function Test-DshFingerprint([int]$Port, [string]$Path) {
+    try {
+      $req = [System.Net.HttpWebRequest]::Create("http://127.0.0.1:$Port$Path")
+      $req.Method = 'GET'
+      $req.Timeout = 1200
+      $req.ReadWriteTimeout = 1200
+      $req.AllowAutoRedirect = $false
+      $resp = $req.GetResponse()
+      $code = [int]$resp.StatusCode
+      $resp.Close()
+      return ($code -eq 200)   # 有鉴权时不该是 200；200 说明是别的服务
+    } catch [System.Net.WebException] {
+      $r = $_.Exception.Response
+      if (-not $r) { return $false }
+      $code = [int]$r.StatusCode
+      if ($code -ne 401) { $r.Close(); return $false }
+      try {
+        $sr = New-Object System.IO.StreamReader($r.GetResponseStream())
+        $body = $sr.ReadToEnd()
+        $sr.Close()
+      } catch { $body = '' }
+      $r.Close()
+      if ($body.Length -gt 512) { $body = $body.Substring(0, 512) }
+      # 与 bridge.js 的 probeDshPort 同一套正则
+      if ($body -match 'dsh web authentication required') { return $true }
+      if ($body -match '^\s*unauthorized\s*$') { return $true }
+      return $false           # 例如 "...bearer..." = 内部 API 口
+    } catch {
+      return $false
+    }
+  }
+
+  foreach ($port in $ordered) {
+    if (Test-DshFingerprint -Port $port -Path '/') { return $port }
+    if (Test-DshFingerprint -Port $port -Path '/api/status') { return $port }
+  }
+
+  # 一个都不像 DSH：退回最小端口（与旧行为一致，不留空值）
+  return $ports[0]
 }
 
 function Get-DshBackends {
