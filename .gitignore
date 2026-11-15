@@ -30,6 +30,9 @@ acl-recovery/
 # 它们写死了真实 QQ 号/群号/记忆示例，且功能已经完成、无人调用 ——
 # 留着只会被 `git add -A` 再抓回来（清理时踩过这个坑）。
 qq-bridge/scripts/_*.mjs
+# 角色卡：作者自己的角色设定（人格全文），属于个人内容。
+# 名字是中文，`git add -A` 特别容易把它又加回来（踩过）。
+qq-bridge/roles/*.md
 # ── 运行状态：聊天记录、未读、记忆库、令牌、日志 ──
 state/
 qq-bridge/state/
