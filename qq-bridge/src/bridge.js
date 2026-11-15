@@ -1,4 +1,4 @@
-﻿// QQ ↔ DeepSeek Harness 桥接主程序。
+// QQ ↔ DeepSeek Harness 桥接主程序。
 //
 // 链路：
 //   QQ 消息 → SnowLuma (OneBot v11 WS) → 本进程 → DSH Web API session.prompt
@@ -14083,7 +14083,22 @@ async function main() {
     const tail = stageChangeLine ? `\n${stageChangeLine}` : '';
     if (reason === 'timeout') return `${sceneLine}${base}（你设的潜水时间到了。）${tail}`;
     if (reason === 'replyCheck') return `${sceneLine}${base}（对方回你了。）${tail}`;
-    if (reason === 'proactiveCheck') return `${sceneLine}${base}（群里安静了一阵，想说什么可以说。）${tail}`;
+    // 主动机会唤醒（2026-11-15 修）：**按会话类型分句**。
+    //
+    // 原来不管群聊私聊都说「群里安静了一阵」。私聊收到这句时，她的处境其实是
+    // 「这个人有一阵没说话了，你要不要主动找他」，跟"群"没关系 ——
+    // 实测 15:50:37 私聊 proactiveCheck 唤醒了，但她看到"群里"就当成别人的事，
+    // 不开口。操作者的反馈正是「群聊的主动唤醒就有提示词，私聊的怎么没有」。
+    //
+    // 两句都保持和上面 `（对方回你了。）` 一样的短口吻：
+    // 只说"为什么叫醒你"，不写行动要求（那些在 preset 里）。
+    if (reason === 'proactiveCheck') {
+      const isPrivate = String(key).startsWith('private:');
+      const hint = isPrivate
+        ? '（这个人有阵子没说话了，想找他可以说。）'
+        : '（群里安静了一阵，想说什么可以说。）';
+      return `${sceneLine}${base}${hint}${tail}`;
+    }
     if (reason === 'poke') return `${sceneLine}${base}（有人拍了一拍。）${tail}`;
     // 待办到点：和「（有人拍了一拍。）」同样的位置和口吻，但要把是哪件事说出来 ——
     // 只写"有件事到点了"她还得自己去查记忆，等于多一次工具往返。
