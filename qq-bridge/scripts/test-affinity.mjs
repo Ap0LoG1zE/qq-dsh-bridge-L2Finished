@@ -619,6 +619,28 @@ ok('手工调整好感度也会记录档位变化（拖滑条进新档位能触�
     'qq_affinity 的 userId 参数描述应写明名字也可以',
   )
 }
+// 回归（2026-11-15）：删除表情后必须走 HTTP 同步。
+// 事件：面板显示删不掉，实际 QQ 已删（7->6）；WS 侧列表不跟随删除刷新。
+{
+  const bs = readFileSync(new URL('../src/bridge.js', import.meta.url), 'utf8')
+  const ls = bs.split('\n')
+  assert.ok(
+    bs.includes('{ preferHttp = false }'),
+    'syncStickerLibrary 应支持 preferHttp 选项',
+  )
+  // 删除端点必须用它
+  const delLine = ls.findIndex((l) => l.includes("/api/stickers/delete"))
+  assert.ok(delLine > 0, '找不到删除表情端点')
+  const delBlock = ls.slice(delLine, delLine + 40).join('\n')
+  assert.ok(
+    delBlock.includes('preferHttp: true'),
+    '删除表情后必须用 preferHttp 重新同步，否则 WS 的旧列表会让界面永远显示删不掉',
+  )
+  // 其它端点不该用（避免无谓地绕过更快的 WS）
+  const preferCount = (bs.match(/preferHttp: true/g) || []).length
+  assert.equal(preferCount, 1, 'preferHttp: true 只应出现在删除端点一处，实际 ' + preferCount + ' 处')
+}
+ok('删除表情后用 HTTP 重新同步（WS 列表不跟随删除）')
 ok('qq_affinity 支持按名字查（不再误报"没聊过"）')
 ok('qq_set_voice 权限：开关都要主人，桥接/工具/预设三处口径一致')
 ok('偏爱档文案：限制句已清、害羞保留、控制台与源码一致')

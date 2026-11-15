@@ -1939,7 +1939,7 @@ async function main() {
   }
 
   // force=true 时忽略 TTL 强制刷新；失败时返回 null（调用方决定是否使用缓存）。
-  async function syncStickerLibrary(force = false) {
+  async function syncStickerLibrary(force = false, { preferHttp = false } = {}) {
     if (cfg.socialV2?.sticker?.enabled === false) return null;
     const rawTtl = Number(cfg.socialV2?.sticker?.syncTtlMs);
     const ttl = Number.isFinite(rawTtl) ? Math.max(0, rawTtl) : 60000;
@@ -1952,6 +1952,10 @@ async function main() {
       let response;
       let via = 'ws';
       try {
+        // 2026-11-15：preferHttp 时跳过 WS。SnowLuma 的 WS 侧收藏表情列表
+        // **不跟随删除刷新**（实测删完 WS 仍返回旧列表），而删除后必须看真值，
+        // 否则界面永远显示"删不掉"。
+        if (preferHttp) throw new Error('preferHttp=true，跳过 WS 直接走 HTTP');
         response = await bot.request('fetch_custom_face_detail', { count });
         if (!response || response.status !== 'ok' || response.retcode !== 0) {
           throw new Error(`fetch_custom_face_detail 失败: ${response?.wording || response?.retcode || 'unknown'}`);
@@ -2325,6 +2329,7 @@ async function main() {
       }
     }
     // 强制刷新本地库，让刚收藏的表情立即可用。
+    // 删除后用 HTTP 重新同步：WS 侧的列表是旧的，用它判断"删没删掉"永远为否。
     const synced = await syncStickerLibrary(true);
     const entry = findSticker(synced?.entries ?? stickerEntries, emojiId);
     return { emojiId, entry: entry || null, remark: cleanRemark };
@@ -6609,6 +6614,7 @@ async function main() {
         }
         if (req.method === 'POST' && url.pathname === '/api/stickers/sync') {
           try {
+            // 删除后用 HTTP 重新同步：WS 侧的列表是旧的，用它判断"删没删掉"永远为否。
             const synced = await syncStickerLibrary(true);
             sendJson({ ok: true, total: synced?.entries?.length ?? stickerEntries.length, syncedAt: synced?.syncedAt ?? stickerSyncedAt });
           } catch (error) {
@@ -6688,6 +6694,7 @@ async function main() {
                 log(`[sticker] 上传后写备注失败（不影响收藏）：${error?.message ?? error}`);
               }
             }
+            // 删除后用 HTTP 重新同步：WS 侧的列表是旧的，用它判断"删没删掉"永远为否。
             const synced = await syncStickerLibrary(true);
             const entry = emojiId ? findSticker(synced?.entries ?? stickerEntries, emojiId) : null;
             log(`[sticker] 上传表情成功 emojiId=${emojiId || '(未知)'} ${buffer.length}B${note ? ` 备注=${note}` : ''}`);
@@ -6708,7 +6715,8 @@ async function main() {
             if (!delRes || delRes.status !== 'ok' || delRes.retcode !== 0) {
               throw new Error(`delete_custom_face 失败: ${delRes?.wording || delRes?.retcode || 'unknown'}`);
             }
-            const synced = await syncStickerLibrary(true);
+            // 删除后用 HTTP 重新同步：WS 侧的列表是旧的，用它判断"删没删掉"永远为否。
+            const synced = await syncStickerLibrary(true, { preferHttp: true });
             log(`[sticker] 删除表情 ${stickerId}`);
             appendActivity(`[sticker] 控制台删除表情：${stickerId}`);
             sendJson({ ok: true, total: synced?.entries?.length ?? stickerEntries.length });
