@@ -324,10 +324,19 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
   vm.runInContext(`Object.assign(globalThis, (() => { ${modelViewSource}\nreturn { compactModelMessage, compactModelData, serializeModelData, describeAge }; })());`, context);
   vm.runInContext(source + '\nglobalThis.auditReady = main();', context);
   const bridge = await context.auditReady;
-  // preset 清单要与真实安装一致（含三档分级的两个 preset）：缺了 qq-chat-owner /
-  // qq-chat-readonly，owner 私聊会走 fail-closed 直接建不出会话——那是**正确**行为，
-  // 但会让所有涉及 owner 私聊的既有测试变成在测失败路径。
-  bridge.setPresets(['standard', 'qq-chat', 'qq-chat-v2', 'qq-chat-owner', 'qq-chat-readonly']);
+  // preset 清单要与真实安装一致。
+  //
+  // 2026-11-15 修：这里原来只有旧名字（qq-chat / qq-chat-v2 / qq-chat-owner /
+  // qq-chat-readonly），而四个旧预设早已合并成唯一的 `qq-chat-agent`。
+  // 清单不含新名字的后果：任何走 owner 档建会话的测试都会撞上 fail-closed
+  // （「需要 preset qq-chat-agent，但它不在 DSH 可用清单中」），
+  // 于是那些用例变成在测失败路径 —— 看着通过，其实什么都没验证。
+  // 现在同时保留旧名（历史用例引用它们）与新名（当前代码用）。
+  bridge.setPresets([
+    'standard',
+    'qq-chat-agent',
+    'qq-chat', 'qq-chat-v2', 'qq-chat-owner', 'qq-chat-readonly',
+  ]);
   bridge.setReady(true);
   return { ...bridge, calls, temp, async close() {
     for (const timer of timers) clearTimeout(timer);
