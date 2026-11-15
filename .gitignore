@@ -1,4 +1,4 @@
-# 依赖
+﻿# 依赖
 node_modules/
 qq-bridge/node_modules/
 
@@ -31,8 +31,10 @@ acl-recovery/
 # 留着只会被 `git add -A` 再抓回来（清理时踩过这个坑）。
 qq-bridge/scripts/_*.mjs
 # 角色卡：作者自己的角色设定（人格全文），属于个人内容。
-# 名字是中文，`git add -A` 特别容易把它又加回来（踩过）。
+# 用通配符而不是写死文件名 —— 具体叫什么不重要，`roles/*.md` 里除 README 外
+# 都是个人设定。这样 `git add -A` 也抓不回来（踩过这个坑）。
 qq-bridge/roles/*.md
+!qq-bridge/roles/README.md
 # 作者自己的运维笔记：写满本机路径、重启命令、成本分析与调试历史。
 # 对部署者没有用处，反而暴露作者环境 —— 不进公开仓库。
 qq-bridge/docs/PROJECT_HANDBOOK.md
@@ -51,4 +53,4 @@ Thumbs.db
 .vscode/
 # 临时
 *.tmp
-zz*.txt
+zz*.txtTESTPAT: qq-bridge/roles/*.md
