@@ -3111,10 +3111,12 @@ async function main() {
     const st = socialV2.conversations.get(key);
     if (st) {
       // 保留旧 token 在脱敏集合中，但撤销它的调用权限。
-      // 2026-11-15：token 从 48 字符缩到 8 字符（操作者要求省上下文）。
-      // 8 位十六进制 = 40 亿种，配合「只接受本机会话 + 白名单」够用；
-      // 原来 48 字符 × 每次工具调用，300 次就是 14k 字符的白烧。
-      st.agentToken = crypto.randomBytes(16).toString('hex');
+      // 2026-11-16：agentToken 定为 **16 个十六进制字符**（randomBytes(8)）。
+      //   历史：原来是 48 字符（randomBytes(24)）→ 试过 8 字符（randomBytes(4)，
+      //   40 亿种，现代机器几小时能爆破）→ 最终定 16 字符：
+      //   1.8×10^19 种，实际不可爆破，同时比 48 字符每次调用省 32 字符。
+      //   调用次数多时这仍是可观的开销（300 次 ≈ 9.6k 字符）。
+      st.agentToken = crypto.randomBytes(8).toString('hex');
       rememberAgentToken(key, st.agentToken);
       st.bootstrapSent = false;
       // 共用会话：整组一起复位。只复位自己会让组里其它 key 仍然「已引导」，
@@ -10428,7 +10430,7 @@ async function main() {
         lastWakeReason: '',
         lastAiReplyAt: 0,
         lastActionAt: 0,
-        agentToken: crypto.randomBytes(16).toString('hex'),
+        agentToken: crypto.randomBytes(8).toString('hex'),
         bootstrapSent: false,
         wakeTimes: [],
         sendTimes: [],
@@ -10503,9 +10505,9 @@ async function main() {
           if (!val || typeof val !== 'object') continue;
           if (!/^(group|private):\d+$/.test(key)) continue;
           const defaultWc = defaultWakeConfigV2();
-          let agentToken = String(val.agentToken || crypto.randomBytes(16).toString('hex'));
+          let agentToken = String(val.agentToken || crypto.randomBytes(8).toString('hex'));
           if (!agentToken || seenTokens.has(agentToken)) {
-            agentToken = crypto.randomBytes(16).toString('hex');
+            agentToken = crypto.randomBytes(8).toString('hex');
           }
           seenTokens.add(agentToken);
           const st = {
