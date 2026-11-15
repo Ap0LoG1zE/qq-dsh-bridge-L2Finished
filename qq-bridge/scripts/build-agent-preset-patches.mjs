@@ -33,7 +33,8 @@ export const REPO_ROOT = path.resolve(__dirname, '..');
  *   · 三档分级取消 —— 不再有 owner 全工具档，因此 src/bridge.js 的 TIER_PRESETS
  *     与 preset-prompt.js 的 presetTierKey() 都改成把任何情况映射到这一个名字。
  *
- * 旧四个的源与 patch 已备份在 作者本机的备份目录-*（不在 DSH 里，仅存档查看）。
+ * 旧四个的源与 patch 在合并时做过一次本地备份（`_backup-presets-merge-*`，
+ * 不在仓库内，仅供作者存档查看）。
  */
 export const PRESETS = ['qq-chat-agent'];
 

@@ -108,7 +108,7 @@ assert.match(sections[0].text({}), /跟随用户语言/)
 // The section is evaluated per assembly with that assembly's agent, so the
 // cwd of the session's header decides whether the rule applies.
 // 这两个 cwd 只是用来验证"工作区范围"判定，内容不需要是真实路径
-//（2026-11-15 开源清理：原来写的是作者本机的 <仓库>\...）。
+//（2026-11-15 开源清理：原来写的是作者本机的真实路径）。
 const QQ_CWD = path.join('D:', 'work', 'qq-bridge', 'state', 'agents')
 const OTHER_CWD = path.join('D:', 'work', 'other-workspace')
 const ctxWithCwd = (cwd) => ({ agent: { session: { header: cwd === undefined ? {} : { cwd } } } })

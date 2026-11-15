@@ -33,6 +33,9 @@ qq-bridge/scripts/_*.mjs
 # 角色卡：作者自己的角色设定（人格全文），属于个人内容。
 # 名字是中文，`git add -A` 特别容易把它又加回来（踩过）。
 qq-bridge/roles/*.md
+# 作者自己的运维笔记：写满本机路径、重启命令、成本分析与调试历史。
+# 对部署者没有用处，反而暴露作者环境 —— 不进公开仓库。
+qq-bridge/docs/PROJECT_HANDBOOK.md
 # ── 运行状态：聊天记录、未读、记忆库、令牌、日志 ──
 state/
 qq-bridge/state/
