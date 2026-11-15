@@ -1,4 +1,4 @@
-﻿const fs=require('node:fs');
+const fs=require('node:fs');
 const d=JSON.parse(fs.readFileSync('state/social-v2.json','utf8'));
 const g=d.conversations['group:20001'];
 console.log('selfNotes:', Array.isArray(g.selfNotes)?g.selfNotes.length:'非数组');

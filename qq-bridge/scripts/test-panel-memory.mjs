@@ -28,7 +28,7 @@ try {
   const g = h.getSocialV2State('global');
   g.memberImpressions = {
     10001: { traits: ['爱把话绕回笨蛋'], name: 'Ap0LoG1zE', interactionCount: 5, lastSeenAt: Date.now() },
-    2722156233: { traits: ['会@我骂猪'], name: '7月1', interactionCount: 2, lastSeenAt: Date.now() },
+    70001: { traits: ['会@我骂猪'], name: '7月1', interactionCount: 2, lastSeenAt: Date.now() },
     // 旧数据：没有 name 字段
     999999999: { traits: ['老数据没有 name'], interactionCount: 1, lastSeenAt: Date.now() },
   };

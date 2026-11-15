@@ -34,12 +34,12 @@ try {
   // 所以这里只放 traits，名字靠下面的 aliases 提供。
   g.memberImpressions = {
     10001: { traits: ['爱把话绕回笨蛋', '半夜还在调提示词'], interactionCount: 5, lastSeenAt: 3000 },
-    2722156233: { traits: ['会@我骂猪'], interactionCount: 2, lastSeenAt: 2000 },
+    70001: { traits: ['会@我骂猪'], interactionCount: 2, lastSeenAt: 2000 },
     999999999: { traits: ['别名表里也没有这个人'], interactionCount: 1, lastSeenAt: 1000 },
   };
   h.socialV2.aliases = {
     10001: { primary: 'Ap0LoG1zE', names: ['Ap0LoG1zE'], lastAt: Date.now() },
-    2722156233: { primary: '7月1', names: ['7月1'], lastAt: Date.now() },
+    70001: { primary: '7月1', names: ['7月1'], lastAt: Date.now() },
   };
   g.todos = [
     { text: '明天讲那张卡片', createdAt: 1000, expiresAt: Date.now() + 20 * 3600000, done: false },

@@ -13,7 +13,7 @@ console.log('=== 写入 3 条不同 kind 的记录 ===\n');
 store.append([{
   src: 'qq', key: 'group:20001', seq: 100, t: Date.now(),
   kind: 'msg', role: '鹿', text: '你们没人觉得这个打气筒很奇怪吗',
-  meta: { messageId: '-1460857195', userId: '3380569062', media: false },
+  meta: { messageId: '-70005', userId: '70003', media: false },
 }]);
 
 // ② 她自己的话（kind: ai）
@@ -53,7 +53,7 @@ ok('meta.self 不再重复写', !recs[1].meta || !('self' in recs[1].meta));
 ok('保留 key', recs.every((r) => !!r.key));
 ok('保留 seq', recs.every((r) => r.seq != null));
 ok('保留 text', recs.every((r) => !!r.text));
-ok('保留 messageId/userId', recs[0].meta?.messageId === '-1460857195' && recs[0].meta?.userId === '3380569062');
+ok('保留 messageId/userId', recs[0].meta?.messageId === '-70005' && recs[0].meta?.userId === '70003');
 ok('false 的 media 不写', !recs[0].meta || recs[0].meta.media === undefined);
 
 // ids.txt 必须仍然有效（id 不落盘，但要进索引）

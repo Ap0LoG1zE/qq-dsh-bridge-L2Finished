@@ -1199,31 +1199,6 @@ export function mount(ctx) {
   // 于是用户点开「后端」页签时多半已命中 5 秒缓存，而不是先看到"加载中…"。
   discoverBackends().catch(() => {})
 
-  // ── DSH 启动时对齐一次桥接的 baseUrl ──────────────────────────────────
-  //
-  // 为什么放在 mount()：这个函数在 **DSH 启动、插件加载时执行一次**，正是
-  // 「桌面版 DSH 换了新端口」的那个时刻。桌面版每次启动都由 Electron 重新分配
-  // 端口，桥接那边记的还是上一次的，不对齐的话它所有 RPC 都会打到一个死端口。
-  //
-  // 桥接侧原来有一份「掉线后每 60 秒重探一次」的轮询，已经删掉了 ——
-  // 那种后台盲猜既不可预期，又会在 DSH 关机期间反复空转。
-  // 现在改成**事件驱动**：DSH 启动推一次，剩下的时机（小面板点启动 SnowLuma、
-  // 控制台手动按钮）各自负责，不再有周期性副作用。
-  //
-  // 失败完全不影响插件装配：桥接可能还没起来，下次请求会自然重试。
-  try {
-    const env = bridgeEnv()
-    if (env.ok) {
-      bridgeApi(env, '/api/dsh/follow-endpoint', { method: 'POST', body: {}, timeoutMs: 20000 })
-        .then((r) => {
-          if (r.ok && r.data?.changed) {
-            console.log(`[qq-bigfish] DSH 启动对齐：桥接 baseUrl → ${r.data.baseUrl}`)
-          }
-        })
-        .catch(() => {})
-    }
-  } catch { /* 桥接不可达时静默跳过 */ }
-
   const table = [
     [ROUTES.status, handleStatus],
     [ROUTES.toggle, handleToggle],

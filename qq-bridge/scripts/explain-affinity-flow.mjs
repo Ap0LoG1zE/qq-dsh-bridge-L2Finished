@@ -10,7 +10,7 @@ console.log(bar('═'))
 
 // ── 第 1 步：消息进来 ──
 console.log('\n【第 1 步】群里 群友A 说了句话')
-const incoming = { userId: '3263163372', sender: '群友A', text: '你还好吗', isSelf: false, isOwner: false }
+const incoming = { userId: '70002', sender: '群友A', text: '你还好吗', isSelf: false, isOwner: false }
 console.log(`  userId=${incoming.userId}  text="${incoming.text}"`)
 
 // ── 第 2 步：算这次该加多少分 ──

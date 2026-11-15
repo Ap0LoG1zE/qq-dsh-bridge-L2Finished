@@ -3,7 +3,8 @@
 // 2) 同名标签命中多条时必须报歧义，绝不猜一条发出去
 // 3) id / md5 / url 仍然精确匹配
 // 4) 找不到时的错误信息要指出「该改用什么」，否则模型会一直传备注
-import { findSticker, resolveSticker, normalizeStickerEntry } from '../src/sticker-lib.js';
+// 5) 面板要 url（缩略图），模型不要 url（省 token）—— 两条路径必须分开
+import { findSticker, resolveSticker, normalizeStickerEntry, formatStickerList } from '../src/sticker-lib.js';
 
 let pass = 0;
 let fail = 0;
@@ -79,6 +80,24 @@ console.log('## 空库');
   const r = resolveSticker([], '随便');
   ok(!r.entry, '空库不崩');
   ok(/空的/.test(r.error), '空库错误说明表情库是空的', r.error);
+}
+
+console.log('## 面板要 url、模型不要 url（两条路径必须分开）');
+{
+  // 背景：2026-11-11 的 token 瘦身把 url 从公共返回值里删掉，
+  // 结果 DSH 小面板的表情卡片全变成空白 —— 面板正是靠 url 渲染缩略图的。
+  const modelView = formatStickerList(list, '', 10);
+  ok(modelView.stickers.every((s) => !('url' in s)), '模型路径不带 url（省 token）');
+  ok(modelView.stickers.every((s) => !('resId' in s)), '模型路径不带 resId');
+  ok(modelView.stickers.some((s) => s.id === 'F198556F65E71C3B42B92FE94271891C'), '模型路径用 md5 作句柄');
+
+  const panelView = formatStickerList(list, '', 10, { withUrl: true });
+  ok(panelView.stickers.every((s) => typeof s.url === 'string' && s.url.length > 0), '面板路径每张都有 url（否则图是空白）');
+  ok(panelView.stickers.some((s) => s.url === 'https://p.qpic.cn/a/1'), '面板拿到的是真实图片地址');
+  ok(panelView.stickers.every((s) => typeof s.resId === 'string' && s.resId), '面板路径带 resId');
+  // 其它字段不能因为补 url 而丢
+  const one = panelView.stickers.find((s) => s.desc === '被示爱很害羞时用');
+  ok(one && one.desc === '被示爱很害羞时用' && one.useCount !== undefined, '面板路径保留 desc/useCount');
 }
 
 console.log(`\n结果：${pass} 通过，${fail} 失败`);

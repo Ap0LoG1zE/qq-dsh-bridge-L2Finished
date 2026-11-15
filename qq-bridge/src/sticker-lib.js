@@ -276,8 +276,19 @@ export function resolveSticker(entries, ref) {
   };
 }
 
-// 格式化给 AI 看的表情列表；query 会匹配 desc/localNote/tags/usage/id/md5。
-export function formatStickerList(entries, query = '', limit = 48) {
+// 格式化表情列表；query 会匹配 desc/localNote/tags/usage/id/md5。
+//
+// ⚠️ 两种调用方的需求是**冲突**的，必须分开：
+//   · 模型（qq_list_stickers）—— 要省 token。url 是约 100 字符的签名链接，
+//     模型看不懂也用不上（真要看图走 qq_get_sticker_image）。
+//   · 控制台面板（/api/stickers）—— 要显示缩略图。url 是**唯一**的图片来源，
+//     少了它整块卡片就是一片空白。
+//
+// 2026-11-11 的瘦身直接把 url 从公共返回值里删掉了，结果面板的图全没了
+// （面板 client.js 里是 `if (s.url) { img.src = s.url }`，没有 url 就不插 img）。
+// 现在改成 `withUrl` 选项：模型路径继续精简，面板路径显式要 url。
+export function formatStickerList(entries, query = '', limit = 48, options = {}) {
+  const withUrl = options?.withUrl === true;
   const list = (Array.isArray(entries) ? entries : []).map(normalizeStickerEntry).filter(Boolean);
   const q = String(query ?? '').trim().toLowerCase();
   const filtered = q
@@ -287,7 +298,7 @@ export function formatStickerList(entries, query = '', limit = 48) {
       })
     : list;
   const max = Math.max(1, Math.min(500, Number(limit) || 48));
-  // 2026-11-11 瘦身：**不再返回 url / resId 等长字段**。
+  // 2026-11-11 瘦身：**模型路径不再返回 url / resId 等长字段**。
   //   · `url`      —— 单条约 100 字符的签名链接，模型看不懂也用不上
   //                   （真要看图走 qq_get_sticker_image，那条路径按 stickerId 取）
   //   · `resId`    —— 与 `id` 完全同值（实测同一条 id 与 resId 一字不差）
@@ -298,14 +309,19 @@ export function formatStickerList(entries, query = '', limit = 48) {
   // 而 id 形如 `30001_0_0_0_<md5>_0_0` —— QQ 号前缀 + 后缀全是常量，
   // 只有中间那 32 位 md5 在变。4 条表情能省 4×21 = 84 字符。
   // 仍保留 `id` 字段名以兼容旧调用方，但值是 md5。
-  const items = filtered.slice(0, max).map((e) => ({
-    id: e.md5 || e.id,
-    desc: e.desc || '',
-    localNote: e.localNote || '',
-    tags: e.tags || [],
-    usage: e.usage || '',
-    useCount: e.useCount || 0
-  }));
+  const items = filtered.slice(0, max).map((e) => {
+    const base = {
+      id: e.md5 || e.id,
+      desc: e.desc || '',
+      localNote: e.localNote || '',
+      tags: e.tags || [],
+      usage: e.usage || '',
+      useCount: e.useCount || 0
+    };
+    if (!withUrl) return base;
+    // 面板路径：补回渲染缩略图/删除/改备注需要的字段。
+    return { ...base, resId: e.resId || e.id, md5: e.md5 || '', url: e.url || '' };
+  });
   return {
     total: list.length,
     matched: filtered.length,

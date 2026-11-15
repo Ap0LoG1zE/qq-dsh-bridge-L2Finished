@@ -31,7 +31,7 @@ const oldLine = JSON.stringify({
   kind: 'msg',
   role: '7月1',
   text: '打气筒是什么梗',
-  meta: { messageId: '123', userId: '2722156233' },
+  meta: { messageId: '123', userId: '70001' },
 });
 fs.appendFileSync(path.join(eventsDir, shard), `${oldLine}\n`, 'utf8');
 

@@ -7,6 +7,29 @@ config.json
 qq-bridge/config.json
 *.credentials
 .credentials.yaml
+# ── 工作区里可能出现的配置副本（2026-11-15 清理时补上）──────────────
+# 这些都是"当时排错时留下的 config 快照"，里面带真实的 SnowLuma accessToken、
+# ownerQQ、群号。曾经被误提交并推上公开仓库 —— 不要让它再回来。
+# _cfg_rebuild.json / config.recovered.json 就是踩过的那两个。
+config.json.bak*
+config.recovered.json
+_cfg_rebuild.json
+qq-bridge/config.json.bak*
+qq-bridge/config.recovered.json
+qq-bridge/_cfg_rebuild.json
+# 旧版本的主程序备份（与 src/bridge.js 同源，只是历史快照）
+qq-bridge/_bridge.new.js
+_bridge.before-coldstart.js
+# 网关/工具目录快照
+qq-bridge/_snowluma-catalog.json
+# ACL 排错产物：含本机路径、用户名、SID、真实 QQ 号。
+# 那是**本机环境**的诊断记录，对部署者毫无用处，公开等于泄露机器信息。
+qq-bridge/acl-recovery/
+acl-recovery/
+# 一次性调试脚本（下划线开头是作者自己的约定）。
+# 它们写死了真实 QQ 号/群号/记忆示例，且功能已经完成、无人调用 ——
+# 留着只会被 `git add -A` 再抓回来（清理时踩过这个坑）。
+qq-bridge/scripts/_*.mjs
 # ── 运行状态：聊天记录、未读、记忆库、令牌、日志 ──
 state/
 qq-bridge/state/

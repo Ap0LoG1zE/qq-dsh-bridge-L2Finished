@@ -32,12 +32,12 @@ try {
   // 建两条印象，并按桥接的方式写别名
   const g = h.getSocialV2State('global');
   g.memberImpressions = {
-    2722156233: { traits: ['会@我骂猪'], interactionCount: 2, lastSeenAt: Date.now() },
+    70001: { traits: ['会@我骂猪'], interactionCount: 2, lastSeenAt: Date.now() },
     10001: { traits: ['爱把话绕回笨蛋'], interactionCount: 5, lastSeenAt: Date.now() },
   };
   // 别名表（名字的唯一真相）。桥接每收到一条消息都会写它；测试里直接注入等价数据。
   h.socialV2.aliases = {
-    2722156233: { primary: '7月1', names: ['7月1'], lastAt: Date.now() },
+    70001: { primary: '7月1', names: ['7月1'], lastAt: Date.now() },
     10001: { primary: 'Ap0LoG1zE', names: ['Ap0LoG1zE'], lastAt: Date.now() },
   };
 
@@ -45,7 +45,7 @@ try {
   const r1 = await post('/api/socialV2/impression-remove', { key: G, name: '7月1' });
   console.log('① 按展示名删「7月1」→', r1.status, JSON.stringify(r1.body).slice(0, 120));
   ok('按展示名能删掉', r1.status === 200 && r1.body.ok === true);
-  ok('全局里真的少了', !h.getSocialV2State('global').memberImpressions['2722156233']);
+  ok('全局里真的少了', !h.getSocialV2State('global').memberImpressions['70001']);
   ok('另一条没被误删', !!h.getSocialV2State('global').memberImpressions['10001']);
 
   // ② 用 QQ 号删
@@ -60,21 +60,21 @@ try {
 
   // ④ 编辑：改 trait
   h.getSocialV2State('global').memberImpressions = {
-    2722156233: { traits: ['旧内容'], interactionCount: 1, lastSeenAt: Date.now() },
+    70001: { traits: ['旧内容'], interactionCount: 1, lastSeenAt: Date.now() },
   };
   const r4 = await post('/api/socialV2/impression-update', { key: G, name: '7月1', traitIndex: 0, text: '新内容' });
   console.log('④ 按展示名编辑 →', r4.status, JSON.stringify(r4.body).slice(0, 120));
   ok('按展示名能编辑', r4.status === 200 && r4.body.ok === true);
-  ok('trait 真的改了', h.getSocialV2State('global').memberImpressions['2722156233'].traits[0] === '新内容');
+  ok('trait 真的改了', h.getSocialV2State('global').memberImpressions['70001'].traits[0] === '新内容');
 
   // ⑤ 改名**不支持**（操作者确认不需要）：名字归别名表管，印象编辑只改 traits。
   // 传 newName 应该被忽略、不影响 traits。
-  const before = JSON.stringify(h.getSocialV2State('global').memberImpressions['2722156233'].traits);
+  const before = JSON.stringify(h.getSocialV2State('global').memberImpressions['70001'].traits);
   const r5 = await post('/api/socialV2/impression-update', { key: G, name: '7月1', newName: '七月一号' });
   console.log('⑤ 传 newName（应被忽略） →', r5.status);
   ok('不报错（忽略掉这个名字参数）', r5.status === 200);
-  ok('traits 没被改坏', JSON.stringify(h.getSocialV2State('global').memberImpressions['2722156233'].traits) === before);
-  ok('别名表没被改', String(h.socialV2.aliases['2722156233']?.primary || '') === '7月1');
+  ok('traits 没被改坏', JSON.stringify(h.getSocialV2State('global').memberImpressions['70001'].traits) === before);
+  ok('别名表没被改', String(h.socialV2.aliases['70001']?.primary || '') === '7月1');
 } catch (e) {
   console.log('❌ 异常:', e.message); fails += 1;
 } finally {

@@ -39,13 +39,13 @@ function check(name, cond, extra = '') {
 const MINIAPP_CARD = JSON.stringify({
   ver: '1.0.0.19',
   prompt: '[QQ小程序]这是研学能看到的吗',
-  config: { type: 'normal', width: 0, height: 0, forward: 1, autoSize: 0, ctime: 1794373232, token: '9832a2658feeddf9610f87ec6995a5fc' },
+  config: { type: 'normal', width: 0, height: 0, forward: 1, autoSize: 0, ctime: 70006, token: '9832a2658feeddf9610f87ec6995a5fc' },
   needShareCallBack: false,
   app: 'com.tencent.miniapp_01',
   view: 'view_8C8E89B49BE609866298ADDFF2DBABA4',
   meta: {
     detail_1: {
-      appid: '1109937557',
+      appid: '70007',
       appType: 0,
       title: '哔哩哔哩',
       desc: '这是研学能看到的吗',
@@ -53,7 +53,7 @@ const MINIAPP_CARD = JSON.stringify({
       preview: 'https://qq.ugcimg.cn/v1/90l2fj452ueusetgle7i3le8fobkrjc2uhnd1s8rj6a0csh2122fgr58ui9j8kqnirpa43mnlgojvq1dt525urkgosmd45vamu04s4h09avqmsq3lagpstclmma6206m/e9vf2tsqr6j29hl2kodb3vahlc',
       url: 'm.q.qq.com/a/s/df7d5a5c5bdf23618a7b06c04004e4ad',
       scene: 1036,
-      host: { uin: 3554451149, nick: '玫玖璃真没救力' },
+      host: { uin: 70004, nick: '玫玖璃真没救力' },
       shareTemplateId: '8C8E89B49BE609866298ADDFF2DBABA4',
       shareTemplateData: {},
       qqdocurl: 'https://b23.tv/hUW6qRa?share_medium=android&share_source=qq&bbid=XUED2EEE041FF5A9BD1F33504D821E1ED155C&ts=1794373230826',
@@ -70,7 +70,7 @@ const STRUCT_CARD = JSON.stringify({
   app: 'com.tencent.structmsg',
   meta: {
     news: {
-      appid: 100951776,
+      appid: 70008,
       desc: '【测试】这么近那么美',
       jumpUrl: 'https://www.bilibili.com/video/BV1xx411c7mD?p=2',
       preview: 'https://i0.hdslb.com/bfs/archive/abc.jpg',
