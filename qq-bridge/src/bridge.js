@@ -5109,6 +5109,13 @@ async function main() {
           const sid = String(url.searchParams.get('sessionId') ?? '').trim();
           const stateSessions = readJsonSafe(STATE_FILE, {})?.sessions ?? {};
           const key = Object.keys(stateSessions).find((k) => stateSessions[k] === sid);
+          // 2026-11-17：临时加的访问日志。当初是为了确认"插件到底有没有来请求"——
+          // 结论是**来了**，问题在时序（agent/created 早于 state.sessions[key] 落盘），
+          // 已在 plugins/qq-agent-context 里修好。
+          // 保留它：验证「新会话首轮是否拿到令牌」时，这一行（key=group:xxx）就是
+          // 最直接的成功信号；非 QQ 会话会打 key=(未匹配到)，插件那边已带退避。
+          // 嫌吵可以删，删掉后排查首轮问题只能翻会话 zstd。
+          log(`[agent-context] 插件请求 sessionId=${sid.slice(0, 20)}… → key=${key || '(未匹配到)'}`);
           if (!sid || !key) { sendJson({ ok: false, error: 'unknown session' }, 404); return; }
           if (!isSessionAllowedInCurrentMode(key)) { sendJson({ ok: false, error: 'not allowed in current mode' }, 403); return; }
           const acSt = getSocialV2State(key);
@@ -14014,11 +14021,14 @@ async function main() {
           // 记下此刻活跃的 id：她按提示全量查过之后，delta 只需要给「新增 + 已消失」。
           factState.factSeenIds = picked.map((f) => f.id).filter(Boolean);
         } else if (nowCount > 0 && fingerprint !== prevFingerprint) {
-          // 平时：只提示变化，正文让她自己查。
-          // 不报条数（和冷启动那句保持一致）—— 条数是调用之后才有的信息，
-          // 写进唤醒词只是把它撑长；也不写 category='longTerm'，
-          // 全库只教一种查法：不带 category 一次拿全部。
-          factsLine = '（长期记忆有变化，先调 qq_memory_query 看一眼你记得什么，再说话。）\n\n';
+          // 2026-11-17：**不再提示「长期记忆有变化」**。
+          //
+          // 原来这里会写一句「先调 qq_memory_query 看一眼你记得什么」。
+          // 但现在长期记忆由 qq-agent-context 插件**自动装配进系统提示词**（每轮都在），
+          // 内容变了插件那边下一轮就自动更新 —— 让她再去查一遍纯属重复劳动，
+          // 还得等 2 分钟插件刷新期，反而更容易让她以为"我记得的和现在不一样"。
+          //
+          // 只更新基线，不产生任何提示。
           factState.factFingerprint = fingerprint;
         } else if (nowCount === 0 && prevFingerprint) {
           factState.factFingerprint = '';
