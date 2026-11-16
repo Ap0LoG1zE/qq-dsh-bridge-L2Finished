@@ -145,12 +145,13 @@ test('one closing action acknowledges the read watermark without an observation 
   assert.match(prefix, /qq_mark_read\(throughSeq=/);
   assert.match(prefix, /qq_set_wake_config\(throughSeq=…, config=…\)/);
   // 2026-11-12（操作者在别的会话重写了这一节）：
-  //   · 段名从【等、回与沉睡前观察】改成【等、回与收尾】——"观察窗口"这个概念退役了，
-  //     改为由收尾工具自己等约 20 秒。
+  //   · 段名从【等、回与沉睡前观察】改成【等、回与收尾】——"观察窗口"这个概念退役了。
   //   · 收尾结果多了 suggestedThroughSeq（放弃那几条新消息的入口）。
-  // 这里跟着钉住新语义；旧断言（发完就收尾 / 没有水位时省略 throughSeq）已随重写消失。
+  // 2026-11-17 再改：操作者又重写了措辞 —— **收尾不再空等**，立刻返回。
+  //   旧断言钉的是「收尾工具自己会等约 N 秒」，与现在的「收尾不会空等，立刻返回」相反，
+  //   所以这里改钉新语义（不空等 + 用 suggestedThroughSeq 放弃）。
   assert.match(prefix, /【等、回与收尾】/);
-  assert.match(prefix, /收尾工具自己会等约 \d+ 秒/);
+  assert.match(prefix, /收尾不会空等，立刻返回/);
   assert.match(prefix, /suggestedThroughSeq/);
   assert.match(prefix, /对方明确说“不聊了\/晚安\/下了\/拜拜\/明天见”时直接收尾/);
 });

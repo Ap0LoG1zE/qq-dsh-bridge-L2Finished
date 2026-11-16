@@ -100,17 +100,21 @@ test('冷启动后下一轮不得误报「有变化」（基线要写，留空�
   });
 });
 
-test('长期事实内容真变化时能检测到，且提示里不带正文', async () => {
+// 2026-11-17 改：长期记忆改成**自动装配进系统提示词**（qq-agent-context 插件），
+// 所以「内容变了要提示她去查」这条契约**整体取消**了。
+// 现在正确的行为是：内容变了也**不该**在唤醒词里说任何话 —— 插件下一轮会自动更新。
+test('长期事实内容变化不再提示（它已自动装配进系统提示词）', async () => {
   await withBridge(async (h, stateDir) => {
     addFact(stateDir, 'global', { text: 'FACT-OLD', tag: 'identity' });
     h.buildWakePromptV2(KEY, 'bootstrap');
     h.buildWakePromptV2(KEY, 'atMention@seq1');
     addFact(stateDir, 'global', { text: 'FACT-NEW-MARKER 新约定', tag: 'agreement' });
     const changed = h.buildWakePromptV2(KEY, 'atMention@seq2');
-    assert.ok(changed.includes('长期记忆有变化'), '新写一条事实必须被检测到');
-    assert.ok(!changed.includes('FACT-NEW-MARKER'), '检测到变化也只提示，正文让她自己查');
-    const after = h.buildWakePromptV2(KEY, 'atMention@seq3');
-    assert.ok(!after.includes('长期记忆有变化'), '同一个变化只提示一次');
+    // 不提示「有变化」：插件每 2 分钟刷新，系统提示词里的长期记忆会自己更新。
+    assert.ok(!changed.includes('长期记忆有变化'),
+      '长期记忆已自动装配，不该再让她去 qq_memory_query 查');
+    // 也不该把正文塞进唤醒词（正文只在系统提示词里）。
+    assert.ok(!changed.includes('FACT-NEW-MARKER'), '正文不该出现在唤醒词里');
   });
 });
 

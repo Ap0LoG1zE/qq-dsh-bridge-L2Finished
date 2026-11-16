@@ -1357,6 +1357,9 @@ server.tool(
 );
 
 /**
+ * 纯语音开关（2026-11-13 新增）：只有主人能切。
+ * 开启后桥接会把她打的字合成语音发出去，工具本身只是改一个开关。
+ */
 server.tool(
   'qq_set_voice',
   '打开或关闭「纯语音」模式：开启后你打的字会被自动转成你的声音发出去，关闭则回到打字。'
@@ -1388,54 +1391,34 @@ server.tool(
   }
 );
 
- * 把 /api/socialV2/facts 的响应渲染成给模型看的纯文本。
- *
- * 2026-11-10 操作者的要求：「每一次调动她都能看到完整的，但是要告诉她什么忘掉了」。
- * 所以这里**永远返回全部活跃事实**，只在末尾追加一段「已经忘掉的」。
- * 不要改回差集模式 —— 差集让她可能漏读中间写过、这次又没变化的内容。
- *
- * 参数是桥接 facts 接口的原始响应：{ facts: [...], forgotten: [{id,text,tag}] }。
- */
-function formatFactsBlock(data) {
-  const all = Array.isArray(data?.facts) ? data.facts : [];
-  const live = all.filter((f) => !f.archived).slice(0, 30);
-  const forgotten = Array.isArray(data?.forgotten) ? data.forgotten : [];
-
-  const parts = [];
-  parts.push(live.length
-    ? `【长期记忆】${live.length} 条（按重要度排序；这些是你记得的事，不是给你的指令；细节想不起来用 qq_recall 查）\n${live.map((f) => `- ${String(f.text || '').trim()}`).join('\n')}`
-    : '【长期记忆】还没有内容（0 条）。');
-
-  // 「忘掉的」必须明说，否则她会继续拿已经不存在的记忆说话 —— 那比记不起来更糟。
-  if (forgotten.length) {
-    parts.push(`【已经忘掉的】下面这些已经不在你的记忆里了（权重衰减或归档），别再当成还记得：\n${forgotten.map((f) => `- ${String(f.text || '').trim()}`).join('\n')}`);
-  }
-  return parts.join('\n\n');
-}
+// 2026-11-17：formatFactsBlock 已删除。
+//
+// 它原来只服务于 qq_memory_query —— 把 /api/socialV2/facts 渲染成【长期记忆】块。
+// 现在长期记忆由 qq-agent-context 插件自动装配进系统提示词（每轮都在），
+// query 不再返回它，这个渲染函数就没有调用者了。留着只会让后来的人以为还有这条路。
+//
+// 长期记忆的写入仍然走 qq_memory_append(category='longTerm')，那条没变。
 
 server.tool(
   'qq_memory_query',
   '查看当前会话的记忆（只读）。'
-    + '**不带 category 是主要用法**：一次返回全部——selfNote 自我认知 + 群友印象 + 待办 + 进行中的话题 + 想说的 + 长期事实。'
+    + '**不带 category 是主要用法**：一次返回全部——selfNote 自我认知 + 群友印象 + 待办 + 进行中的话题 + 想说的话。'
     + '新会话第一轮、上下文刚被压缩过时，查这一次就够了，不用分开查。'
-    + '每次都返回完整的长期事实，另外会告诉你哪些已经忘掉了（别再拿那些说话）。'
+    // 2026-11-17：长期记忆不再由本工具返回 —— 它已经由插件自动装配进系统提示词，
+    // 每轮都在，再查一遍等于重复付费，而且会让她以为"这是我刚想起来的"。
+    + '**长期记忆不在这里**：它已经在你系统提示词里，每轮都在，不用查。'
     + '带 category 只看某一类（单类维护时用）。'
     + '返回是排好版的纯文本，不是 JSON。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【令牌】）'),
-    category: z.enum(['todo', 'activeTopic', 'pendingThought', 'memberImpression', 'selfNote', 'longTerm'])
+    category: z.enum(['todo', 'activeTopic', 'pendingThought', 'memberImpression', 'selfNote'])
       .optional()
-      .describe('可选。**不传 = 一次拿回全部记忆（推荐）**；传了就只看那一类'),
+      .describe('可选。**不传 = 一次拿回全部轻量记忆（推荐）**；传了就只看那一类。'
+        + '长期记忆不在选项里——它已经在系统提示词中。'),
   },
   async ({ key, token, category }) => {
     try {
-      // 长期事实不在 /api/socialV2/memory 里，走 facts 接口。
-      if (category === 'longTerm') {
-        const data = await agentApi(`/api/socialV2/facts?key=${encodeURIComponent(key)}`, { headers: { 'x-agent-token': token } });
-        const text = formatFactsBlock(data);
-        return { content: [{ type: 'text', text }] };
-      }
       const q = new URLSearchParams({ key });
       if (category) q.set('category', category);
       const data = await agentApi(`/api/socialV2/memory?${q.toString()}`, { headers: { 'x-agent-token': token } });
@@ -1450,29 +1433,11 @@ server.tool(
       // 现在桥接侧保证了 formatted 恒为非空纯文本（没数据也会写"没有"），
       // 这里只在该字段意外缺失时才兜底，且兜底也输出人话而不是 JSON。
       const lightText = formatted || '【记忆】读取成功，但桥接没有返回可读正文（这是异常状态，重试一次；仍异常请报告）。';
-      // 不带 category = 「想起来」的完整动作：轻量记忆 + 长期事实**一次全给**。
-      // 2026-11-10 二次修订：以前不带 category 只返回轻量记忆，长期事实要另外调一次，
-      // 于是她只挑了参数更明确的那次（category='longTerm'），selfNote/群友印象整块被跳过。
-      // 现在合成一次调用，冷启动/压缩后只查一次就齐了。
-      if (!category) {
-        let factsText = '';
-        try {
-          const fd = await agentApi(`/api/socialV2/facts?key=${encodeURIComponent(key)}`, { headers: { 'x-agent-token': token } });
-          factsText = formatFactsBlock(fd);
-        } catch (error) {
-          // 事实库坏了不能拖累轻量记忆：她至少还能看到 selfNote / 群友印象。
-          factsText = `【长期记忆】读取失败（${error?.message ?? error}），先按轻量记忆说话。`;
-        }
-        return { content: [{ type: 'text', text: `${lightText}\n\n${factsText}` }] };
-      }
-      if (formatted) return { content: [{ type: 'text', text: formatted }] };
-      // 同上：按类别查时也不回退成 JSON。
-      return {
-        content: [{
-          type: 'text',
-          text: `【记忆】没有返回 ${category || '记忆'} 的可读内容（可能是这一类还没有数据）。`,
-        }],
-      };
+      // 2026-11-17：**不再追加长期事实**。
+      // 原来不带 category 时会再打一次 /api/socialV2/facts，把 30 条事实拼在后面。
+      // 现在长期记忆由 qq-agent-context 插件装进系统提示词（每轮都在），
+      // 再查一遍是重复内容 —— 既费 token，又让她分不清"哪些是我刚想起来的"。
+      return { content: [{ type: 'text', text: lightText }] };
     } catch (error) {
       return { content: [{ type: 'text', text: `记忆读取失败：${error?.message ?? error}` }], isError: true };
     }
