@@ -128,7 +128,10 @@ test('snapshots are optional, partial snapshots require reading, and watermarks 
   //      塞进"新会话专属准备"里反而让她以为平时不用看。
   // 另外修了一句自相矛盾的话：原写「压缩后内容丢了」+「同一个 DSH 会话里查过一次就够」——
   // 压缩就发生在同一个会话里，两句打架。判据改成"有没有被压过"，不是"换没换会话"。
-  assert.match(prefix, /【新会话 \/ 刚压缩完：先拿这两样东西】/);
+  // 2026-11-17：标题又从「先拿这两样东西」改成「先拿这三样东西」——
+  // ③ 是重新加回来的（操作者在别的会话补了一条准备动作）。
+  // 这里只钉「这一节存在」，用 . 代替具体数字：数字会随内容增减变，钉死只会反复误报。
+  assert.match(prefix, /【新会话 \/ 刚压缩完：先拿这.样东西】/);
   assert.match(prefix, /① \*\*调 qq_get_prompt\*\*/);
   assert.match(prefix, /② \*\*调 qq_memory_query\*\*/);
   assert.ok(!prefix.includes('这一步不用调工具'),

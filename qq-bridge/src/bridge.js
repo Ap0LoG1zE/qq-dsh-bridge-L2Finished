@@ -5143,39 +5143,26 @@ async function main() {
           if (!sid || !key) { sendJson({ ok: false, error: 'unknown session' }, 404); return; }
           if (!isSessionAllowedInCurrentMode(key)) { sendJson({ ok: false, error: 'not allowed in current mode' }, 403); return; }
           const acSt = getSocialV2State(key);
-          const acStickerCfg = cfg.socialV2?.sticker ?? {};
           const parts = [];
           const idText = selfIdentityTextV2();
           if (idText) parts.push(idText.trim());
           parts.push(sessionTokenLineV2(key, acSt.agentToken));
-          if (acStickerCfg.enabled !== false && acStickerCfg.includeInPrompt !== false) {
-            const stickerText = buildStickerContext(stickerEntries, acStickerCfg.promptMaxStickers ?? 8);
-            if (stickerText) parts.push(stickerText);
-          }
-          let factsText = '';
-          try {
-            // ⚠️ 必须用 memoryKeyOf(key) 而不是 key。
-            //
-            // 2026-11-17 修：这里原来写的是 `selectFactsForInjection(STATE_DIR, key)`，
-            // 于是它去读 facts/private_<QQ号>.jsonl —— **那个文件根本不存在**。
-            // 长期事实自 2026-11-10 起一律存全局（facts/global.jsonl），
-            // 其它注入点（唤醒词、控制台预览）早就改成了 memoryKeyOf()，只有这一处漏了。
-            //
-            // 症状：系统提示词里身份/令牌/表情都在，唯独【长期记忆】整段消失，
-            // 而任何异常都不会发生（selectForInjection 对空库返回空串，是合法返回值），
-            // 所以日志里连一个字都没有 —— 静默丢功能。
-            try {
-              const f = selectFactsForInjection(STATE_DIR, memoryKeyOf(key));
-              factsText = f.text;
-            } catch (inner) {
-              // 全局库坏了，退回到按会话取（老数据/迁移期可能只有会话级文件）。
-              log(`[memory] 全局长期记忆渲染失败，回退按会话取：${inner?.message ?? inner}`);
-              factsText = selectFactsForInjection(STATE_DIR, key).text;
-            }
-          } catch (error) {
-            log(`[memory] 长期记忆渲染失败（已跳过）：${error?.message ?? error}`);
-          }
-          if (factsText) parts.push(factsText);
+          // ── 2026-11-18：**只保留身份 + 令牌，其余全部移出** ──────────────
+          //
+          // 这一段会进 **system prompt**，而 system prompt 在整个 prompt 的最前面：
+          // 它一变，后面几十万 token 的对话历史前缀全部失效、整段重算。
+          //
+          // 实测 session-7e48ee50：52 步里 7 次缓存重建，吃掉 88.6% 的 cacheMiss，
+          // 命中率从 98.8% 掉到 90.1%。已经移出的诱因：
+          //   ① 长期记忆（16:23:34 多了 6 条 → +331 字符 → 42,000 token 重算）
+          //   ② 可用表情包（她收藏/发送表情、useCount 涨了就变）← 本次移出
+          //
+          // 剩下的两样是真的几乎不变：
+          //   · 身份：QQ 号 + 昵称，除非换号
+          //   · 令牌：只在她重置会话 / 轮换时才变
+          //
+          // 表情包改由 preset 引导她「新会话/刚压缩完时调一次 qq_list_stickers」。
+          // 代价是首轮多一次工具往返，但换来的是整段对话的命中率。
           sendJson({ ok: true, key, text: parts.join('\n\n') });
           return;
         }
@@ -6245,13 +6232,36 @@ async function main() {
             sendJson({ ok: false, error: '群聊拍一拍必须指定 targetUserId（要拍的群友 QQ 号）' }, 400);
             return;
           }
+          // 2026-11-17：**targetUserId 允许传昵称，自动换成 QQ 号**。
+          //
+          // 实测她传了 targetUserId="Ap0LoG1zE"（那是昵称，不是号），被这里拒了。
+          // 消息行里只有昵称没有号，她照抄昵称是很自然的动作 —— 与其让她先查一次
+          // qq_get_userid 再来拍（多一次工具往返），不如在这里直接用别名表换掉。
+          //
+          // 只在**唯一命中**时才换：昵称可能重复（同名/包含关系），
+          // 猜错会把拍一拍发给别人，比报错难查得多。
+          let resolvedTarget = targetUserId;
           if (targetUserId && !/^[1-9]\d*$/.test(targetUserId)) {
-            sendJson({ ok: false, error: 'targetUserId 必须是正整数 QQ 号' }, 400);
-            return;
+            let candidates = [];
+            try { candidates = lookupAliasV2(targetUserId) || []; } catch { candidates = []; }
+            // 精确匹配优先：primary 或不区分大小写完全相等
+            const exact = candidates.filter((c) => c.userId === targetUserId
+              || String(c.primary).toLowerCase() === targetUserId.toLowerCase()
+              || (c.names || []).some((n) => String(n).toLowerCase() === targetUserId.toLowerCase()));
+            const pick = exact.length === 1 ? exact[0] : (candidates.length === 1 ? candidates[0] : null);
+            if (!pick) {
+              const hint = candidates.length > 1
+                ? `「${targetUserId}」对应多个人（${candidates.slice(0, 3).map((c) => `${c.primary}/${c.userId}`).join('、')}），请用 qq_get_userid 确认后传 QQ 号`
+                : `「${targetUserId}」不是一个 QQ 号，也没有对应的已知成员；先用 qq_get_userid(query=…）换成号`;
+              sendJson({ ok: false, error: hint }, 400);
+              return;
+            }
+            resolvedTarget = pick.userId;
           }
+          const finalTarget = resolvedTarget;
           // 群聊必须确认目标确实是本群成员（私聊天然只有双方，无需校验）。
           if (kind === 'group') {
-            const memberError = await assertGroupMember(id, targetUserId);
+            const memberError = await assertGroupMember(id, finalTarget);
             if (memberError) { sendJson({ ok: false, error: memberError }, 403); return; }
           }
           const st = getSocialV2State(key);
@@ -6280,7 +6290,7 @@ async function main() {
               throw blocked;
             }
             if (kind === 'group') {
-              await bot.raw('group_poke', { group_id: id, user_id: Number(targetUserId) });
+              await bot.raw('group_poke', { group_id: id, user_id: Number(finalTarget) });
             } else {
               // 私聊拍一拍：send_poke 自动路由到当前私聊对象
               await bot.raw('send_poke', { user_id: id });
@@ -6288,8 +6298,12 @@ async function main() {
             st.lastActionAt = now;
             st.lastAiReplyAt = now;
             st.wakeConfig.noActionCount = 0;
+            // 显示名用**她传的那个标签**（昵称），不是换出来的 QQ 号 ——
+            // 她自己看到的记录要和她说的话对得上（"我拍了拍 Ap0LoG1zE"）。
+            const pokeTargetLabel = String(body.targetLabel ?? '').trim()
+              || (finalTarget !== targetUserId ? targetUserId : finalTarget);
             const pokeText = kind === 'group'
-              ? `[拍一拍] 我拍了拍 ${targetUserId}`
+              ? `[拍一拍] 我拍了拍 ${pokeTargetLabel}`
               : '[拍一拍] 我拍了拍你';
             st.recentMessages.push({
               messageId: null,
@@ -6306,7 +6320,8 @@ async function main() {
               hasMedia: false,
               forwardIds: [],
               hasForward: false,
-              poke: { targetId: targetUserId || String(id), targetIsSelf: false, groupId: kind === 'group' ? String(id) : null },
+              // targetId 记**真实 QQ 号**（后续逻辑要拿它判断"拍的是谁"）。
+              poke: { targetId: finalTarget || String(id), targetIsSelf: false, groupId: kind === 'group' ? String(id) : null },
               time: Date.now()
             });
             const recentLimit = Number(cfg.socialV2?.context?.recentLimit) || 100;
@@ -6315,8 +6330,10 @@ async function main() {
             st.preSleepWaitObservedAt = 0;
             st.preSleepWaitAccumMs = 0;
             saveSocialV2State();
-            log(`[reserved2] 工具拍一拍 ${key}${kind === 'group' ? ' -> ' + targetUserId : ''}`);
-            appendActivity(`${key} [reserved2] 工具拍一拍${kind === 'group' ? ' -> ' + targetUserId : ''}`);
+            // 日志记**真实 QQ 号**：出问题时要知道到底拍到了谁（传昵称时尤其重要）。
+            const logTarget = finalTarget !== targetUserId ? `${finalTarget}(原传 ${targetUserId})` : finalTarget;
+            log(`[reserved2] 工具拍一拍 ${key}${kind === 'group' ? ' -> ' + logTarget : ''}`);
+            appendActivity(`${key} [reserved2] 工具拍一拍${kind === 'group' ? ' -> ' + logTarget : ''}`);
             // 2026-11-12 精简：原来回 {ok, key, kind, targetUserId} —— 四个字段全是回显。
             //   ok            成功时恒 true
             //   key           她自己传的
@@ -14102,9 +14119,16 @@ async function main() {
           const hasFact = nowCount > 0;
           // 库里什么都没有时不点名工具：点名了她会白调一次，然后拿到一片空。
           if (hasSelf || hasImp || hasFact) {
-            factsLine = '（新会话或上下文刚压缩过，你记下的东西现在不在上下文里。开口前先调 qq_memory_query，不带 category。）\n\n';
+            // 2026-11-18：点明 qq_memory_query **带不带 category 都含长期记忆**，
+            // 并额外提醒她拿一次表情包列表（表情包已从系统提示词移出，见
+            // /api/socialV2/agent-context 的说明：它会话可变，留在系统提示词里
+            // 会让整段缓存前缀失效）。
+            factsLine = '（新会话或上下文刚压缩过，你记下的东西现在不在上下文里 —— 包括长期记忆。'
+              + '开口前先调 qq_memory_query（不带 category，一次拿到轻量记忆和长期记忆），'
+              + '再调一次 qq_list_stickers 看看自己有哪些表情包。）\n\n';
           } else {
-            factsLine = '（新会话或上下文刚压缩过 —— 你记下的东西现在不在上下文里。）\n\n';
+            factsLine = '（新会话或上下文刚压缩过 —— 你记下的东西现在不在上下文里。'
+              + '先调 qq_list_stickers 看看自己有哪些表情包。）\n\n';
           }
           // 记录当前指纹作为基线：这一轮已经明确提示过"去查"，下一轮内容没变就不该再提示。
           // （写基线不会漏检 —— 指纹是内容哈希，内容变了哈希必然变。留空反而会让
