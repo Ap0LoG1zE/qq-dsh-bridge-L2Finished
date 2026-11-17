@@ -2595,7 +2595,26 @@ window.__ModuleLoader__.load({
       rows.push(statusLine(c.name + (c.detail ? '：' + c.detail : ''), c.ok === true))
     }
     var nodes = [section(d.ok ? '自检全部通过' : '自检发现问题', rows)]
+    // 端点对齐的结论：端口漂移是这类故障最常见的原因，明说「这轮做了什么」
+    // 比让人去翻 bridge.log 快得多。只在真的发生过动作时显示，正常时保持安静。
+    var es = d.endpointSync
+    if (es && (es.changed === true || es.reason === 'hint' || es.reason === 'scan')) {
+      var syncRows = []
+      if (es.baseUrl) syncRows.push(kv('桥接的 DSH 地址', es.baseUrl))
+      if (es.changed === true) syncRows.push(kv('本轮动作', '已从旧地址自动跟随到上面这个（' + (es.reason || 'scan') + '）'))
+      else syncRows.push(kv('本轮动作', '地址本来就是对的，无需改动'))
+      nodes.push(section('端点对齐', syncRows))
+    }
     if (d.model) nodes.push(section('DSH 模型', [kv('当前模型', (d.model.provider ? d.model.provider + ' / ' : '') + (d.model.model || '—')), kv('思考强度', d.model.reasoningEffort)]))
+    // 桥接没跑时把「已试过自动启动」如实显示出来，否则一屏错误信息没人知道下一步做什么。
+    var as = d.autostart
+    if (as && !(d.ok === true)) {
+      var note = as.started
+        ? '已执行 start.bat 拉起桥接，但控制台仍然连不上 —— 看 qq-bridge/state/bridge.log 的前几行。'
+        : (as.error || '桥接没在运行，且自动启动没有成功。')
+      nodes.push(h('div', 'dsh-fb-warn', note))
+    }
+    if (d.elapsedMs) nodes.push(kv('本次检测耗时', d.elapsedMs + 'ms'))
     nodes.push(actionsRow([{ label: '重新检测', onClick: function () { loadTab('diagnose') } }]))
     setBody(nodes)
   }

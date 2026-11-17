@@ -802,18 +802,64 @@ async function probeDshPort(port, timeoutMs = 1200) {
 }
 
 /**
- * 让 `cfg.dsh.baseUrl` 跟上 DSH 当前实际监听的端口。
- * @returns {Promise<{changed: boolean, baseUrl: string, from?: string}>}
+ * 在给定端口集合里找出**第一个**真的是 DSH 的端口。
+ *
+ * 为什么要并发、又为什么要限流：
+ *   · 顺序探有上界风险 —— 某个端口「接受连接但永不响应」时每次都要吃满 1.2s 超时，
+ *     十几个这样的端口叠起来就是十几秒，而这段代码跑在掉线自愈路径上。
+ *   · 全并发也不行 —— 一次开几十个 socket 探测，防火墙/系统资源都不喜欢。
+ *   取折中：并发 8 路，命中即全员提前退出（hit 是共享的短路标记）。
+ *
+ * @returns {Promise<number>} 命中的端口；一个都没有则返回 0。
  */
-async function followDshEndpoint(cfg) {
+async function firstDshPort(ports, concurrency = 8) {
+  let cursor = 0;
+  let hit = 0;
+  const worker = async () => {
+    for (;;) {
+      if (hit) return;                       // 别人已经找到了，收工
+      const i = cursor++;
+      if (i >= ports.length) return;         // 队列空了，收工
+      const port = ports[i];
+      if (await probeDshPort(port)) { hit = port; return; }
+    }
+  };
+  const n = Math.min(concurrency, ports.length);
+  if (n <= 0) return 0;
+  await Promise.all(Array.from({ length: n }, worker));
+  return hit;
+}
+
+/**
+ * 让 `cfg.dsh.baseUrl` 跟上 DSH 当前实际监听的端口。
+ *
+ * @param {object} cfg 配置对象（会被就地改写 dsh.baseUrl）
+ * @param {object} [opts]
+ * @param {number} [opts.port] 权威端口提示：调用方**确定**自己就是 DSH 时传进来
+ *        （例如面板跑在 DSH 进程内，`req.socket.localPort` 就是它正在服务的端口）。
+ *        有提示就先用指纹验一次，验过直接用 —— 不必去监听列表里猜。
+ *        这消除了整条「扫端口」路径，是「点一下立刻连上」的关键。
+ * @param {boolean} [opts.force] 跳过「配置值还能用就不动」的短路。
+ * @returns {Promise<{changed: boolean, baseUrl: string, from?: string, reason: string}>}
+ */
+async function followDshEndpoint(cfg, opts = {}) {
   const configured = String(cfg?.dsh?.baseUrl || '').trim();
   const parsePort = (url) => {
     try { return Number(new URL(url).port) || 0; } catch { return 0; }
   };
 
-  // 1) 配置里的地址还能用就什么都不做（不制造无谓的文件改写）。
+  // ① 权威提示优先：调用方说「我就在这个端口上」，验一下指纹即可采纳。
+  //    注意仍然要验证 —— 端口可以被别的进程抢占，盲信提示会把 baseUrl 指到错误的服务。
+  const hintedPort = Number(opts.port) || 0;
+  if (Number.isInteger(hintedPort) && hintedPort > 0 && await probeDshPort(hintedPort)) {
+    return finish(hintedPort, 'hint');
+  }
+
+  // ② 配置里的地址还能用就什么都不做（不制造无谓的文件改写）。
   const configuredPort = parsePort(configured);
-  if (configuredPort && await probeDshPort(configuredPort)) return { changed: false, baseUrl: configured };
+  if (!opts.force && configuredPort && await probeDshPort(configuredPort)) {
+    return { changed: false, baseUrl: configured, reason: 'configured-alive' };
+  }
 
   // 跳过 SnowLuma(3000/3001) 与本桥接控制台端口。
   const skip = new Set([3000, 3001, Number(cfg?.consolePort) || 3100]);
@@ -822,27 +868,29 @@ async function followDshEndpoint(cfg) {
   const inRange = (p) => Number.isInteger(p) && p > 0 && p <= 65535
     && p !== configuredPort && !skip.has(p);
 
-  // 2) 让操作系统告诉我们哪些端口在监听 —— 再只对这些端口做 DSH 指纹确认。
+  // ③ 让操作系统告诉我们哪些端口在监听 —— 再只对这些端口做 DSH 指纹确认。
   //    ⚠️ 不要逐端口 TCP/HTTP 扫描：实测 2000~20000 全扫要 4~7 秒，
   //    而 `netstat -ano` 一次只要 **25 毫秒**（实测），拿到的还是精确的监听集合。
-  //    本机同时在监听的端口通常只有十几个，逐个确认指纹瞬间完成。
+  //    本机同时在监听的端口通常只有十几个，并发确认指纹瞬间完成。
   //
   // ⚠️ 这里**刻意不做**「记住上次的端口再优先试」。
   //    桌面版 DSH 每次启动都重新分配端口（实测一天里见过 5306→9149→7167→4801…），
   //    上一次成功记录的端口下一次必然失效；先试它只会白等一个超时才回退，
   //    反而比直接查监听列表更慢。netstat 这条路已经是毫秒级，没有优化的必要。
   const listening = listListeningLoopbackPorts().filter(inRange);
-  for (const port of listening) {
-    if (await probeDshPort(port)) return finish(port);
-  }
+  const found = await firstDshPort(listening);
+  if (found) return finish(found, 'scan');
 
-  return { changed: false, baseUrl: configured, from: configured };
+  return { changed: false, baseUrl: configured, from: configured, reason: 'not-found' };
 
   /** 采纳找到的端口：更新内存配置 + 写回 config.json + 记住它。 */
-  function finish(port) {
+  function finish(port, reason = 'scan') {
     const nextUrl = `http://127.0.0.1:${port}`;
-    if (nextUrl === configured) return { changed: false, baseUrl: configured };
-    log(`[dsh] 配置里的 DSH 地址 ${configured || '(空)'} 已失效，自动跟随到 ${nextUrl}`);
+    if (nextUrl === configured) return { changed: false, baseUrl: configured, reason: 'already-current' };
+    // 措辞区分来源：提示命中是「被明确告知」，扫描命中是「推导出来的」。
+    // 两者在排错时的含义完全不同，日志里必须分得开。
+    const how = reason === 'hint' ? '（由调用方提供端口提示）' : '';
+    log(`[dsh] 配置里的 DSH 地址 ${configured || '(空)'} 已失效，自动跟随到 ${nextUrl}${how}`);
     cfg.dsh.baseUrl = nextUrl;
 
     // 写回 config.json（只替换 baseUrl 那一行的值，其余字节原样保留）。
@@ -862,7 +910,7 @@ async function followDshEndpoint(cfg) {
     }
     // 不再记 dsh-port.json：桌面版 DSH 每次启动都换端口，上一次记下的值下一次必然失效，
     // 留着只会让「优先试旧端口」那条路径白等一个超时。端口发现改成直接读监听列表。
-    return { changed: true, baseUrl: nextUrl, from: configured };
+    return { changed: true, baseUrl: nextUrl, from: configured, reason: reason || 'scan' };
   }
 }
 
@@ -2723,6 +2771,12 @@ async function main() {
   let dshCheckStarted = false;
   // 上次「DSH 掉线后重新跟随端口」的时刻（毫秒）。见 checkDsh 里的冷却说明。
   let lastDshFollowAt = 0;
+  // ── 事件流退避睡眠的「提前叫醒」开关 ───────────────────────────────────────
+  // pumpMux 在「连上但 0 帧」时会指数退避（3s → 30s）。端口刚对齐完那一刻，
+  // 它多半正睡在退避窗口里，于是表现成「端口明明对了，事件流还要再等半分钟」。
+  // 这里存一个 resolver：任何知道「DSH 现在重新可用了」的地方调 wakeMuxPump()
+  // 就能把它从 sleep 里立刻叫起来，用新端口重连。
+  let muxWake = null;
   let snowlumaWatchStarted = false; // SnowLuma 上游健康探测只启动一次（见 startSnowlumaWatch）
   let currentMode = 'chat'; // chat | closed-agent | reserved（仿真模式，由 DSH settings / state/mode.json 驱动）
   let lastMode = currentMode;
@@ -3245,7 +3299,22 @@ async function main() {
       }
     }
   };
+  // ── checkDsh 的重入护栏 ────────────────────────────────────────────────────
+  // 它由 `setInterval(..., 5000)` 驱动，而「掉线自愈」那段会 `await` 一次端口探测
+  // （netstat + 指纹，最坏几百毫秒）。一旦某轮耗时超过 5 秒（DSH 半死不活时完全
+  // 可能），定时器就会再起一轮，两轮同时更新 dshReady / 同时改写 cfg 与 config.json，
+  // 结果不可预期。用单飞标记把并发的第二轮直接挡掉 —— 下一轮 5 秒后自然会来。
+  let dshCheckBusy = false;
   const checkDsh = async () => {
+    if (dshCheckBusy) return;
+    dshCheckBusy = true;
+    try {
+      await checkDshOnce();
+    } finally {
+      dshCheckBusy = false;
+    }
+  };
+  const checkDshOnce = async () => {
     let ok = false;
     try {
       await api.settings.describe({});
@@ -3299,25 +3368,84 @@ async function main() {
       dshReady = false;
       log('⚠️ DSH 不可用（重启中？），QQ 消息将入队等待');
     }
-    // 这里**刻意不做**「掉线后自动重新跟随端口」。
+    // ── 掉线后的端口自愈 ────────────────────────────────────────────────────
     //
-    // 曾经有过一段：探测到 DSH 连不上且距上次跟随超过 60 秒，就重新扫一遍端口。
-    // 后来去掉了，原因：
-    //   ① 桌面版 DSH 每次启动都换端口，而桥接的这份"掉线重探"是靠 5 秒轮询驱动的，
-    //      冷却窗口内要等、冷却外又要扫端口，行为不可预期；
-    //   ② 现在有更明确的两个时机去对齐端口 ——
-    //      · **DSH 启动时**（DSH 自己的启动流程会调 /api/dsh/follow-endpoint）；
-    //      · 使用者在小面板点「启动 SnowLuma」（也会顺带促一次对齐）。
-    //      这两个时机都是"人刚动完手"，比在后台盲猜更可靠。
-    //   ③ 真的需要手动对齐时，控制台还有现成的按钮和接口。
+    // 曾经**刻意去掉过**这一段，理由是「端口对齐改成事件驱动、少一份周期性副作用」。
+    // 那个判断在实测里站不住，现在加回来 —— 但加了明确的前置条件，不再是盲目轮询：
     //
-    // 换句话说：端口对齐从"后台自动"改成"事件驱动"，少一份周期性副作用。
+    //   真正卡住用户的场景是「先开 DSH，再点启动 SnowLuma」：
+    //     · DSH 是**新的**进程，端口是**新的**值；
+    //     · 桥接要么还在连旧端口（上次那个 DSH 进程的），要么刚起来、配置里也是旧值；
+    //     · 面板那条「启动 SnowLuma」顺带的对齐请求 —— 它要求面板**先能连上桥接的
+    //       控制台**，而桥接这时通常还没起好，于是这一步经常根本没执行；
+    //     · 结果就得等到「有人想起来去点一下对齐」为止。
+    //   所以必须在**桥接自己这一侧**也能自愈，不能只依赖外部事件。
+    //
+    // 三条前置条件（缺一不做，避免 5 秒一次地扫端口）：
+    //   ① DSH 确实不可用（`ok === false`）—— 可用时绝不打扰；
+    //   ② 距上次尝试跟随已过冷却期（JOIN 成功时会把时间戳写在这里）；
+    //   ③ 当前不是「刚刚跟随完仍然连不上」的状态 —— 由冷却期自然覆盖。
+    //
+    // 代价可控：netstat 一次约 25ms，指纹探测并发 8 路，命中即停。
+    if (!ok) {
+      const FOLLOW_COOLDOWN_MS = 10_000;
+      const now = Date.now();
+      if (now - lastDshFollowAt > FOLLOW_COOLDOWN_MS) {
+        lastDshFollowAt = now;   // 先占位：这次无论成败都不在冷却期内重复
+        try {
+          const r = await followDshEndpoint(cfg);
+          if (r.changed) {
+            api.baseUrl = r.baseUrl;
+            api.invalidateAuth();
+            log(`[dsh] 掉线自愈：${r.from || '(空)'} → ${r.baseUrl}（来源 ${r.reason || 'scan'}）`);
+            // 端口变了：立刻重探一次，让本轮 checkDsh 就能把 dshReady 翻成 true，
+            // 而不是再等 5 秒。顺带把退避中的事件流叫醒。
+            try { await api.settings.describe({}); } catch {}
+            wakeMuxPump();
+          }
+        } catch { /* 自愈失败不阻断主循环，下一轮冷却期过后再试 */ }
+      }
+    }
   };
   function startDshWatch() {
     if (dshCheckStarted) return;
     dshCheckStarted = true;
     checkDsh();
     setInterval(checkDsh, 5000);
+  }
+
+  /**
+   * 把正睡在退避窗口里的 pumpMux 立刻叫起来。
+   *
+   * 幂等：没有等待者时什么都不做（下一次 pumpMux 会自己算退避）。
+   * 注意它只打断「睡眠」，不改变退避策略本身 —— 策略仍然是
+   * 「真的连上了才重置」，否则会退化成每 3 秒一次的刷屏重连。
+   */
+  function wakeMuxPump() {
+    if (!muxWake) return;
+    const r = muxWake;
+    muxWake = null;
+    r();
+  }
+
+  /**
+   * 可被打断的 sleep：`ms` 到点或 wakeMuxPump() 被调用，哪个先到就返回。
+   * @returns {Promise<boolean>} true = 是被 wake 叫醒的（而不是自然到点）。
+   */
+  function sleepUnlessWoken(ms) {
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (woken) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        if (muxWake === fire) muxWake = null;
+        resolve(woken);
+      };
+      const fire = () => finish(true);
+      const timer = setTimeout(() => finish(false), ms);
+      muxWake = fire;
+    });
   }
 
   // ── SnowLuma 上游健康：**连上了 ≠ 收得到** ──────────────────────────────────
@@ -8918,18 +9046,52 @@ async function main() {
               if (diskCfg?.dsh?.baseUrl) cfg.dsh.baseUrl = String(diskCfg.dsh.baseUrl).trim();
             } catch { /* 读不到就沿用内存值，不阻断 */ }
 
-            const r = await followDshEndpoint(cfg);
+            // ── 端口提示：调用方把自己**确切的** DSH 端口告诉我们 ────────────
+            // 面板（qq-dsh-panel）就跑在 DSH 进程里，`req.socket.localPort` 就是
+            // DSH 正在服务的端口 —— 那是**权威答案**，比扫监听列表靠谱得多。
+            //
+            // 为什么这条提示是「立刻连上」的关键：以前这条路径无论谁调都只能
+            // 「扫一遍回环监听端口 + 逐个验指纹」。桌面版 DSH 每次启动换端口，
+            // 于是每次都得白扫一遍；更糟的是它只能从端口列表里**猜**，猜错就是
+            // 看起来对齐了、其实还连着旧端口。有了提示，一次指纹验证就够了。
+            let body = {};
+            try { body = await readBody(); } catch { body = {}; }
+
+            // 先做一次掉线判定，让 dshReady 反映「对齐前」的真实情况（下面要用）。
+            const wasReady = dshReady;
+            await checkDsh();
+
+            const r = await followDshEndpoint(cfg, { port: Number(body?.port) || 0 });
             if (r.changed) {
               // 端口变了要同步换掉 NodeApiClient 的 baseUrl，否则只改了 cfg 和
               // config.json，实际请求还打旧端口。
               api.baseUrl = r.baseUrl;
               api.invalidateAuth();
-              // 立刻用它做一次探活，让 /api/status 的 dshReady 马上反映真实情况，
-              // 而不是等下一个 5 秒轮询。
-              lastDshFollowAt = Date.now();
-              log(`[dsh] 控制台请求主动对齐：${r.from || '(空)'} → ${r.baseUrl}`);
+              log(`[dsh] 控制台请求主动对齐：${r.from || '(空)'} → ${r.baseUrl}（来源 ${r.reason || 'scan'}）`);
             }
-            sendJson({ ok: true, changed: r.changed === true, baseUrl: r.baseUrl, from: r.from ?? null });
+            lastDshFollowAt = Date.now();
+
+            // ── 对齐完必须**真的**验一次，而不是把「写了配置」当成「连上了」 ──
+            // 旧实现的毛病：只把新值写进 cfg/config.json 就返回 ok，dshReady 仍然是
+            // 下一轮 5 秒轮询才会更新。于是面板点完按钮立刻读 /api/status，看到的
+            // 还是 dshReady=false，表现成「点了没反应」。这里同步跑一次 checkDsh()，
+            // 用真实的 RPC 结果回答调用方。
+            await checkDsh();
+
+            // ── 把正在退避等待的事件流**立刻**叫起来 ──────────────────────
+            // pumpMux 在「连上但 0 帧」时会指数退避（最长 30 秒）。端口刚对齐完，
+            // 那个退避窗口还在睡，于是「端口对了、事件流却还要再等半分钟」。
+            // 这里把等待打断，让它马上用新端口重连。
+            if (!wasReady || r.changed) wakeMuxPump();
+
+            sendJson({
+              ok: true,
+              changed: r.changed === true,
+              baseUrl: r.baseUrl,
+              from: r.from ?? null,
+              reason: r.reason ?? null,
+              dshReady,
+            });
           } catch (error) {
             sendJson({ ok: false, error: String(error?.message ?? error) }, 500);
           }
@@ -16094,7 +16256,12 @@ async function main() {
             + '（可在 DSH 里核对版本，或查看 issue #34）。已改为指数退避重连，不再每 3 秒刷屏。');
         }
       }
-      await sleep(retryMs);
+      // 用可打断的 sleep：端口对齐 / DSH 重新可用时会被 wakeMuxPump() 立刻叫醒，
+      // 不必再干等满退避窗口（最长 30 秒）。被叫醒说明「环境变了」，退避计数清零重来。
+      if (await sleepUnlessWoken(retryMs)) {
+        failureStreak = 0;
+        retryMs = 3000;
+      }
     }
   }
 

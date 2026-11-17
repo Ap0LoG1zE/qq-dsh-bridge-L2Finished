@@ -1,6 +1,6 @@
 {
   "name": "qq-dsh-panel",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "DSH Desktop 浮游球工具箱：可拖动的角落小球，面板里以开关形式管理功能。当前含两个功能——「思考链中文」（模型从源头用中文推理）与「QQ 大肥鱼」（把 DeepSeek 部署到 QQ 群：桥接状态、回复节奏、人格、长期记忆、群友印象、Token 用量、表情素材、访问控制、后端切换、连接诊断共 11 个页签）。",
   "type": "module",
   "main": "lib/index.js",

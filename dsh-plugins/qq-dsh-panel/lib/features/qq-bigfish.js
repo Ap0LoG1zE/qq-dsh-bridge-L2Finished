@@ -187,28 +187,92 @@ function writeLocalState(patch) {
  * 桌面端端口由 Electron 运行时分配（实测 62295，但不应假设固定），所以按
  * 「进程 → 它监听的回环端口」反查。仅 Windows 实现；其他平台返回空数组，
  * 工具箱会退化成"只显示当前配置"。
+ *
+ * ── 为什么必须认指纹，不能取「最小端口」 ─────────────────────────────────
+ * 旧实现挑的是 `Sort-Object LocalPort | Select-Object -First 1` —— 也就是
+ * **该进程监听的最小端口**。这个假设是错的：实测 DSH 主进程会同时监听好几个
+ * 回环端口（本机这一刻是 1873/1874/1875），而只有一个（1873）才是真正的 Web UI
+ * —— 另外两个是内部面，对 `/` 也回 401 但正文不同。挑中它们，桥接就拿到 401。
+ *
+ * 更麻烦的是「最小」这个规则本身：协助者机器上 DSH 最小监听端口 58116，
+ * 而真正的 Web UI 在 65235 —— 相差 7000 多，根本不连续。
+ *
+ * 所以判据必须与 bridge.js 的 probeDshPort **完全一致**（那是本项目里唯一
+ * 被实测验证过的识别逻辑）：
+ *   GET /        -> 401 且正文含 "dsh web authentication required"   <- Web UI
+ *   GET /api/*   -> 401 且正文是 "unauthorized"                        <- API 面
+ *   其它 401     -> 正文是 "missing or invalid Authorization bearer"   <- 内部 API 口
+ * 三种都可能回 401，所以**只能看正文**，不能只看状态码（4310 端口那个服务
+ * 对 `/` 直接回 200，按状态码判会把它误认成 DSH）。
  */
 let backendCache = { at: 0, list: [] }
+
+/** PowerShell 里的 DSH 指纹函数源码（与 bridge.js 的 probeDshPort 同一套正则）。 */
+const PS_DSH_FINGERPRINT = String.raw`
+function Test-DshFingerprint([int]$Port, [string]$Path) {
+  try {
+    $req = [System.Net.HttpWebRequest]::Create("http://127.0.0.1:$Port$Path")
+    $req.Method = 'GET'
+    $req.Timeout = 900
+    $req.ReadWriteTimeout = 900
+    $req.AllowAutoRedirect = $false
+    $resp = $req.GetResponse()
+    try { $resp.Close() } catch {}
+    return $false   # 200 说明是别的服务
+  } catch [System.Net.WebException] {
+    $r = $_.Exception.Response
+    if (-not $r) { return $false }
+    $code = [int]$r.StatusCode
+    if ($code -ne 401) { try { $r.Close() } catch {}; return $false }
+    try {
+      $sr = New-Object System.IO.StreamReader($r.GetResponseStream())
+      $body = $sr.ReadToEnd()
+      $sr.Close()
+    } catch { $body = '' }
+    try { $r.Close() } catch {}
+    if ($body.Length -gt 512) { $body = $body.Substring(0, 512) }
+    if ($body -match 'dsh web authentication required') { return $true }
+    if ($body -match '^\s*unauthorized\s*$') { return $true }
+    return $false
+  } catch { return $false }
+}
+function Get-DshPortOf([int]$ProcessId) {
+  $ports = @(Get-NetTCPConnection -State Listen -OwningProcess $ProcessId -ErrorAction SilentlyContinue |
+       Where-Object { $_.LocalAddress -eq '127.0.0.1' -or $_.LocalAddress -eq '::1' } |
+       ForEach-Object { [int]$_.LocalPort } | Sort-Object -Unique)
+  if ($ports.Count -eq 0) { return $null }
+  foreach ($p in $ports) {
+    if (Test-DshFingerprint -Port $p -Path '/') { return $p }
+  }
+  foreach ($p in $ports) {
+    if (Test-DshFingerprint -Port $p -Path '/api/status') { return $p }
+  }
+  # 一个都不像 DSH：不要静默返回一个错的值（那正是旧实现的坑）。
+  return $null
+}
+`
 
 async function discoverBackends() {
   if (process.platform !== 'win32') return []
   // 5 秒缓存。这个函数要 spawn PowerShell（首次约 1~3 秒）；早期版本用的是
   // execFileSync —— 那是**同步阻塞**，等待期间会把整个 host 半卡住，
   // 连带把别的页签（诊断）的请求一起拖住。改为异步 + 缓存后，
-  // 首次仍要等，之后 5 秒内直接命中缓存。
+  // 首次仍要等，之后缓存期内直接命中。
   const now = Date.now()
   if (now - backendCache.at < 30000) return backendCache.list
   const script = [
+    PS_DSH_FINGERPRINT,
     '$out = @()',
     "foreach ($p in (Get-CimInstance Win32_Process -Filter \"Name='DeepSeek Harness.exe'\" -ErrorAction SilentlyContinue)) {",
     "  if ($p.CommandLine -match '--type=') { continue }",
-    '  $c = Get-NetTCPConnection -State Listen -OwningProcess $p.ProcessId -ErrorAction SilentlyContinue | Where-Object { $_.LocalAddress -eq \'127.0.0.1\' } | Sort-Object LocalPort | Select-Object -First 1',
-    "  if ($c) { $out += [pscustomobject]@{ kind = 'desktop'; pid = $p.ProcessId; port = $c.LocalPort } }",
+    '  $port = Get-DshPortOf -ProcessId $p.ProcessId',
+    "  if ($port) { $out += [pscustomobject]@{ kind = 'desktop'; pid = $p.ProcessId; port = $port } }",
     '}',
     "foreach ($p in (Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" -ErrorAction SilentlyContinue)) {",
     "  if ($p.CommandLine -notmatch '@deepseek-ai[\\\\/]dsh[\\\\/]lib[\\\\/]bin\\.js') { continue }",
-    '  $c = Get-NetTCPConnection -State Listen -OwningProcess $p.ProcessId -ErrorAction SilentlyContinue | Where-Object { $_.LocalAddress -eq \'127.0.0.1\' } | Sort-Object LocalPort | Select-Object -First 1',
-    "  if ($c) { $out += [pscustomobject]@{ kind = 'cli'; pid = $p.ProcessId; port = $c.LocalPort } }",
+    "  if ($p.CommandLine -match 'mcp-') { continue }",
+    '  $port = Get-DshPortOf -ProcessId $p.ProcessId',
+    "  if ($port) { $out += [pscustomobject]@{ kind = 'cli'; pid = $p.ProcessId; port = $port } }",
     '}',
     '$out | ConvertTo-Json -Compress',
   ].join('\n')
@@ -403,6 +467,26 @@ async function handleStatus(req, res) {
       bridge: { dir: env.dir, port: env.port, running: false },
     })
   }
+
+  // ── 「面板一打开就自己连上」的那一步 ──────────────────────────────────────
+  //
+  // 走到这里说明桥接是活的；但「桥接活着」和「桥接连着**这个** DSH」是两件事。
+  // DSH 每次重启换端口，而桥接只在「自己探到连不上」时才重跟 —— 那要等它的
+  // 5 秒轮询 + 10 秒冷却。用户看到的就是「开了 DSH，面板要愣半天才活」。
+  //
+  // 所以我们在这里主动补一刀：带着**权威端口**（req.socket.localPort）促一次对齐。
+  // 代价很小：端口本来就对时，桥接那边一次指纹验证就返回 changed=false；
+  // 只在真的没连上（dshReady !== true）时才做，避免每次刷新都发请求。
+  let endpointSync = null
+  if (r.data?.dshReady !== true && wantAutostart) {
+    endpointSync = await alignDshEndpoint(env, req, { timeoutMs: 8000 }).catch(() => null)
+    if (endpointSync?.dshReady === true) {
+      // 对齐真的把它救活了：重读一次状态，让下面返回的字段都与实际一致
+      // （模式、SnowLuma、preset 都可能因为「刚连上 DSH」才第一次拿得到）。
+      const again = await bridgeApi(env, '/api/status', { timeoutMs: 10000 })
+      if (again.ok) r = again
+    }
+  }
   const s = r.data || {}
   const online = s.socialV2Paused !== true
   // 纯语音状态：和上线/下线一起返回，面板打开时不用再多打一次接口。
@@ -433,11 +517,16 @@ async function handleStatus(req, res) {
     allowPrivate: s.allowPrivate ?? [],
     allowGroups: s.allowGroups ?? [],
     snowluma: s.snowluma ?? null,
+    // 这轮有没有顺便做过端点对齐（null = 没做）。面板可以据此显示一行
+    // 「已把桥接对齐到 DSH 当前端口」，省得用户怀疑是不是又漂了。
+    endpointSync,
     bridge: {
       dir: env.dir,
       port: env.port,
       running: true,
-      baseUrl: env.cfg?.dsh?.baseUrl ?? '',
+      // 优先用「这轮对齐后的」地址：env.cfg 是请求进来时读的磁盘快照，
+      // 对齐可能刚刚把它改掉，直接回旧值会让人以为没生效。
+      baseUrl: endpointSync?.baseUrl || env.cfg?.dsh?.baseUrl || '',
       consoleUrl: env.base,
     },
     local: readLocalState(),
@@ -857,6 +946,55 @@ async function waitForPorts(ports, totalMs) {
   }
 }
 
+/**
+ * 从入站请求里取出「DSH 到底在哪个端口」。
+ *
+ * 为什么这个值是**权威**的：面板的 host 半跑在 DSH 进程里面，是 DSH 自己把这个
+ * HTTP 请求交给我们的 —— 于是 `req.socket.localPort` 就是 DSH 正在服务的端口，
+ * 不可能是别的进程。相比之下「扫一遍回环监听端口 + 猜哪个像 DSH」要慢得多，
+ * 而且撞上端口被别的服务占用时会猜错。
+ *
+ * 只接受回环来源：这是本机自检，不接受任何远端传进来的提示（否则就成了一个
+ * 「让桥接把 baseUrl 指到任意地址」的口子）。
+ */
+function dshPortHint(req) {
+  try {
+    const sock = req?.socket
+    if (!sock) return 0
+    const local = String(sock.localAddress || '')
+    if (local && !/^(127\.|::1$|::ffff:127\.)/.test(local)) return 0
+    const port = Number(sock.localPort) || 0
+    return Number.isInteger(port) && port > 0 && port <= 65535 ? port : 0
+  } catch {
+    return 0
+  }
+}
+
+/**
+ * 让桥接把 DSH 端点对齐到**本进程所在的端口**，并等到它真的连上。
+ *
+ * @returns {Promise<{synced:boolean, dshReady:boolean|null, baseUrl:string|null, error?:string}>}
+ */
+async function alignDshEndpoint(env, req, { timeoutMs = 20000 } = {}) {
+  const port = dshPortHint(req)
+  // 没拿到提示时仍然发请求（桥接会自己扫端口），只是没有那条快速路径。
+  const r = await bridgeApi(env, '/api/dsh/follow-endpoint', {
+    method: 'POST',
+    body: port ? { port } : {},
+    timeoutMs,
+  })
+  if (!r.ok) {
+    return { synced: false, dshReady: null, baseUrl: null, error: r.error || `HTTP ${r.status}` }
+  }
+  return {
+    synced: true,
+    dshReady: r.data?.dshReady === true,
+    baseUrl: r.data?.baseUrl ?? null,
+    changed: r.data?.changed === true,
+    reason: r.data?.reason ?? null,
+  }
+}
+
 /** POST 启动本机已安装的 SnowLuma。 */
 async function handleLaunchSnowluma(req, res) {
   const env = bridgeEnv()
@@ -869,55 +1007,70 @@ async function handleLaunchSnowluma(req, res) {
     })
   }
 
-  // 顺手对齐一次 DSH 端口。
+  // ── 先把 DSH 端点对齐，而且这次是**带权威端口**的 ─────────────────────────
   //
-  // 为什么放在这里：点「启动 SnowLuma」通常是**刚开机/刚重启 DSH 之后**的第一个动作，
-  // 而桌面版 DSH 每次启动换端口、桥接只在「探测到连不上」时才重新跟随（有 60 秒冷却）。
-  // 在这个时机主动促一次，能让桥接立刻跟上当前端口，不用等冷却。
+  // 点「启动 SnowLuma」几乎总是「刚开机 / 刚重启 DSH」之后的第一个动作，而桌面版
+  // DSH 每次启动都换端口。旧实现有两个毛病，都直接造成「点了要等很久才连上」：
   //
-  // 失败不影响 SnowLuma 启动：端口对齐是"顺带"，不是前置条件。
-  let endpointSync = null
-  try {
-    const r = await bridgeApi(env, '/api/dsh/follow-endpoint', { method: 'POST', body: {}, timeoutMs: 20000 })
-    if (r.ok) endpointSync = r.data ?? null
-  } catch { /* 老版本桥接没有这个端点时静默跳过 */ }
+  //   ① 只发 `{}`，让桥接自己去扫监听端口 —— 那条路要 netstat + 逐个验指纹，
+  //      而且只能猜。现在把 `req.socket.localPort` 一起发过去，桥接一次指纹验证
+  //      就能确定，不用扫。
+  //   ② 对齐之后**不确认**结果就继续往下走。现在拿到 dshReady 再决定怎么报。
+  //
+  // 对齐失败不影响 SnowLuma 启动：它俩是两条独立的链路。
+  const endpointSync = await alignDshEndpoint(env, req).catch((error) => ({
+    synced: false,
+    dshReady: null,
+    baseUrl: null,
+    error: String(error?.message ?? error),
+  }))
 
-  if (await probePort(3001)) {
-    return json(res, 200, { ok: true, already: true, message: 'SnowLuma 似乎已经在运行（3001 已在监听）', endpointSync })
-  }
+  // ── SnowLuma 已在运行时**不能**直接 return ────────────────────────────────
+  //
+  // 旧实现是 `if (probePort(3001)) return already`。这是个真实的坑：
+  // SnowLuma 常常常驻不关，而 DSH 重启后桥接还在连旧端口 —— 于是点「启动 SnowLuma」
+  // 得到的回答是「似乎已经在运行」，可实际上**桥接根本没连上**，面板一片空白。
+  // 现在「已经在运行」只是一个分支标记，后面照样等到真正连上（或超时）再返回。
+  const alreadyRunning = await probePort(3001)
 
-  const homeDir = String(env.cfg?.snowluma?.homeDir || '').trim()
-  let launcher = String(env.cfg?.snowluma?.launcherPath || '').trim()
-  if (!launcher && homeDir) launcher = path.join(homeDir, 'launcher.bat')
-  if (!launcher || !fs.existsSync(launcher)) {
-    return json(res, 200, {
-      ok: false,
-      error: `找不到 SnowLuma 启动器：${launcher || '(未配置)'}。请在 config.json 里设置 snowluma.launcherPath 或 snowluma.homeDir。`,
-    })
-  }
+  let launched = false
+  let launcher = ''
+  if (!alreadyRunning) {
+    const homeDir = String(env.cfg?.snowluma?.homeDir || '').trim()
+    launcher = String(env.cfg?.snowluma?.launcherPath || '').trim()
+    if (!launcher && homeDir) launcher = path.join(homeDir, 'launcher.bat')
+    if (!launcher || !fs.existsSync(launcher)) {
+      return json(res, 200, {
+        ok: false,
+        error: `找不到 SnowLuma 启动器：${launcher || '(未配置)'}。请在 config.json 里设置 snowluma.launcherPath 或 snowluma.homeDir。`,
+        endpointSync,
+      })
+    }
 
-  try {
-    // detached + unref：SnowLuma 必须独立于 DSH 的生命周期，否则 DSH 一重启就把它带走。
-    // stdio:'ignore'：它的输出很多，捕获会撑满管道缓冲把进程卡死（同类坑踩过一次）。
-    // cwd 设为安装目录：launcher.bat 里用的是相对路径（node ./index.mjs）。
-    //
-    // ⚠️ 这里**故意保持** `cmd /c start "" launcher.bat`（2026-11-09 试过改掉，回滚了）。
-    //    试过"绕开 bat 直接 spawn node.exe + windowsHide:true"想消除 CMD 窗口，
-    //    实测结果更糟：点一次按钮会连弹 3 个窗口，最后只剩一个空的黑窗口。
-    //    原因没完全查清（怀疑与 SnowLuma 自己的子进程/重启逻辑、以及
-    //    detached+windowsHide 在 cmd start 场景下的行为叠加有关），
-    //    但结论明确：**不要动这里**。原写法至少是"能跑、只多一个 CMD"。
-    //    想要无窗口，正确的做法是改 SnowLuma 自己的启动方式或做个无窗口的包装，
-    //    而不是从桥接侧塞 spawn 参数 —— 那只是把窗口从"一个"变成"三个"。
-    const child = spawn('cmd.exe', ['/c', 'start', '', launcher], {
-      cwd: path.dirname(launcher),
-      detached: true,
-      stdio: 'ignore',
-      windowsHide: false,
-    })
-    child.unref()
-  } catch (error) {
-    return json(res, 500, { ok: false, error: `启动失败：${String(error?.message ?? error)}` })
+    try {
+      // detached + unref：SnowLuma 必须独立于 DSH 的生命周期，否则 DSH 一重启就把它带走。
+      // stdio:'ignore'：它的输出很多，捕获会撑满管道缓冲把进程卡死（同类坑踩过一次）。
+      // cwd 设为安装目录：launcher.bat 里用的是相对路径（node ./index.mjs）。
+      //
+      // ⚠️ 这里**故意保持** `cmd /c start "" launcher.bat`（2026-11-09 试过改掉，回滚了）。
+      //    试过"绕开 bat 直接 spawn node.exe + windowsHide:true"想消除 CMD 窗口，
+      //    实测结果更糟：点一次按钮会连弹 3 个窗口，最后只剩一个空的黑窗口。
+      //    原因没完全查清（怀疑与 SnowLuma 自己的子进程/重启逻辑、以及
+      //    detached+windowsHide 在 cmd start 场景下的行为叠加有关），
+      //    但结论明确：**不要动这里**。原写法至少是"能跑、只多一个 CMD"。
+      //    想要无窗口，正确的做法是改 SnowLuma 自己的启动方式或做个无窗口的包装，
+      //    而不是从桥接侧塞 spawn 参数 —— 那只是把窗口从"一个"变成"三个"。
+      const child = spawn('cmd.exe', ['/c', 'start', '', launcher], {
+        cwd: path.dirname(launcher),
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: false,
+      })
+      child.unref()
+      launched = true
+    } catch (error) {
+      return json(res, 500, { ok: false, error: `启动失败：${String(error?.message ?? error)}`, endpointSync })
+    }
   }
 
   const ready = await waitForPorts([3000, 3001], 45000)
@@ -925,27 +1078,47 @@ async function handleLaunchSnowluma(req, res) {
   // 端口就绪 ≠ 桥接已连上：桥接对 SnowLuma 用的是**指数退避**重连，
   // 反复失败后实测间隔可达 30 秒。所以这里继续轮询桥接状态，
   // 等到真正 connected 再返回 —— 否则用户会以为「启动了但没反应」。
+  //
+  // 「已经在运行」时也必须走这里：那种情况下真正缺的是「桥接连上它」，
+  // 而不是「把它拉起来」。
   let connected = false
+  let dshReady = endpointSync?.dshReady ?? null
   if (ready) {
     const deadline = Date.now() + 45000
     while (Date.now() < deadline) {
       const st = await bridgeApi(env, '/api/status', { timeoutMs: 8000 })
-      if (st.ok && st.data?.snowluma?.connected === true) { connected = true; break }
-      await new Promise((r) => setTimeout(r, 2500))
+      if (st.ok) {
+        if (dshReady === null) dshReady = st.data?.dshReady === true
+        if (st.data?.snowluma?.connected === true) { connected = true; break }
+      }
+      await new Promise((r) => setTimeout(r, 1500))
     }
+  }
+
+  // 收尾时再对一次 DSH 端点：SnowLuma 起来这段时间里 DSH 可能又换端口了
+  // （用户可能刚重启过它）。这一步很轻 —— 端口没变时桥接直接返回 changed:false。
+  let finalSync = endpointSync
+  if (!(endpointSync?.dshReady === true)) {
+    finalSync = await alignDshEndpoint(env, req, { timeoutMs: 15000 }).catch(() => endpointSync)
+    if (finalSync?.dshReady === true) dshReady = true
   }
 
   return json(res, 200, {
     ok: true,
-    launched: true,
+    already: alreadyRunning,
+    launched,
     ready,
     connected,
-    launcher,
+    dshReady,
+    launcher: launcher || null,
+    endpointSync: finalSync,
     message: !ready
-      ? '进程已启动，但 45 秒内没等到 3000/3001 监听。可能需要在 WebUI 里扫码登录，或它启动得比较慢 —— 点「打开 WebUI」看看。'
+      ? 'SnowLuma 进程已启动，但 45 秒内没等到 3000/3001 监听。可能需要在 WebUI 里扫码登录，或它启动得比较慢 —— 点「打开 WebUI」看看。'
       : connected
-        ? 'SnowLuma 已启动，桥接也已连上。'
-        : 'SnowLuma 已启动（端口在监听），但桥接还没连上 —— 它用的指数退避可能要再等一会儿，稍后刷新本页即可。',
+        ? (dshReady === false
+          ? 'SnowLuma 已启动、桥接也已连上，但桥接还没连上 DSH —— 看一下「诊断」页。'
+          : 'SnowLuma 已启动，桥接也已连上 DSH 与 SnowLuma。')
+        : 'SnowLuma 在监听，但桥接还没连上 —— 它用的指数退避可能要再等一会儿，稍后刷新本页即可。',
   })
 }
 
@@ -1100,10 +1273,17 @@ async function handleBackend(req, res) {
   if ((req.method || 'GET') === 'GET') {
     const backends = await discoverBackends()
     const currentUrl = String(env.cfg?.dsh?.baseUrl || '').replace(/\/+$/, '')
+    // 本进程所在的端口就是「真正的 DSH」——把它标出来，用户一眼就能对上。
+    const selfPort = dshPortHint(req)
     return json(res, 200, {
       ok: true,
       current: currentUrl,
-      backends: backends.map((b) => ({ ...b, current: b.url === currentUrl })),
+      backends: backends.map((b) => ({
+        ...b,
+        current: b.url === currentUrl,
+        self: selfPort > 0 && b.port === selfPort,
+      })),
+      selfPort: selfPort || null,
       supported: process.platform === 'win32',
     })
   }
@@ -1144,16 +1324,75 @@ async function handleBackend(req, res) {
   })
 }
 
-/** GET 连接诊断：一次把排查要看的都拿齐。 */
+/**
+ * GET 连接诊断：一次把排查要看的都拿齐。
+ *
+ * ── 为什么以前「诊断加载不出来」 ──────────────────────────────────────────
+ * 旧实现有三处会把这一页拖死：
+ *
+ *   ① **桥接没起时不做任何事**。三个 `bridgeApi` 并发打向一个没人监听的端口，
+ *      各自等到超时才回；而它和「状态」页不同 —— 不会去 `ensureBridgeRunning`。
+ *      于是用户点「诊断」看到的是一个转圈的空白页，而不是「桥接没在跑」。
+ *   ② **不对齐 DSH 端点**。刚重启 DSH 之后，桥接还连着旧端口，`/api/presets`、
+ *      `/api/dsh/model` 这两条要走 DSH 的 RPC 就得等它自己超时（20 秒起）。
+ *      诊断页恰恰是「最需要立刻给结论」的那一页，却最慢。
+ *   ③ 每条都是 20 秒超时，三条并发，所以最坏情况整页要挂 20 秒。
+ *
+ * 现在的做法：
+ *   · 先确保桥接在跑（和状态页同一套 `ensureBridgeRunning`）；
+ *   · 再**带端口提示**对齐一次 DSH 端点 —— 这是面板跑在 DSH 进程里才有的权威信息，
+ *     一次请求就让桥接连到正确端口，后面的 RPC 才有意义；
+ *   · 主状态用正常超时，两条「锦上添花」的探测用**短超时**（拿不到就明说拿不到，
+ *     不让它们拖累整页）；
+ *   · 无论成败都回一份结构化的结论，面板永远能渲染出内容。
+ */
 async function handleDiagnose(req, res) {
   const env = bridgeEnv()
   if (!env.ok) return json(res, 200, { ok: false, error: env.error })
 
+  const t0 = Date.now()
+
+  // ① 桥接没跑就拉起来（与「状态」页同一套逻辑：只启动已存在的 start.bat）。
+  //    诊断页尤其需要这一步 —— 它本来就是为了排查「为什么连不上」而存在的。
+  let broughtUp = null
+  if (!(await probePort(env.port, 1000))) {
+    broughtUp = await ensureBridgeRunning(env, { startIfDown: true, waitMs: 15000 })
+  }
+
+  // ② 带权威端口提示对齐 DSH 端点。
+  //    失败不致命：后面的 status 会如实反映「连不上」，那本身就是诊断结论。
+  const endpointSync = await alignDshEndpoint(env, req, { timeoutMs: 12000 }).catch((error) => ({
+    synced: false, dshReady: null, baseUrl: null, error: String(error?.message ?? error),
+  }))
+
+  // ③ 主状态正常超时；另外两条短超时 —— 它们只是「补充信息」，
+  //    桥接连不上 DSH 时本来也拿不到，没必要陪着等满 20 秒。
   const [status, presets, model] = await Promise.all([
-    bridgeApi(env, '/api/status'),
-    bridgeApi(env, '/api/presets'),
-    bridgeApi(env, '/api/dsh/model'),
+    bridgeApi(env, '/api/status', { timeoutMs: 12000 }),
+    bridgeApi(env, '/api/presets', { timeoutMs: 5000 }),
+    bridgeApi(env, '/api/dsh/model', { timeoutMs: 5000 }),
   ])
+
+  if (!status.ok) {
+    // 桥接控制台都够不着：直接给出**可行动**的结论，而不是一句「读不到数据」。
+    return json(res, 200, {
+      ok: false,
+      error: status.error || `桥接控制台返回 HTTP ${status.status}`,
+      autostart: broughtUp,
+      elapsedMs: Date.now() - t0,
+      checks: [
+        {
+          name: '桥接控制台可达',
+          ok: false,
+          detail: `连不上 ${env.base}。${broughtUp?.started
+            ? '已执行 start.bat，但端口仍没起来 —— 看 state/bridge.log 前几行。'
+            : (broughtUp?.error || '桥接没在运行，且自动启动没有成功。')}`,
+        },
+      ],
+      bridge: { dir: env.dir, port: env.port, baseUrl: env.cfg?.dsh?.baseUrl ?? '' },
+    })
+  }
+
   const s = (status.data || {})
   const presetIds = (presets.data && Array.isArray(presets.data.presets)) ? presets.data.presets.map((p) => p.id) : []
   // 取「配置里实际在用的 preset」，再判断它在不在 DSH 的清单里。
@@ -1170,7 +1409,11 @@ async function handleDiagnose(req, res) {
     ? presetIds.includes(wanted)
     : presetIds.some((id) => /^qq-chat/i.test(String(id)))
   const wantedDetail = (() => {
-    if (!presetIds.length) return 'DSH 还没连上，拿不到清单'
+    if (!presets.ok && !presetIds.length) {
+      return presets.error
+        ? `拿不到 preset 清单（${presets.error}）—— 多半是桥接还没连上 DSH`
+        : 'DSH 还没连上，拿不到清单'
+    }
     if (!wanted) return `桥接没回传当前 preset；DSH 现有 ${presetIds.length} 个`
     return presetIds.includes(wanted)
       ? '已装'
@@ -1178,7 +1421,14 @@ async function handleDiagnose(req, res) {
   })()
   const checks = [
     { name: '桥接控制台可达', ok: status.ok, detail: status.ok ? env.base : (status.error || `HTTP ${status.status}`) },
-    { name: 'DSH 已就绪', ok: s.dshReady === true, detail: s.dshReady === true ? `模式 ${s.mode}` : '桥接连不上 DSH（看 state/bridge.log）' },
+    {
+      name: 'DSH 已就绪',
+      ok: s.dshReady === true,
+      detail: s.dshReady === true
+        ? `模式 ${s.mode}`
+        : `桥接连不上 DSH（当前 baseUrl ${endpointSync?.baseUrl || env.cfg?.dsh?.baseUrl || '(未知)'}）`
+          + `${endpointSync?.synced === false ? `；端点对齐也失败了：${endpointSync.error}` : ''}`,
+    },
     { name: 'SnowLuma 已连接', ok: s.snowluma?.connected === true, detail: s.snowluma?.connected ? `账号在线=${s.snowluma.accountOnline}` : 'WebSocket 未连接' },
     { name: 'SnowLuma 上游健康', ok: s.snowluma?.good === true, detail: s.snowluma?.good ? `来源 ${s.snowluma.goodSource || 'heartbeat'}` : (s.snowluma?.hint || '收不到 QQ 数据（注入退化）') },
     { name: wanted ? `preset「${wanted}」已装` : 'QQ preset 已装', ok: wantedOk, detail: wantedDetail },
@@ -1188,6 +1438,10 @@ async function handleDiagnose(req, res) {
     ok: checks.every((c) => c.ok),
     checks,
     model: model.ok ? model.data : null,
+    elapsedMs: Date.now() - t0,
+    // 对齐的结论一并回给面板：端口漂移是这类故障最常见的原因，
+    // 直接显示「这次对齐做了什么」比让人去翻日志快得多。
+    endpointSync,
     bridge: { dir: env.dir, port: env.port, baseUrl: env.cfg?.dsh?.baseUrl ?? '' },
   })
 }
