@@ -1103,7 +1103,19 @@ server.tool(
         headers: { 'x-agent-token': token },
         timeoutMs: Math.min(725000, (Number(timeoutMs) || 30000) + Math.max(Number(quietMs) || 0, 10000) + 20000)
       });
-      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      // ── 2026-11-17：只回 text，不再把整个 JSON 丢给模型 ────────────────────
+      //
+      // 原来 `serializeModelData(data)` 返回：
+      //   {"ok":true,"key":"private:3380569062","arrived":false,"newMessages":[],
+      //    "readThroughSeq":173,"unreadCount":3,"text":"【没等到新消息】，读到 #173\n对方大概说完了，可以回。"}
+      // 148 字符里 text 只占 40，其余 108 是纯噪音（ok 恒定 true、key/token 是她
+      // 自己传的、newMessages 内容已经写在 text 里了）。
+      //
+      // 现在：有 text 就直接给 text；只有老版本桥接（不返回 text）才退回 JSON。
+      const body = typeof data?.text === 'string' && data.text.trim()
+        ? data.text
+        : serializeModelData(data);
+      return { content: [{ type: 'text', text: body }] };
     } catch (error) {
       return { content: [{ type: 'text', text: `等待失败：${error?.message ?? error}` }], isError: true };
     }
