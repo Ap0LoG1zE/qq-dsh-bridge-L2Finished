@@ -77,6 +77,9 @@ const tests = [
   // 既不算"观望期间新到"、也不会被带回去。修法是发送前拍快照当基线，
   // 并且 observeBeforeSleepV2 不能自己再拍一份把它覆盖掉。
   'test-send-observe-gap.mjs',
+  // 观望语义的连续性（2026-11-17 操作者定）：总预算=发送耗时+20秒，
+  // 来消息就重置 10 秒安静窗，无额外上限。
+  'test-observe-continuous.mjs',
   // 令牌账本 / 价目表 与 体检修复回归（纯函数，无外部依赖）
   'test-token-usage.mjs', 'test-hardening.mjs',
   // 语音发送（纯函数 + 端点存在性；真发语音只在 --live 或 CLI 里做）

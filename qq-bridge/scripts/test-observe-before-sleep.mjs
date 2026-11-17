@@ -187,22 +187,22 @@ await test('安静窗内连发两条：合并成一次贴回，且计时器被�
 // 数组间隔由 sendMessagesV2 真的 sleep 掉（见那边的 sendChain.then(sleep)），
 // 所以 paceAfterSendV2 只需要补那 20 秒。
 // 这条用例确认：3 条数组时，总耗时 ≈ 间隔之和 + observeAfterSendMs，而不是只有 20 秒。
-await test('多条数组：数组间隔真实流逝 + 再额外等满 observeAfterSendMs', async () => {
-  await withBridge(async ({ request }) => {
-    const t0 = Date.now();
-    // 用 fixed 模式把间隔钉死成已知值，便于断言。
-    const r = await request('send-message', {
-      body: { messages: ['一', '二', '三'], gapMode: 'fixed', gapMs: 300 }
+await test('多条数组：发送耗时算进总预算，不是发完再等满', async () => {
+    await withBridge(async ({ request }) => {
+      const t0 = Date.now();
+      const r = await request('send-message', { body: { messages: ['一', '二', '三'], gapMode: 'fixed', gapMs: 300 } });
+      const elapsed = Date.now() - t0;
+      assert.equal(r.status, 200, `实际：${JSON.stringify(r.data)}`);
+      // 2026-11-17 操作者改了口径：「总预算 = 发送那几秒 + 20 秒」——
+      // 发送耗时**包含在**预算里，不是"发完再额外等满"。
+      const sendCost = 300 * 2;                    // 2 个间隔
+      const naiveSum = sendCost + SEND_OBSERVE_MS; // 旧语义下的总耗时
+      assert.ok(elapsed < naiveSum - 100,
+        `总耗时 ${elapsed}ms 接近"发完再等满"(${naiveSum}ms)，说明发送耗时没被算进预算`);
+      assert.ok(elapsed >= SEND_OBSERVE_MS - 150,
+        `总耗时 ${elapsed}ms 太短，预算 ${SEND_OBSERVE_MS}ms 没生效`);
     });
-    const elapsed = Date.now() - t0;
-    assert.equal(r.status, 200, `实际：${JSON.stringify(r.data)}`);
-    // 2 个间隔 × 300ms = 600ms 左右的数组内等待，再加 observeAfterSendMs(600)。
-    // 给足容差：断言"至少等于两者之和"，而不是只等于 600。
-    const expectedMin = 300 * 2 + SEND_OBSERVE_MS;
-    assert.ok(elapsed >= expectedMin,
-      `总耗时应 ≥ Σ间隔(${300 * 2}ms) + 空转(${SEND_OBSERVE_MS}ms) = ${expectedMin}ms，实际 ${elapsed}ms`);
   });
-});
 
 await test('单条消息：没有数组间隔，只等 observeAfterSendMs', async () => {
   await withBridge(async ({ request }) => {

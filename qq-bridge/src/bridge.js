@@ -6117,6 +6117,7 @@ async function main() {
             // 那几秒里对方说的话会进 unread，若等到 paceAfterSendV2 才拍快照
             // 就会被当成"已有未读"而漏掉。详见 snapshotUnreadBeforeSendV2 的注释。
             const preSendSnapshot = snapshotUnreadBeforeSendV2(st);
+            const sendStartedAt = Date.now();   // 总预算从这里开始算（含逐条发送耗时）
             const sentMessages = await sendMessagesV2(key, messages, delays);
             recordSentMessagesV2(key, sentMessages, sentMessages?.ids);
             st.lastAiReplyAt = now;
@@ -6130,7 +6131,7 @@ async function main() {
             let postSendObserve = null;
             if (sentMessages.length > 0) {
               // 用发送前的快照当基线：覆盖"逐条发送那几秒"的盲区。
-              postSendObserve = await paceAfterSendV2(st, key, Date.now(), { snapshotBeforeSend: preSendSnapshot });
+              postSendObserve = await paceAfterSendV2(st, key, Date.now(), { snapshotBeforeSend: preSendSnapshot, sendStartedAt });
             }
             log(`[reserved2] 工具分条发送 ${key}: 成功 ${sentMessages.length}/${messages.length} 条`);
             appendActivity(`${key} [reserved2] 工具分条发送：成功 ${sentMessages.length}/${messages.length} 条`);
@@ -6283,6 +6284,7 @@ async function main() {
             // 2026-11-17：发送前拍快照，覆盖逐条发送期间的盲区
             //（3 条数组要按 1~3 秒间隔逐条发，那 5~10 秒里对方的消息会漏）。
             const preSendSnapshot = snapshotUnreadBeforeSendV2(st);
+            const sendStartedAt = Date.now();   // 总预算从这里开始算（含逐条发送耗时）
             const sentMessages = await sendMessagesV2(key, messages, delays, actualReplyToMessageId, atUserId);
             recordSentMessagesV2(key, sentMessages, sentMessages?.ids);
             st.lastAiReplyAt = now;
@@ -6296,7 +6298,7 @@ async function main() {
             let postSendObserve = null;
             if (sentMessages.length > 0) {
               // 用发送前的快照当基线：覆盖"逐条发送那几秒"的盲区。
-              postSendObserve = await paceAfterSendV2(st, key, Date.now(), { snapshotBeforeSend: preSendSnapshot });
+              postSendObserve = await paceAfterSendV2(st, key, Date.now(), { snapshotBeforeSend: preSendSnapshot, sendStartedAt });
             }
             log(`[reserved2] 工具统一发送 ${key}: 成功 ${sentMessages.length}/${messages.length} 条`);
             appendActivity(`${key} [reserved2] 工具统一发送：成功 ${sentMessages.length}/${messages.length} 条`);
@@ -8866,6 +8868,7 @@ async function main() {
             noteSendCallV2(st, now);  // 节流按"调用"记账，不按条数
             if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
             const preSendSnapshot = snapshotUnreadBeforeSendV2(st);
+            const sendStartedAt = Date.now();   // 总预算从这里开始算（含逐条发送耗时）
             const sentMessages = await sendMessagesV2(key, [message], [], actualReplyToMessageId, atUserId);
             recordSentMessagesV2(key, sentMessages, sentMessages?.ids);
             st.lastAiReplyAt = now;
@@ -8882,7 +8885,7 @@ async function main() {
             // 同样用发送前的快照。
             let postSendObserve = null;
             if (sentMessages.length > 0) {
-              postSendObserve = await paceAfterSendV2(st, key, Date.now(), { snapshotBeforeSend: preSendSnapshot });
+              postSendObserve = await paceAfterSendV2(st, key, Date.now(), { snapshotBeforeSend: preSendSnapshot, sendStartedAt });
             }
             log(`[send] ${url.pathname} ${key}: 成功 ${sentMessages.length}/1 条`);
             appendActivity(`${key} [send] 成功 ${sentMessages.length}/1 条：${message.slice(0, 80)}`);
@@ -10076,28 +10079,42 @@ async function main() {
 
   async function paceAfterSendV2(st, key, now = Date.now(), opts = {}) {
     if (!st) return { arrived: false, waitedMs: 0, text: '', count: 0 };
-    const observeMs = Math.max(0, Number(cfg.socialV2?.send?.observeAfterSendMs ?? 30000));
-    // ── 2026-11-15 操作者定义的语义 ─────────────────────────────────────
+    const observeMs = Math.max(0, Number(cfg.socialV2?.send?.observeAfterSendMs ?? 20000));
+    // ── 2026-11-17 操作者定义的语义（第三次修订，这是最终口径）─────────────
     //
-    // 「她调用 qq_send_message 后，空转的时间 = 每条数组之间的随机间隔之和 + 20 秒」
+    // 「总预算 = 发送那几秒 + 20 秒；期间我发了消息就重置为 10 秒倒计时；
+    //   没有最长，直到 10 秒安静结束才贴给她」
     //
-    // 关键事实：数组间隔**已经真实流逝了** —— sendMessagesV2 里的
-    // `sendChain.then(() => sleep(d))` 是硬等（见那边的实现），
-    // 所以走到这里时那 1~3 秒 × (N-1) 的间隔已经过去。
+    // 三个要点，缺一个就不对：
     //
-    // 因此这里只需要补「20 秒」这一截，**不需要**再加间隔时间，
-    // 也不该像旧实现那样拿 minSendIntervalMs 去抵减（那是"两次调用之间的节流"，
-    // 和操作者要的"发完等对方接话"是两件事）。
+    // ① **20 秒是总预算，不是"发完再等 20 秒"**
+    //    发送本身（多条数组逐条发，1~3 秒/条）是 20 秒预算的一部分，
+    //    所以这里要把「已经花掉的发送时间」扣掉，而不是从 0 重新计 20 秒。
+    //    调用方通过 opts.sendStartedAt 传发送开始的时刻。
     //
-    // 连发 N 条时总等待自然变成 `Σ间隔 + 20s`：
-    //   1 条 → 0 + 20 = 20s
-    //   3 条 → 约 2~6 + 20 = 22~26s
-    //   5 条 → 约 4~12 + 20 = 24~32s
-    // 这正是操作者要的形状（条数越多，整体等得越久，因为前面已经花掉了间隔）。
+    // ② **来消息就重置 10 秒安静计时**，直到 10 秒内没有新消息才返回。
+    //    这个由 observeBeforeSleepV2 的 quietMs 实现（它每见到新 seq 就重置 lastNewAt）。
+    //
+    // ③ **没有额外硬上限**。
+    //    旧实现有一个 `min(20000)` 的硬顶，会把 waitMs+quietMs 压到 20 秒，
+    //    于是"来消息后还能再等 10 秒"这个承诺根本无法兑现。
+    //    现在硬上限 = budget + quietMs（只是兜底，防止 quietMs 被配成 0 时死循环），
+    //    真正的结束条件是安静窗满足。
+    //
+    // 传下去时把预算换算成"从此刻起还剩多少"，因为 observeBeforeSleepV2 的
+    // budget 是从它自己开始计时的。
     const waitMs = observeMs;
-    st.lastSendCallAt = now + waitMs;
+    const sendStartedAt = Number.isFinite(Number(opts.sendStartedAt))
+      ? Number(opts.sendStartedAt)
+      : now;
+    const alreadySpent = Math.max(0, now - sendStartedAt);
+    const remainingBudget = Math.max(0, waitMs - alreadySpent);
+    st.lastSendCallAt = now + remainingBudget;
     try { saveSocialV2State(); } catch { /* ignore */ }
     if (waitMs <= 0) return { arrived: false, waitedMs: 0, text: '', count: 0 };
+    if (alreadySpent > 0) {
+      log(`[pace] ${key} 发送已花 ${alreadySpent}ms，总预算 ${waitMs}ms，剩余 ${remainingBudget}ms`);
+    }
     // ── 观察期间等新消息（2026-11-14）────────────────────────────────────
     // 与 qq_mark_read 的观望同款：期间来了新消息就提前结束，把那几条贴回去，
     // 让她在同一个回合里接着回 —— 省掉一次完整唤醒（约 5~9 万 token 的重发）。
@@ -10127,30 +10144,23 @@ async function main() {
     if (opts.snapshotBeforeSend instanceof Set) {
       log(`[pace] ${key} 使用发送前快照（覆盖逐条发送期间的盲区）基线=${seenAtStart.size} 条`);
     }
-    log(`[pace] ${key} 开始观望 waitMs=${waitMs} 已有未读=${seenAtStart.size}`);
-    // ⚠️ 2026-11-14：这里也改成「安静窗」语义，与 mark_read 完全一致。
-    // 原来的 waitMs 只当总预算用，而且见第一条消息就返回 —— 她刚说完话、对方
-    // 连发两句时，第一句就被单独贴回去，第二句又得等下一次唤醒，正是操作者
-    // 要避免的"碎着给"。
-    //
-    // 参数：waitMs 仍是"没人说话时的干等时长"（= 节流间隔），
-    //       安静窗取 socialV2.send.observeQuietMs（默认 5s，与收尾观望同口径），
-    //       硬上限要**额外**加在 waitMs 之上 —— 不能沿用收尾那边的 20s 绝对值，
-    //       因为这里的节流等待本身就可能接近 10s。
+    log(`[pace] ${key} 开始观望 remainingBudget=${remainingBudget} 已有未读=${seenAtStart.size}`);
+    // 安静窗：每见到一条新消息就重置，直到 quietMs 内没有新动静才返回。
     const quietMs = Math.max(0, Number(cfg.socialV2?.send?.observeQuietMs ?? 10000));
-    // 硬上限（2026-11-15 重算）：waitMs 已经是 20 秒（minSendIntervalMs），
-    // 再叠加一个安静窗就会到 25~30 秒，逼近/超过传输层能容忍的范围。
+    // 硬上限（2026-11-17 修订）：**不再是固定 20 秒**。
     //
-    // 现在的口径：**总时长封顶在 waitMs + 一个安静窗**，且再兜一个绝对上限。
-    //   · 没人说话 ⇒ 等满 waitMs（20s）就返回，这是"发送后空转"的本体；
-    //   · 有人说话 ⇒ 最多再多等一个 quietMs（把连发的几条合并），然后无论
-    //     安静窗满没满都返回 —— 消息已经带上了，没必要求"满"。
+    // 旧实现写 `hardCapMs = min(20000, waitMs + quietMs)`，而 waitMs 是 30 秒
+    // ⇒ 被压到 20 秒 ⇒ "来消息后还能再等 10 秒"这个承诺根本兑现不了：
+    // 20 秒一到就返回，哪怕对方刚说完话、安静窗还剩 8 秒。
     //
-    // 为什么不一味抬高：这个 HTTP 请求一挂，她那个回合就卡着，
-    // 而 MCP 侧 agentApi 虽然是 300s、DSH 侧 toolCallTimeoutMs 是 725s，
-    // 但真正体感差的是「等 30 秒才回」本身。20+5=25 秒已经是能接受的上界。
-    const hardCapMs = waitMs + quietMs;
-    // ⚠️ 2026-11-15：观望期间**必须**压住唤醒调度，否则这 20 秒里消息一到
+    // 操作者要的是「来消息就重置 10 秒，无最长，直到 10 秒安静结束」。
+    // 所以硬上限只用于**兜底**（万一 quietMs 被配成 0 或极小，防止几乎立刻返回）：
+    // 给足 remainingBudget + 两个安静窗的余量，让它能在"对方一直在聊"时
+    // 撑过几轮重置，但不会无限挂着。
+    //
+    // 真正的结束条件是安静窗满足（observeBeforeSleepV2 里的 lastNewAt 判断）。
+    const hardCapMs = remainingBudget + quietMs * 2;
+    // ⚠️ 2026-11-15：观望期间**必须**压住唤醒调度，否则这段时间里消息一到
     // scheduleWakeV2 就会排一个 batchWindowMs 的唤醒，在她还在等的时候就
     // 准备下一个回合 —— 那批消息会被处理两遍（观望贴一次、唤醒再处理一次）。
     // 这个 Set 以前只有收尾观望在用，收尾观望删掉后就成了死代码，现在补到这里。
@@ -10158,7 +10168,11 @@ async function main() {
     observingKeys.add(observeStamp);
     let ob;
     try {
-      ob = await observeBeforeSleepV2(st, key, waitMs, { quietMs, hardCapMs, seenAtStart });
+      // ⚠️ 传 remainingBudget 而不是 waitMs：总预算要从"发送开始"算起，
+      // 发送本身花掉的时间已经流逝了，剩下的才是这里能等的。
+      //（2026-11-17 修：原先传 waitMs 原值，等于把预算重新计满，
+      //  于是"发送几秒 + 20 秒"变成了"发送几秒 + 30 秒"。）
+      ob = await observeBeforeSleepV2(st, key, remainingBudget, { quietMs, hardCapMs, seenAtStart });
     } finally {
       observingKeys.delete(observeStamp);
     }
@@ -13428,14 +13442,21 @@ async function main() {
    * 否则工具会先被 AbortSignal 掐断，模型看到的是「超时」而不是消息。
    */
   function observeBeforeSleepV2(st, key, waitMs = 10000, opts = {}) {
-    // waitMs 仍然兼容旧调用（= 总预算）。安静窗默认取 waitMs，由调用方覆盖成配置值。
+    // waitMs = 总预算；quietMs = 安静窗（无新消息多久算"安静"）。
     const budget = Math.max(0, Math.min(120000, Number(waitMs) || 0));
     const quietMs = Math.max(0, Math.min(120000,
       opts.quietMs === undefined ? budget : Number(opts.quietMs) || 0));
-    // 硬上限：默认比 budget 多留出一个安静窗的余量（允许"来消息→再等一轮"），
-    // 但绝不超过 20 秒 —— MCP 那边是 25 秒超时，必须留出网络与序列化余量。
-    const hardCapMs = Math.max(budget, Math.min(20000,
-      opts.hardCapMs === undefined ? budget + quietMs : Number(opts.hardCapMs) || 0));
+    // 硬上限（2026-11-17 修订）：**不再硬编码 20 秒**。
+    //
+    // 旧写法定死 `min(20000, ...)`，于是无论调用方给多少预算都会被压到 20 秒。
+    // paceAfterSendV2 传 30秒+10秒 时，就变成了 20 秒截断 ——
+    // "来消息后还能再等 10 秒"根本做不到（20 秒一到就返回）。
+    //
+    // 现在的口径：硬上限只是**兜底**，不是主约束。
+    // 主结束条件是安静窗满足；预算用完且没来消息也会返回（见下面 ① 分支）。
+    // 默认给 budget + 两个安静窗的余量，允许"对方一直在聊"时重置几轮。
+    const hardCapMs = Math.max(budget, Math.min(120000,
+      opts.hardCapMs === undefined ? budget + quietMs * 2 : Number(opts.hardCapMs) || 0));
     if (!budget && !quietMs) return Promise.resolve({ arrived: false, waitedMs: 0, fresh: [] });
     // 快照：观望开始的那一刻，unread 里都已经有谁。
     //
@@ -13485,14 +13506,21 @@ async function main() {
           seenMaxSeq = newest;
           lastNewAt = now;
         }
-        // ① 还没有任何新消息：等满最初的 budget 就收（与旧行为一致，不拖长空等）。
+        // ① 还没来过任何新消息：等满 budget 就收工。
+        //    这就是"总预算 20 秒"的本体 —— 没人接话时不用干等到天荒地老。
         if (!lastNewAt) {
           if (now - startedAt >= budget) finish(false);
           return;
         }
-        // ② 来过新消息：等安静满 quietMs 再返回（把连发的几条合并成一次）。
+        // ② 来过新消息：等安静满 quietMs 再返回。
+        //    这期间每来一条新的都会把 lastNewAt 顶到 now（见上面），
+        //    所以是"来一条重置一次 10 秒"，直到 10 秒内真的没动静才返回。
+        //    ⚠️ 这条**不受 budget 约束** —— 操作者明确要求"无最长，
+        //    直到 10 秒倒计时结束"，对方一直在聊就一直等。
         if (now - lastNewAt >= quietMs) { finish(true); return; }
-        // ③ 硬上限兜底：一直有人在说话也不能把她永久挂住。
+        // ③ 兜底：硬上限只防"quietMs 配成 0 或极小"导致几乎立刻返回，
+        //    正常情况下走不到这里（②会先满足）。给的是 budget + 2 个安静窗，
+        //    足够对方连发几轮都还在等。
         if (now - startedAt >= hardCapMs) finish(true);
       }, 250);
       // 不要 unref：这个定时器在 HTTP handler 里等待 Promise resolve，
