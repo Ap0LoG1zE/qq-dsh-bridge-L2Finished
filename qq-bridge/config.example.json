@@ -318,6 +318,8 @@
     "cards": {
       "enabled": true,
       "bili": true,
+      "music": true,
+      "generic": true,
       "timeoutMs": 2500,
       "cacheTtlMs": 1800000,
       "titleMaxChars": 40,
@@ -325,6 +327,12 @@
       "includeStats": true,
       "includeDesc": false,
       "descMaxChars": 60
+    },
+    "lyrics": {
+      "enabled": true,
+      "timeoutMs": 12000,
+      "maxChars": 2000,
+      "searchLimit": 5
     }
   },
   "webSearch": {

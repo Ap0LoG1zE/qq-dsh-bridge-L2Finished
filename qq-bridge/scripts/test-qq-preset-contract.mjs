@@ -179,11 +179,18 @@ test('social autonomy and visual, forwarding, sticker and web capabilities remai
   // 仍成立的等价表述：能力面必须在，语气面不再钉死具体条数。
   for (const text of [
     '【保持主体性】',
-    '【别当群管家/主持人】', '不要在一条里用空格断句',
+    '【别当群管家/主持人】',
+  // 2026-11-17：原文案是「不要在一条里用空格断句」，后来扩成同时禁换行符
+  // （模型爱用 '\n' 当分条信号，而 QQ 上那只会变成一条里的空行）。
+  // 断言跟着当前文案走，别再钉旧句子 —— 能力面没变，只是表述更完整了。
+  '不要在一条里用空格或者换行符',
     '不会自动发送到 QQ', 'qq_get_message_images', 'qq_get_forward_msg', 'nestedForwardIds',
     'qq_send_poke', 'qq_list_stickers', 'qq_get_sticker_image', 'qq_send_sticker',
     'qq_collect_sticker', 'qq_sticker_note',
-    'qq_set_sticker_remark', '只有管理端明确开启后才能用',
+    'qq_set_sticker_remark',
+    // 2026-11-17：这一整段被精简过（删掉了「只有管理端明确开启后才能用」
+    // 「普通闲聊约 3~5 轮一张」等细枝末节）。断言改为钉**仍在的能力线索**。
+    '每条只能一张，不能附带文字', '不要一轮连发多张', '不要频繁拍',
     // 2026-11-13：操作者又把这节改成了【纯语音】，并加上 qq_set_voice（只有主人能开关）。
     // 断言跟着**当前能力面**走：语音是"打字自动合成"，不是她去调发语音工具。
     '【纯语音】', '你打的字会被自动转成你的声音发出去', 'qq_set_voice',
@@ -207,7 +214,9 @@ test('autonomy limits and the observation escape hatch stay described', () => {
     // [SILENT] 是桥接的退出标记，误用会静默吞掉回复。
     '不要用 [SILENT]',
     // 记忆面
-    '【记忆卫生】', 'qq_memory_append', 'qq_memory_query', 'qq_memory_remove', 'qq_memory_clear',
+    // 2026-11-17：`qq_memory_clear` 从预设里去掉了（工具仍注册，只是预设不再
+    // 主动教她"整块清空"——那条路径风险高、平时用不到，需要时工具描述里能看到）。
+    '【记忆卫生】', 'qq_memory_append', 'qq_memory_query', 'qq_memory_remove',
     // 四类轻量记忆 + 长期记忆都必须给出「什么时候该记」，不能只剩「什么时候该删」。
     // 2026-11-08：合并成 readonly 版之后 selfNote 的引导整段丢了（那段原本只在 owner 里，
     // 写在"你会被相处改变"的人格叙事中），结果 selfNote / pendingThought 只剩"过期就删"，
@@ -223,18 +232,16 @@ test('autonomy limits and the observation escape hatch stay described', () => {
     '**pendingThought** 记你此刻想说还没说出口的那一句', '2 小时后就没了',
     // 2026-11-12：target 从「填群名片」放宽成「填人名」（私聊没有群名片）。
     // 并纠正「同一个人只该有一条印象」——实际每人最多 10 条，满了顶掉最早的。
-    // 2026-11-12：target 的写法改成给一个完整调用示例。
-    // 起因：模型把 target 放在顶层、而工具 schema 只认 extra.target，
-    // 于是报了「memberImpression 需要 extra.target」这种"明明填了却报没填"的错。
-    // 已经让工具两端都收顶层 target；预设这边补一句调用示例，避免她再猜。
-    '**target 和 content 平级，都放顶层**', '同一个人最多存 10 条',
-    // 全局共享 + 会话隔离的边界。
-    'selfNote / memberImpression / todo / longTerm 是全局共用的',
-    'activeTopic / pendingThought 则各聊各的',
+    // 2026-11-17：`ccab978 refactor(memory)` 把【记忆卫生】大幅精简 —— 五类记忆
+    // 仍在，但删掉了实现细节（「同一个人最多存 10 条」「target 和 content 平级」
+    // 「全局共用/各聊各的边界」）。那些属于工具行为的重复说明，工具描述里已有。
+    // 断言改成钉**当前文案里真正承载规则的那几句**，别再钉被删的细节 ——
+    // 否则预设一精简，测试就红，而实际能力一点没退。
+    '记具体小事，不记空泛评价，用 target 指定是谁',
     // 2026-11-12 精简：todo 那条改成粗体类别名开头，判断标准单独成段（原来挤在列表项缩进里）。
-    '**todo** 一两天内要兑现的事', "category='todo'", 'extra.dueAtMs',
+    '**todo** 一两天内要兑现的事', 'extra.dueAtMs', 'extra.done=true',
     '这事过了两三天还成立吗',
-    "qq_memory_append(category='longTerm')", '**longTerm** 几个月后仍成立的事',
+    '**longTerm** 几个月后仍成立的事', 'extra.tag',
     // 旧工具已删除，预设里不能再出现它的名字（否则模型会去调一个不存在的工具）。
     // 这条是**反向**断言，放在最后单独检查。
     // 黑话面：slang-learner.js 与整个「黑话学习」子系统已删除，qq_slang_query/qq_slang_submit
@@ -242,8 +249,8 @@ test('autonomy limits and the observation escape hatch stay described', () => {
     // 现在跟"梗"有关的约束落在【QQ 场景规则】：遇到网络用语/梗就去搜，不靠猜。
     // 这条断言因此改为检查那条**真正还在**的规则，别再钉死已经删掉的文案。
     'mcp__web-search-safe__web_search', '遇到需要实时信息、网络用语/梗',
-    // 频率上限。'别刷屏' 一词语料里已不再出现，改用仍在的等价表述。
-    '普通闲聊约 3~5 轮一张', '不要一轮连发多张', '每条只能一张，不能附带文字', '不要频繁拍',
+    // 频率类断言已在上面的能力面用例里覆盖（2026-11-17 去重：
+    // 原来这里还有一份「普通闲聊约 3~5 轮一张」，那句话随表情段精简被删了）。
     // 会话令牌是硬前置，漏传会被拒绝。
     '作为 token 参数传入',
     // 指定成员唤醒

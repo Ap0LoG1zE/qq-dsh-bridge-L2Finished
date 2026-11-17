@@ -123,6 +123,15 @@ function loadSnowlumaTools(fetchImpl, fixtureConfig = null, httpImpl = null, fix
     fs: modeAwareFs,
     SENSITIVE_RE: { test: () => false },
     serializeModelData: (value) => JSON.stringify(value),
+    // 2026-11-17：`qq_get_lyrics` 工具让模块顶部多了
+    // `import { lookupLyrics, setLyricsConfig } from './lyrics.js'`，
+    // 并在加载期调 `setLyricsConfig(cfg.socialV2?.lyrics)`。
+    // vm 里 import 被剥掉 ⇒ 这里是 undefined ⇒ 加载期直接抛
+    // `setLyricsConfig is not defined`，整个文件所有用例连带失败。
+    // 用桩即可：本文件测的是鉴权/错误渲染，不测歌词本身
+    //（歌词有独立的 test-lyrics.mjs）。
+    lookupLyrics: async () => ({ ok: false, error: 'fixture: 不查歌词' }),
+    setLyricsConfig: () => {},
   });
   const callTool = async (name, arguments_ = {}) => {
     const tool = tools.get(name);

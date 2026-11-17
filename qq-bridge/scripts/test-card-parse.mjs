@@ -20,6 +20,11 @@ import {
   setCardConfig,
   clearCardCache,
   isBiliHost,
+  isImageUrl,
+  pickCardLink,
+  detectMusicPlatform,
+  fmtMusicLine,
+  fmtGenericLine,
 } from '../src/card-parse.js';
 
 let passed = 0;
@@ -133,14 +138,110 @@ clearCardCache();
 setCardConfig({ enabled: false });
 check('总开关关掉时返回空串（回到 [卡片消息]）', await summarizeCard(MINIAPP_CARD) === '');
 
+// bili 关掉后不再出网，但仍应退到本地通用摘要（不再一律空串）。
 clearCardCache();
 setCardConfig({ enabled: true, bili: false });
-check('bili 子开关关掉时返回空串', await summarizeCard(MINIAPP_CARD) === '');
+const biliOffLine = await summarizeCard(MINIAPP_CARD);
+check('bili 关掉后不再出网、且不返回 [B站] 元数据行', !biliOffLine.startsWith('[B站]') || !biliOffLine.includes('BV'), JSON.stringify(biliOffLine));
+
+// 三个子开关全关：这才是「与上游完全一致」的状态。
+clearCardCache();
+setCardConfig({ enabled: true, bili: false, music: false, generic: false });
+check('bili/music/generic 全关时返回空串（回到 [卡片消息]）', await summarizeCard(MINIAPP_CARD) === '');
 
 clearCardCache();
 setCardConfig({});
-check('非 B站卡片返回空串', await summarizeCard(JSON.stringify({ app: 'x', meta: { detail_1: { title: 't', qqdocurl: 'https://example.com/a' } } })) === '');
+// 非 B站卡片现在给本地通用摘要（上游行为是空串，这里是有意的行为变更）。
+check('非 B站卡片退到通用摘要而非空串',
+  (await summarizeCard(JSON.stringify({ app: 'x', meta: { detail_1: { title: 't', qqdocurl: 'https://example.com/a' } } }))).startsWith('[卡片]'));
 check('坏 JSON 返回空串且不抛', await summarizeCard('{oops') === '');
+
+// ── 6b. 音乐卡片（纯本地，零出网）────────────────────────────────────────
+const QQ_MUSIC_CARD = JSON.stringify({
+  app: 'com.tencent.structmsg', desc: '音乐', view: 'music', prompt: '[分享]说爱你',
+  meta: {
+    music: {
+      app_type: 1, appid: 100497308, desc: '蔡依林【VIP】',
+      jumpUrl: 'https://y.qq.com/n/ryqq/songDetail/0039MnYb0qxYhV',
+      musicUrl: 'http://aqqmusic.tc.qq.com/amobile.music.tc.qq.com/C400003Auh9r2Z5Wys.m4a',
+      preview: 'http://y.gtimg.cn/music/photo_new/x.jpg',
+      tag: 'QQ音乐', title: '说爱你'
+    }
+  },
+  config: { forward: true }
+});
+
+const NETEASE_CARD = JSON.stringify({
+  app: 'com.tencent.structmsg', desc: '音乐', view: 'music', prompt: '[分享]七里香',
+  meta: {
+    music: {
+      app_type: 1, desc: '周杰伦', tag: '网易云音乐', title: '七里香',
+      jumpUrl: 'https://music.163.com/song/186016/?userid=1',
+      musicUrl: 'http://m7.music.126.net/x.mp3',
+      preview: 'http://p1.music.126.net/x.jpg'
+    }
+  }
+});
+
+const KUGOU_CARD = JSON.stringify({
+  app: 'com.tencent.structmsg', view: 'music', prompt: '[分享]孤勇者',
+  meta: { music: { tag: '酷狗音乐', title: '孤勇者', desc: '陈奕迅', jumpUrl: 'https://www.kugou.com/song/#hash=abc', preview: 'http://imge.kugou.com/x.jpg' } }
+});
+
+clearCardCache();
+setCardConfig({});
+const qqMusicLine = await summarizeCard(QQ_MUSIC_CARD);
+check('QQ音乐卡片：认出平台', qqMusicLine.startsWith('[QQ音乐]'), qqMusicLine);
+check('QQ音乐卡片：带曲名', qqMusicLine.includes('说爱你'), qqMusicLine);
+check('QQ音乐卡片：带歌手', qqMusicLine.includes('蔡依林'), qqMusicLine);
+check('QQ音乐卡片：压掉 【VIP】 噪声', !qqMusicLine.includes('VIP'), qqMusicLine);
+check('QQ音乐卡片：不含链接', !/https?:\/\//.test(qqMusicLine), qqMusicLine);
+
+const neteaseLine = await summarizeCard(NETEASE_CARD);
+check('网易云卡片：认出平台', neteaseLine.startsWith('[网易云音乐]'), neteaseLine);
+check('网易云卡片：曲名 + 歌手', neteaseLine.includes('七里香') && neteaseLine.includes('周杰伦'), neteaseLine);
+check('网易云卡片：不含链接', !/https?:\/\//.test(neteaseLine), neteaseLine);
+
+const kugouLine = await summarizeCard(KUGOU_CARD);
+check('酷狗卡片：认出平台', kugouLine.startsWith('[酷狗音乐]'), kugouLine);
+
+// 小程序形态的音乐卡片：title 是应用名，内容在 desc / prompt 里。
+const MINIAPP_MUSIC = JSON.stringify({
+  app: 'com.tencent.miniapp_01', prompt: '[网易云音乐]晴天',
+  meta: { detail_1: { title: '网易云音乐', desc: '晴天 - 周杰伦', qqdocurl: 'https://music.163.com/song/186016/?uctx=abc', icon: 'https://open.gtimg.cn/x.png' } }
+});
+clearCardCache();
+setCardConfig({});
+const miniappMusicLine = await summarizeCard(MINIAPP_MUSIC);
+check('小程序音乐卡片：不把应用名当曲名', !/网易云音乐\s*网易云音乐/.test(miniappMusicLine), miniappMusicLine);
+check('小程序音乐卡片：认出平台', miniappMusicLine.startsWith('[网易云音乐]'), miniappMusicLine);
+
+// music 开关关掉后应落到通用摘要，不应变成空串
+clearCardCache();
+setCardConfig({ music: false });
+const musicOffLine = await summarizeCard(QQ_MUSIC_CARD);
+check('music 开关关掉后不退化成空串', musicOffLine !== '', JSON.stringify(musicOffLine));
+setCardConfig({});
+
+// ── 6c. 链接选取：必须排除图标/封面 ───────────────────────────────────────
+check('isImageUrl 认得出图标域名', isImageUrl('https://open.gtimg.cn/open/app_icon/x.png'));
+check('isImageUrl 认得出封面域名', isImageUrl('https://p1.music.126.net/x.jpg'));
+check('isImageUrl 不误杀页面链接', !isImageUrl('https://y.qq.com/n/ryqq/songDetail/0039MnYb0qxYhV'));
+check('pickCardLink 优先 jumpUrl 而不是 preview',
+  pickCardLink({ preview: 'https://qq.ugcimg.cn/a', jumpUrl: 'https://y.qq.com/n/ryqq/songDetail/x' }, []) === 'https://y.qq.com/n/ryqq/songDetail/x');
+check('pickCardLink 跳过跳板域名以前的图标',
+  pickCardLink({ icon: 'https://open.gtimg.cn/i.png', qqdocurl: 'https://b23.tv/abc' }, []) === 'https://b23.tv/abc');
+check('parseCardJson 的 link 不再是图标',
+  parseCardJson(MINIAPP_CARD)?.link === 'https://b23.tv/hUW6qRa?share_medium=android&share_source=qq&bbid=XUED2EEE041FF5A9BD1F33504D821E1ED155C&ts=1794373230826',
+  parseCardJson(MINIAPP_CARD)?.link);
+
+// ── 6d. 平台识别 ──────────────────────────────────────────────────────────
+check('detectMusicPlatform 按域名认 QQ音乐', detectMusicPlatform({ link: 'https://y.qq.com/x' })?.label === 'QQ音乐');
+check('detectMusicPlatform 按域名认网易云', detectMusicPlatform({ link: 'https://music.163.com/song/1' })?.label === '网易云音乐');
+check('detectMusicPlatform 认得出 aqqmusic 音频直链', detectMusicPlatform({ link: 'http://aqqmusic.tc.qq.com/a.m4a' })?.label === 'QQ音乐');
+check('detectMusicPlatform 按 tag 兜底', detectMusicPlatform({ tag: '网易云音乐' })?.label === '网易云音乐');
+check('detectMusicPlatform 非音乐返回 null', detectMusicPlatform({ link: 'https://example.com/x', tag: '新闻' }) === null);
+check('detectMusicPlatform view=music 兜底为「音乐」', detectMusicPlatform({ view: 'music' })?.label === '音乐');
 
 // 指向不可达的短链：必须超时降级而不是抛异常/挂住
 clearCardCache();

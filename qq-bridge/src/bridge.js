@@ -56,6 +56,7 @@ import {
   applyStickerNote,
   markStickerUsed
 } from './sticker-lib.js';
+import { isStickerLike, describeInlineImage, stickerLabelFromSummary } from './media-kind.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -1194,6 +1195,9 @@ function loadConfig() {
     // 发文件（qq_send_file）：只对 Owner 档（private:<ownerQQ>）生效，路由里有独立档位闸门；
     // 这里的开关是"要不要给管理员用这个工具"，默认开。详细边界见 socialV2.files。
     sendFile: true,
+    // 查歌词（qq_get_lyrics）：纯 MCP 侧出网，不经过桥接路由，所以这里只是让控制台
+    // 读数一致。真正生效的开关是 socialV2.lyrics.enabled。
+    getLyrics: true,
     ...(cfg.socialV2.tools ?? {})
   };
 
@@ -1580,7 +1584,14 @@ async function segmentsToText(segments, options = {}) {
       case 'face': out.push(`[表情${d.id ?? ''}]`); break;
       // 市场表情（mface）在部分网关实现里出现：有 summary 就用它，别让模型只看到 "[mface]"。
       case 'mface': out.push(`[表情${d.summary ? `:${d.summary}` : ''}]`); break;
-      case 'image': out.push('[图片]'); break;
+      // QQ 把「表情包」也发射成 image 段，靠 picSubType 区分渲染方式：
+      //   sub_type=0 → 普通图片（相册/截图/粘贴进来的图）
+      //   sub_type=1 → 表情包（收藏表情、斗图用的那种）
+      // 两者对读消息的模型意义完全不同：表情包是在表达情绪（该接梗、该反应），
+      // 普通图片是在传递内容（该看图、该评论画面）。一律标 [图片] 会让她把
+      // 别人甩来的表情包当成「一张图」去分析，那正好是人和机器最容易露馅的地方。
+      // 判定逻辑统一在 media-kind.js，避免这里和 media 元数据/看图标注各说各话。
+      case 'image': out.push(describeInlineImage(d)); break;
       case 'record': out.push('[语音]'); break;
       case 'video': out.push('[视频]'); break;
       case 'file': out.push(`[文件${d.name ?? ''}]`); break;
@@ -1605,13 +1616,15 @@ async function segmentsToText(segments, options = {}) {
       }
       case 'json': {
         // 分享卡片（小程序 / 结构化分享）。以前一律渲染成「[卡片消息]」，对模型等于
-        // 什么都没说；B站卡片现在在**桥接侧**内联展开成一行摘要（见 src/card-parse.js），
-        // 这样她零工具调用就知道群友转的是什么视频，既少一次往返、也不多占 schema。
+        // 什么都没说；现在在**桥接侧**内联展开成一行摘要（见 src/card-parse.js），
+        // 这样她零工具调用就知道群友转的是什么，既少一次往返、也不多占 schema。
         //
-        // 三层降级，任何一层失败都不影响消息投递：
-        //   ① 不是 B站卡片 / 开关关了 → 原文重发，回到「[卡片消息]」；
-        //   ② 短链解析失败 → 用卡片自带标题兜底；
-        //   ③ 一切正常 → `[B站] 标题 · UP · 时长 · 播放 · BV号`。
+        // 三类路由（各自有开关），任何一层失败都不影响消息投递：
+        //   · B站  → `[B站] 标题 · UP · 时长 · 播放 · BV号`（唯一出网的一类）
+        //   · 音乐 → `[QQ音乐]/[网易云音乐] 曲名 · 歌手`（纯本地，零出网）
+        //   · 其他 → `[平台] 标题 · 摘要`（纯本地）
+        //   全关 / 认不出 / 解析异常 → 回到「[卡片消息]」。
+        // 摘要里刻意**不放 URL**：模型拿到也只能转述，而一条链接比标题还长。
         // 同一条消息会调本函数两次（带引用版/纯文本版），summarizeCard 按原始 JSON
         // 做 memo，第二次不再出网。
         const rawCard = typeof d.data === 'string'
@@ -1668,14 +1681,25 @@ function extractMediaFromSegments(segments) {
       emojiKey: String(d.key ?? '')
     };
     if (seg.type === 'image') {
+      const subType = (d.sub_type ?? d.subType) != null ? String(d.sub_type ?? d.subType) : '';
+      const emojiIdRaw = String(d.emoji_id ?? d.emojiId ?? '').trim();
+      // 和上面 segmentsToText 用同一套判定（media-kind.js），保证
+      // 「文本标注」和「media 元数据」不会各说各话。
+      const stickerLike = isStickerLike(d);
       media.push({
+        // ⚠️ `kind` 保持 'image' 不变：它表达的是**段类型**，下游
+        // collectStickerV2 就是靠 `kind === 'image'` 决定走 fetchOneBotImage 取字节的，
+        // 改成 'sticker' 会让「偷图」功能直接报「无法获取该表情的图片源」。
+        // 语义分类另开字段（isSticker），两者不要混用。
         kind: 'image',
+        segmentType: 'image',
+        isSticker: stickerLike,
         file: String(d.file ?? ''),
         url: String(d.url ?? ''),
         // 线上段落字段是 snake_case 的 `sub_type`（SnowLuma 运行时源码里就这么发）；
         // 而 SDK 的类型描述的是**内部元素**、拼作 `subType`。两个都读，别只认一个
         // —— 只读 camelCase 的话这里会永远是空串，而且不会有任何报错。
-        subType: (d.sub_type ?? d.subType) != null ? String(d.sub_type ?? d.subType) : '',
+        subType,
         summary: sanitizeMediaSummary(d.summary),
         ...emojiFields
       });
@@ -5130,8 +5154,24 @@ async function main() {
           }
           let factsText = '';
           try {
-            const f = selectFactsForInjection(STATE_DIR, key);
-            factsText = f.text;
+            // ⚠️ 必须用 memoryKeyOf(key) 而不是 key。
+            //
+            // 2026-11-17 修：这里原来写的是 `selectFactsForInjection(STATE_DIR, key)`，
+            // 于是它去读 facts/private_<QQ号>.jsonl —— **那个文件根本不存在**。
+            // 长期事实自 2026-11-10 起一律存全局（facts/global.jsonl），
+            // 其它注入点（唤醒词、控制台预览）早就改成了 memoryKeyOf()，只有这一处漏了。
+            //
+            // 症状：系统提示词里身份/令牌/表情都在，唯独【长期记忆】整段消失，
+            // 而任何异常都不会发生（selectForInjection 对空库返回空串，是合法返回值），
+            // 所以日志里连一个字都没有 —— 静默丢功能。
+            try {
+              const f = selectFactsForInjection(STATE_DIR, memoryKeyOf(key));
+              factsText = f.text;
+            } catch (inner) {
+              // 全局库坏了，退回到按会话取（老数据/迁移期可能只有会话级文件）。
+              log(`[memory] 全局长期记忆渲染失败，回退按会话取：${inner?.message ?? inner}`);
+              factsText = selectFactsForInjection(STATE_DIR, key).text;
+            }
           } catch (error) {
             log(`[memory] 长期记忆渲染失败（已跳过）：${error?.message ?? error}`);
           }
@@ -7132,32 +7172,49 @@ async function main() {
               forwardIds: Array.isArray(found.forwardIds) ? found.forwardIds : [],
               hasForward: !!found.hasForward
             } : {};
+            // 本地正文同样只存前 200 字，但**未截断长度**必须留着：截断与否只能由它判断。
+            // 以前用 text.length >= 200，恰好 200 字的完整消息会被误标成已截断，
+            // 模型于是白跑一次 qq_get_message_full。
+            const localInfo = (row) => {
+              if (!row) return null;
+              const full = String(row.text || row.plain || '');
+              return {
+                sender: String(row.sender || ''),
+                text: full.slice(0, 200),
+                textLength: full.length,
+                userId: row.userId ? String(row.userId) : null,
+                messageId: row.messageId ? String(row.messageId) : null,
+                seq: row.seq
+              };
+            };
             let info = null;
             // 如果入参命中本地 seq 且本地存有真实 messageId，优先按 seq 展示，避免与真实 id 冲突。
             if (found && found.messageId && String(found.messageId) !== messageId) {
-              info = {
-                sender: String(found.sender || ''),
-                text: String(found.text || found.plain || '').slice(0, 200),
-                userId: found.userId ? String(found.userId) : null,
-                messageId: String(found.messageId),
-                seq: found.seq
-              };
+              info = localInfo(found);
             } else {
               info = await resolveReplyInfo(kind, id, messageId);
-              if (!info && found) {
-                info = {
-                  sender: String(found.sender || ''),
-                  text: String(found.text || found.plain || '').slice(0, 200),
-                  userId: found.userId ? String(found.userId) : null,
-                  messageId: found.messageId ? String(found.messageId) : null,
-                  seq: found.seq
-                };
-              }
+              if (!info && found) info = localInfo(found);
+            }
+            // 窗口外的 seq 既不在本地也不在 QQ 侧：以前返回 info:null，模型只会以为
+            // 自己传错了 id，然后反复换 id 重试。这里给明确的 404 和当前可见范围。
+            if (!info) {
+              const rows = st.recentMessages || [];
+              const seqs = rows.map((m) => Number(m?.seq)).filter(Number.isFinite);
+              const range = seqs.length
+                ? `（本地 seq ${Math.min(...seqs)}~${Math.max(...seqs)}，共 ${rows.length} 条）`
+                : '';
+              sendJson({
+                ok: false,
+                error: `查不到这条消息：本地最近记录里没有 ${messageId}${range}，按该 id 向 QQ 也取不到。要看当前可见范围请改用 qq_get_recent_messages / qq_get_unread_messages。`
+              }, 404);
+              return;
             }
             // 无论 info 来自本地还是 OneBot，只要本地有 found 就补充转发字段，避免提示词与实现不一致。
-            if (info && found) Object.assign(info, forwardFields);
-            // 正文本就是 200 字符预览；显式告知截断，避免模型把预览当成全文。
-            if (info) info.textTruncated = String(info.text ?? '').length >= 200;
+            if (found) Object.assign(info, forwardFields);
+            // textTruncated 由未截断长度判断，计算完就把内部字段摘掉（不让它进模型上下文）。
+            const fullLen = Number(info.textLength);
+            delete info.textLength;
+            info.textTruncated = Number.isFinite(fullLen) && fullLen > String(info.text ?? '').length;
             sendJson({ ok: true, key, messageId, info });
           } catch (error) {
             sendJson({ ok: false, error: `获取消息详情失败：${error?.message ?? error}` }, 500);
@@ -7225,6 +7282,22 @@ async function main() {
               if (type === 'text') {
                 const raw = seg?.data?.text;
                 if (raw) parts.push(String(raw));
+              } else if (type === 'json') {
+                // 卡片消息整条只有一个 json 段、0 个 text 段。以前这里把它当纯媒体丢掉，
+                // 于是 qq_get_message_full 对卡片返回 text:"" —— 模型按工具描述来「读全文」，
+                // 结果拿到一片空白，还和 qq_get_message_detail 给出的摘要互相打架。
+                // 卡片本来就没有「更长的原文」可读：能读到的就是这段 JSON 渲染出的摘要。
+                mediaKinds.push(type);
+                const cardData = seg?.data?.data;
+                const rawCard = typeof cardData === 'string'
+                  ? cardData
+                  : (cardData && typeof cardData === 'object' ? JSON.stringify(cardData) : '');
+                if (rawCard) {
+                  try {
+                    const cardLine = await summarizeCard(rawCard);
+                    if (cardLine) parts.push(cardLine);
+                  } catch { /* 卡片解析失败不影响其它段 */ }
+                }
               } else if (type && !['reply', 'at'].includes(type)) {
                 mediaKinds.push(type);
               }
@@ -9410,7 +9483,8 @@ async function main() {
     // 表情包（市场/收藏表情）优先走 CDN：get_image 对市场表情必然失败
     // （SnowLuma 缓存里没有该文件），先试 URL 能省一次失败往返，也更可靠。
     const emojiId = String(media.emojiId || emojiIdFromFileName(media.file) || '');
-    const isSticker = media.kind === 'sticker' || !!emojiId || String(media.subType || '') === '1';
+    // 统一用 media-kind.js 的判定（含 sub_type=7），别在这里另写一套。
+    const isSticker = isStickerLike(media) || Boolean(emojiId);
     const label = isSticker ? '表情' : '图片';
     const failures = [];
     const urls = [];
@@ -9601,11 +9675,15 @@ async function main() {
         }
       } else {
         const img = await fetchOneBotImage(media);
-        const kind = media.kind === 'sticker' ? 'sticker' : 'image';
-        const noun = kind === 'sticker' ? '表情' : '图片';
+        // 表情包在 QQ 里也是 image 段（sub_type=1 或有 emoji_id），
+        // 只认 kind==='sticker' 会把用户的收藏/斗图表情统统叫成「图片」。
+        const stickerLike = isStickerLike(media);
+        const kind = stickerLike ? 'sticker' : 'image';
+        const noun = stickerLike ? '表情包' : '图片';
         const base = {
           index,
           kind,
+          sticker: stickerLike,
           ...(media.file ? { file: String(media.file) } : {}),
           ...(media.url ? { url: String(media.url) } : {}),
           ...(media.emojiId ? { emojiId: String(media.emojiId) } : {}),
@@ -9637,10 +9715,21 @@ async function main() {
 
   function mediaHintFor(key, messageRef, mediaList) {
     if (!Array.isArray(mediaList) || mediaList.length === 0 || !messageRef) return '';
+    // 把「表情包」和「图片」分开报数：两者该有的反应完全不同
+    // （表情包该接梗/回应情绪，图片该看内容），混成一个数字等于把判断依据抹掉。
+    const stickerCount = mediaList.filter((m) => m && isStickerLike(m)).length;
+    const imageCount = mediaList.length - stickerCount;
+    const parts = [];
+    if (stickerCount) parts.push(`${stickerCount} 个表情包`);
+    if (imageCount) parts.push(`${imageCount} 张图片`);
+    const what = parts.join(' + ') || `${mediaList.length} 个媒体`;
+    const stickerNote = stickerCount
+      ? '（表情包是在表达情绪/态度，通常不需要「描述画面」，而是接住那个情绪。）'
+      : '';
     if (currentMode === 'reserved2') {
-      return `\n【图片/表情】本条消息包含 ${mediaList.length} 个图片/表情（消息ID=${messageRef}）。如需要查看/识别，请调用 mcp__snowluma__qq_get_message_images，参数 key="${key}", messageId="${messageRef}"。`;
+      return `\n【图片/表情】本条消息包含 ${what}${stickerNote}（消息ID=${messageRef}）。如需要查看/识别，请调用 mcp__snowluma__qq_get_message_images，参数 key="${key}", messageId="${messageRef}"。`;
     }
-    return `\n【图片/表情】本条消息包含 ${mediaList.length} 个图片/表情（消息ID=${messageRef}）。`;
+    return `\n【图片/表情】本条消息包含 ${what}${stickerNote}（消息ID=${messageRef}）。`;
   }
 
   function findMessageMedia(key, ref) {
@@ -12332,9 +12421,12 @@ async function main() {
         includeReply: false
       });
       const senderUserId = raw.sender?.user_id ?? raw.user_id ?? null;
+      const fullText = String(text ?? '');
       const info = {
         sender: String(sender ?? ''),
-        text: String(text ?? '').slice(0, 200),
+        text: fullText.slice(0, 200),
+        // 未截断长度：调用方据此判断 textTruncated，不会把「恰好 200 字」误判成截断。
+        textLength: fullText.length,
         userId: senderUserId != null ? String(senderUserId) : null
       };
       replyInfoCache.set(cacheKey, { info, ts: Date.now() });

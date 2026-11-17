@@ -43,6 +43,16 @@ import * as stateAcl from '../src/state-acl.mjs';
 // 注意别用 `...card` 整包摊：它导出的 formatDuration（m:ss）会和 card-parse 的
 // 同名导出（给人读的时长文案）撞车，后摊的覆盖前者 ⇒ 语音相关的既有断言会静默失真。
 import { setCardConfig, summarizeCard } from '../src/card-parse.js';
+// 图片/表情的语义分类（2026-11-17 新增）。bridge.js 顶部从它 import
+// isStickerLike / describeInlineImage / stickerLabelFromSummary ——
+// VM 里 import 被剥掉，不在这里摊进 context 就会是 undefined，
+// 表现为测试里 `ReferenceError: isStickerLike is not defined`。
+// 注意**不要** `...mediaKind` 整包摊：它导出的名字较通用，容易和别的模块撞车。
+import {
+  isStickerLike as _isStickerLike,
+  describeInlineImage as _describeInlineImage,
+  stickerLabelFromSummary as _stickerLabelFromSummary,
+} from '../src/media-kind.js';
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
@@ -315,6 +325,12 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     // 卡片断言用 fixture JSON 且不开 enabled，需要真实解析的用例放到 test-card-parse.mjs。
     setCardConfig,
     summarizeCard,
+    // 图片/表情语义分类（2026-11-17）：bridge.js 顶部 import 了这三个，
+    // VM 里必须显式注入，否则是 undefined —— 调用点会抛
+    // `ReferenceError: isStickerLike is not defined`。
+    isStickerLike: _isStickerLike,
+    describeInlineImage: _describeInlineImage,
+    stickerLabelFromSummary: _stickerLabelFromSummary,
     cleanupTemp: () => {},
     ...globals,
   });

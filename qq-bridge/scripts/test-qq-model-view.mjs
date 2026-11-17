@@ -153,7 +153,16 @@ test('MCP validates/forwards read watermarks and wait purposes against an isolat
     // live config or user runtime state are copied into this test fixture.
     fixture = await fs.mkdtemp(path.join(ROOT, '.tmp-model-view-test-'));
     await fs.mkdir(path.join(fixture, 'src'));
-    await Promise.all(['mcp-snowluma-safe.js', 'qq-model-view.js', 'sensitive.js'].map((name) =>
+    // ⚠️ 这份清单必须跟着 mcp-snowluma-safe.js 的**本地 import 链**走（含传递依赖）。
+    // 2026-11-17：新增 `import ... from './lyrics.js'`（qq_get_lyrics 工具），
+    // 而 lyrics.js 自己又 `import { safeFetch } from './safe-fetch.js'`。
+    // 少拷任何一个 ⇒ 子进程 ERR_MODULE_NOT_FOUND ⇒ 启动即崩 ⇒ 客户端只看到
+    // "MCP error -32000: Connection closed"。症状像连接问题，实际是漏拷依赖。
+    // 以后新增本地模块，记得顺着 import 链把整个闭包都列进来。
+    await Promise.all([
+      'mcp-snowluma-safe.js', 'qq-model-view.js', 'sensitive.js',
+      'lyrics.js', 'safe-fetch.js',
+    ].map((name) =>
       fs.copyFile(path.join(ROOT, 'src', name), path.join(fixture, 'src', name))));
     await fs.writeFile(path.join(fixture, 'config.json'), JSON.stringify({ consolePort: api.address().port }));
     const transport = new StdioClientTransport({

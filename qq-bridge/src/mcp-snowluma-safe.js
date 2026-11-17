@@ -19,6 +19,7 @@ import { z } from 'zod';
 // 在 MCP 里拦会连「安全拒绝理由」都拿不到，反而让模型无法把话说清楚。
 import { SENSITIVE_RE } from './sensitive.js';
 import { serializeModelData } from './qq-model-view.js';
+import { lookupLyrics, setLyricsConfig } from './lyrics.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -34,6 +35,11 @@ function loadConfig() {
 }
 
 const cfg = loadConfig();
+
+// 歌词模块配置：和 cards 一样在加载时归一化一次，非法值不变成运行期异常。
+// 注意 lyrics.js 是 MCP 进程内直接用的（不经过桥接 HTTP），因为查词是纯出网 GET，
+// 不需要 QQ 网关，也就没必要多绕一层。
+setLyricsConfig(cfg.socialV2?.lyrics);
 
 function getConfig() {
   return loadConfig();
@@ -396,6 +402,8 @@ const TOOL_CONFIG_FLAGS = {
   // 不登记会怎样：控制台关掉 memory 时它仍然注册、仍然随每轮请求发 schema，
   // 模型调它再拿 403 —— 既是白烧 token，又诱导误调。
   qq_affinity: 'memory',
+  // 查歌词：纯 MCP 侧出网（不经桥接），所以关掉的做法是**注册期就不注册**。
+  qq_get_lyrics: 'getLyrics',
 };
 const disabledTools = [];
 
@@ -2002,6 +2010,68 @@ server.tool(
 //     这样"查一下"只要几百字符，而不是把说明书再发一遍。
 //   · call 用 zod 按原工具 schema 校验参数，失败时把**完整参数说明**连错误一起返回，
 //     模型能自己改对，不需要再走一次 find。
+  server.tool(
+    'qq_get_lyrics',
+    '查一首歌的歌词（QQ音乐 / 网易云音乐）。只返回**歌词正文纯文本**（已去掉时间轴和制作人员名单，一行一句）。'
+    + '没有 JSON、没有字段名、也不复述歌名，直接用眼睛读。\n\n'
+    + '**什么时候用**：群里有人发了音乐卡片并聊起这首歌，你想接话、想引用某句词、或者想知道这歌在讲什么。'
+    + '卡片摘要里已经给了曲名、歌手和 id，直接拿来用，不要自己瞎猜、也不要再去 web_fetch 那个链接。\n\n'
+    + '**首选按 id 取词**：摘要形如 `[QQ音乐] 晴天 · 周杰伦 · mid:0039MnYb0qxYhV`，'
+    + '`mid:` 对应 platform="qq"，`id:` 对应 platform="netease"，把这两个传进来就够，不必再传歌名歌手。'
+    + '这条路直达那首歌，不会有歧义。\n\n'
+    + '摘要里没有 id（小程序形态的卡片常见）时才退到按歌名搜：传 platform + title + artist。'
+    + '**platform 一定按卡片上写的平台传** —— 拿 QQ音乐 的歌名去网易云搜，搜出来的十有八九是翻唱。\n\n'
+    + '只有「按歌名搜」这条路才可能撞上翻唱，那时返回开头会有一行「⚠️」说明；按 id 取的词永远是那首歌本身的。\n\n'
+    + '歌词是给你读懂这首歌用的，**不要整段搬到群里**，引用一两句最合适的就行。',
+    {
+      platform: z.enum(['qq', 'netease']).optional()
+        .describe('平台：qq=QQ音乐，netease=网易云音乐。来自音乐卡片时**务必传**，否则可能搜到翻唱'),
+      title: z.string().optional().describe('歌名（来自卡片摘要）'),
+      artist: z.string().optional().describe('歌手名（来自卡片摘要，强烈建议传，能大幅提高匹配准确度）'),
+      id: z.string().optional().describe('歌曲 id（QQ音乐的 songmid 或网易云的 songId），需要配合 platform 使用'),
+      maxChars: z.number().optional().describe('歌词最多返回多少字，默认 2000')
+    },
+    async ({ platform, title, artist, id, maxChars }) => {
+      try {
+        const data = await lookupLyrics({
+          platform,
+          title,
+          artist,
+          id,
+          maxChars: maxChars ?? cfg.socialV2?.lyrics?.maxChars
+        });
+        // 输出一律手工拼纯文本：不 JSON.stringify、不带字段名。
+        // 模型读歌词只需要「曲名、歌手、然后正文」，多一个花括号都是白烧 token。
+        if (!data.ok) {
+          const lines = [`取歌词失败：${data.error}`];
+          if (Array.isArray(data.candidates) && data.candidates.length) {
+            lines.push('相近的歌：');
+            for (const c of data.candidates) {
+              lines.push(`  ${c.title} — ${c.artist || '未知'}（${c.platform}，id=${c.id}）`);
+            }
+          }
+          return { content: [{ type: 'text', text: lines.join('\n') }], isError: true };
+        }
+        // 只返回歌词正文，不输出标题行。
+        //
+        // 踩过的坑（2026-11-17 实测 seq129）：她按卡片摘要里的 id 取词，网易云的 LRC
+        // 不带 [ti:]/[ar:] 标签，返回头部变成「(未知曲名)（网易云音乐）」—— 她明明知道
+        // 这是《你瞒我瞒》陈柏宇，工具却把已知信息变成了「未知」。
+        //
+        // 结论：按 id 取词时**她本来就知道是哪首歌**，标题行纯属重复。
+        // 按歌名搜时她也刚把歌名传进来，同样不需要复述。所以一律不给标题行，
+        // 只留两类真正的新信息：翻唱提示、截断提示。
+        const parts = [];
+        if (data.coverOnly && data.note) parts.push(`⚠️ ${data.note}`);
+        if (data.truncated) parts.push('⚠️ 歌词较长，后面截断了');
+        parts.push(data.lyric);
+        return { content: [{ type: 'text', text: parts.join('\n\n') }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `查歌词失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+
 if (deferEnabled()) {
   const oneLine = (text) => String(text || '').replace(/\s+/g, ' ').split(/[。；;]/)[0].slice(0, 72);
   const paramNames = (schema) => (schema ? Object.keys(schema) : []);
