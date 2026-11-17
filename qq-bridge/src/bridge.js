@@ -3664,6 +3664,42 @@ async function main() {
     };
     // 二代会话工具必须仍命中当前模式的白名单/准入；避免白名单移除后旧 agentToken 继续读状态。
     const v2SessionAllowed = isSessionAllowedInCurrentMode;
+
+    /**
+     * 「发消息」专用令牌校验：主人会话的令牌可以往**任意**聊天发。
+     *
+     * 为什么需要这一层（需求原文）：让主人私聊能凭 key 直接往指定的群/私聊发话，
+     * 不必先拥有那个聊天的令牌。否则每个聊天各有一把 token，
+     * `agentTokenOk(targetKey, ownerToken)` 必然失败，主人无法跨聊天说话。
+     *
+     * ⚠️ 只放开发送。读取（未读/历史/记忆/状态）仍然要求令牌属于**目标 key 自己**，
+     *    见各端点里的 agentTokenOk(key, ...)。理由：发送是"往某处说一句"，
+     *    而读取会把这个聊天的私密内容和记忆暴露给调用方 —— 两件事的风险不对等。
+     *
+     * ⚠️ 豁免条件写死为 ownerQQ 的**私聊** key：群聊里即使有人 QQ 号等于 ownerQQ
+     *    也不会获得这条特权（与 sessionTier 的口径一致）。
+     */
+    const ownerPrivateKeyOf = () => {
+      const q = String(cfg?.ownerQQ ?? '').trim();
+      return q ? `private:${q}` : '';
+    };
+    /** token 是否属于主人私聊会话。 */
+    const isOwnerAgentToken = (token) => {
+      const ownerKey = ownerPrivateKeyOf();
+      if (!ownerKey) return false;
+      const st = socialV2.conversations.get(ownerKey);
+      return !!st && !!st.agentToken && tokenEq(token, st.agentToken);
+    };
+    /**
+     * 发送类端点的令牌校验。
+     * @param {string} key 目标聊天 key
+     * @param {string} token 请求方 agent token
+     * @returns {boolean} 允许发送
+     */
+    const canSendToKey = (key, token) => {
+      if (agentTokenOk(key, token)) return true;      // 本聊天自己的令牌
+      return isOwnerAgentToken(token);                // 主人私聊：可发往任意聊天
+    };
     const server = http.createServer(async (req, res) => {
       let url;
       try { url = new URL(req.url ?? '/', `http://127.0.0.1:${port}`); }
@@ -6020,7 +6056,7 @@ async function main() {
             sendJson({ ok: false, error: '已禁用多条发送，请合并为一条消息' }, 403);
             return;
           }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !canSendToKey(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('sendBurst')) { sendJson({ ok: false, error: '工具未启用：qq_send_burst' }, 403); return; }
           if (currentMode !== 'reserved2') {
@@ -6077,6 +6113,10 @@ async function main() {
             noteSendCallV2(st, now);  // 节流按"调用"记账，不按条数
             if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
             const delays = computeGapsV2(messages, 'auto', undefined, undefined, sendCfg);
+            // 2026-11-17：**发送前**拍快照。多条数组是逐条发的（间隔 1~3 秒），
+            // 那几秒里对方说的话会进 unread，若等到 paceAfterSendV2 才拍快照
+            // 就会被当成"已有未读"而漏掉。详见 snapshotUnreadBeforeSendV2 的注释。
+            const preSendSnapshot = snapshotUnreadBeforeSendV2(st);
             const sentMessages = await sendMessagesV2(key, messages, delays);
             recordSentMessagesV2(key, sentMessages, sentMessages?.ids);
             st.lastAiReplyAt = now;
@@ -6089,7 +6129,8 @@ async function main() {
             // 让她能在同一个回合里接着回 —— 省掉一次完整唤醒。
             let postSendObserve = null;
             if (sentMessages.length > 0) {
-              postSendObserve = await paceAfterSendV2(st, key, Date.now());
+              // 用发送前的快照当基线：覆盖"逐条发送那几秒"的盲区。
+              postSendObserve = await paceAfterSendV2(st, key, Date.now(), { snapshotBeforeSend: preSendSnapshot });
             }
             log(`[reserved2] 工具分条发送 ${key}: 成功 ${sentMessages.length}/${messages.length} 条`);
             appendActivity(`${key} [reserved2] 工具分条发送：成功 ${sentMessages.length}/${messages.length} 条`);
@@ -6161,7 +6202,7 @@ async function main() {
             sendJson({ ok: false, error: '已禁用多条发送，请合并为一条消息' }, 403);
             return;
           }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !canSendToKey(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('sendMessage')) { sendJson({ ok: false, error: '工具未启用：qq_send_message' }, 403); return; }
           if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
@@ -6239,6 +6280,9 @@ async function main() {
             actualReplyToMessageId = resolved.messageId;
           }
           try {
+            // 2026-11-17：发送前拍快照，覆盖逐条发送期间的盲区
+            //（3 条数组要按 1~3 秒间隔逐条发，那 5~10 秒里对方的消息会漏）。
+            const preSendSnapshot = snapshotUnreadBeforeSendV2(st);
             const sentMessages = await sendMessagesV2(key, messages, delays, actualReplyToMessageId, atUserId);
             recordSentMessagesV2(key, sentMessages, sentMessages?.ids);
             st.lastAiReplyAt = now;
@@ -6251,7 +6295,8 @@ async function main() {
             // 让她能在同一个回合里接着回 —— 省掉一次完整唤醒。
             let postSendObserve = null;
             if (sentMessages.length > 0) {
-              postSendObserve = await paceAfterSendV2(st, key, Date.now());
+              // 用发送前的快照当基线：覆盖"逐条发送那几秒"的盲区。
+              postSendObserve = await paceAfterSendV2(st, key, Date.now(), { snapshotBeforeSend: preSendSnapshot });
             }
             log(`[reserved2] 工具统一发送 ${key}: 成功 ${sentMessages.length}/${messages.length} 条`);
             appendActivity(`${key} [reserved2] 工具统一发送：成功 ${sentMessages.length}/${messages.length} 条`);
@@ -6294,7 +6339,7 @@ async function main() {
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
           if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
           if (!req.headers['x-agent-token']) { sendJson({ ok: false, error: '撤回必须携带 agent token' }, 403); return; }
-          if (!agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!canSendToKey(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (socialV2.paused) { sendJson({ ok: false, error: '二代 AI 已暂停' }, 403); return; }
           const wantText = String(body.text ?? '').trim();
@@ -6343,7 +6388,7 @@ async function main() {
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
           if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
           if (!req.headers['x-agent-token']) { sendJson({ ok: false, error: 'reserved2 模式发送拍一拍必须携带 agent token' }, 403); return; }
-          if (!agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!canSendToKey(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (!v2ToolEnabled('sendPoke')) { sendJson({ ok: false, error: '工具未启用：qq_send_poke' }, 403); return; }
           if (socialV2.paused) { sendJson({ ok: false, error: '二代 AI 已暂停，不能发送拍一拍' }, 403); return; }
@@ -6565,7 +6610,7 @@ async function main() {
           if (!key) { sendJson({ ok: false, error: 'key 不能为空（格式 private:QQ号）' }, 400); return; }
           if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
           if (!token) { sendJson({ ok: false, error: 'reserved2 模式发送必须携带 agent token' }, 403); return; }
-          if (!agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!canSendToKey(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           const keyMatch = /^(group|private):(\d+)$/.exec(key);
           if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 private:QQ号' }, 400); return; }
           const kind = keyMatch[1];
@@ -6612,7 +6657,7 @@ async function main() {
             sendJson({ ok: false, error: '表情消息不能附带文字；请先用 qq_send_message / qq_reply 把想说的话作为单独气泡发送，再单独 qq_send_sticker 发表情' }, 400);
             return;
           }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !canSendToKey(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('sendSticker')) { sendJson({ ok: false, error: '工具未启用：qq_send_sticker' }, 403); return; }
           if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
@@ -8820,6 +8865,7 @@ async function main() {
 
             noteSendCallV2(st, now);  // 节流按"调用"记账，不按条数
             if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
+            const preSendSnapshot = snapshotUnreadBeforeSendV2(st);
             const sentMessages = await sendMessagesV2(key, [message], [], actualReplyToMessageId, atUserId);
             recordSentMessagesV2(key, sentMessages, sentMessages?.ids);
             st.lastAiReplyAt = now;
@@ -8830,9 +8876,13 @@ async function main() {
             // 发送后空转 + 观察新消息（2026-11-14）：
             // 空转期间有新消息就提前结束，把那几条按【本轮消息】同格式带回去，
             // 让她能在同一个回合里接着回 —— 省掉一次完整唤醒。
+            //
+            // 注：这条路径只发 1 条、没有数组间隔，所以不存在"逐条发送的盲区"，
+            // 但为了三条发送路径行为一致（也免得以后有人把这条改成多条），
+            // 同样用发送前的快照。
             let postSendObserve = null;
             if (sentMessages.length > 0) {
-              postSendObserve = await paceAfterSendV2(st, key, Date.now());
+              postSendObserve = await paceAfterSendV2(st, key, Date.now(), { snapshotBeforeSend: preSendSnapshot });
             }
             log(`[send] ${url.pathname} ${key}: 成功 ${sentMessages.length}/1 条`);
             appendActivity(`${key} [send] 成功 ${sentMessages.length}/1 条：${message.slice(0, 80)}`);
@@ -10005,6 +10055,25 @@ async function main() {
    *
    * @returns {{arrived: boolean, waitedMs: number}} 是否等到了新消息
    */
+  /**
+   * 拍一份 unread 快照，供 paceAfterSendV2 当基线用。
+   *
+   * 为什么需要它（2026-11-17）：`qq_send_message` 发多条数组时，
+   * sendMessagesV2 会按数组间隔**逐条**发（1~3 秒/条）。3 条约 5~10 秒。
+   * 那期间对方发的消息已经进了 unread，但观望还没开始、也没有任何等待机制，
+   * 于是它们既不在「观望期间新到」里、也不会被带回去 —— 成了盲区。
+   *
+   * 解法：**发送之前**拍快照，让观望用这份更早的基线算差集。
+   * 这样「发送期间到达」和「观望期间到达」都算 fresh，一次带回。
+   */
+  function snapshotUnreadBeforeSendV2(st) {
+    return new Set(
+      (Array.isArray(st?.unread) ? st.unread : [])
+        .map((m) => (m && Number.isSafeInteger(m.seq) ? m.seq : null))
+        .filter((s) => s !== null)
+    );
+  }
+
   async function paceAfterSendV2(st, key, now = Date.now(), opts = {}) {
     if (!st) return { arrived: false, waitedMs: 0, text: '', count: 0 };
     const observeMs = Math.max(0, Number(cfg.socialV2?.send?.observeAfterSendMs ?? 30000));
@@ -10038,11 +10107,26 @@ async function main() {
     // "发送完成 → 这里"之间到达，beforeSeq 读到的已经是新值，那批消息全被漏掉。
     // 实测 13:23:09 的日志就是 `arrived=false waitedMs=7011 lastUnreadSeq=92 unread=1`
     // —— unread 里躺着一条，却被判成"没来新消息"。
-    const seenAtStart = new Set(
-      (Array.isArray(st.unread) ? st.unread : [])
-        .map((m) => (m && Number.isSafeInteger(m.seq) ? m.seq : null))
-        .filter((s) => s !== null)
-    );
+    //
+    // 2026-11-17 修（操作者实测）：**逐条发送那几秒是盲区**。
+    // 她一次发 N 条数组时，sendMessagesV2 要按数组间隔逐条发（1~3 秒/条），
+    // 3 条就是 5~10 秒。那期间对方说的话已经进了 unread，但本函数还没被调用，
+    // 等它拍快照时那些消息已经算"已有未读"→ 不会被当成 fresh → 不给她。
+    // 实测 session-772b7a56：20:53:50 调用发送，20:54:01 才开始观望，
+    // 中间 11 秒的操作者消息全进了盲区。
+    //
+    // 所以调用方要在**发送之前**拍好快照传进来（opts.snapshotBeforeSend），
+    // 用那一刻的 unread 集合做基线 —— 发送期间和观望期间到达的都算 fresh。
+    const seenAtStart = opts.snapshotBeforeSend instanceof Set
+      ? opts.snapshotBeforeSend
+      : new Set(
+        (Array.isArray(st.unread) ? st.unread : [])
+          .map((m) => (m && Number.isSafeInteger(m.seq) ? m.seq : null))
+          .filter((s) => s !== null)
+      );
+    if (opts.snapshotBeforeSend instanceof Set) {
+      log(`[pace] ${key} 使用发送前快照（覆盖逐条发送期间的盲区）基线=${seenAtStart.size} 条`);
+    }
     log(`[pace] ${key} 开始观望 waitMs=${waitMs} 已有未读=${seenAtStart.size}`);
     // ⚠️ 2026-11-14：这里也改成「安静窗」语义，与 mark_read 完全一致。
     // 原来的 waitMs 只当总预算用，而且见第一条消息就返回 —— 她刚说完话、对方
@@ -10074,7 +10158,7 @@ async function main() {
     observingKeys.add(observeStamp);
     let ob;
     try {
-      ob = await observeBeforeSleepV2(st, key, waitMs, { quietMs, hardCapMs });
+      ob = await observeBeforeSleepV2(st, key, waitMs, { quietMs, hardCapMs, seenAtStart });
     } finally {
       observingKeys.delete(observeStamp);
     }
@@ -10084,6 +10168,11 @@ async function main() {
     let maxSeq = 0;
     if (ob?.arrived) {
       // 只取观望期间**新出现**的那几条（不在开始时快照里的）。
+      //
+      // ⚠️ 2026-11-17 修：如果调用方传了 `snapshotBeforeSend`，用它代替
+      // 这里自己拍的那份快照。原因见函数头 —— 逐条发送那几秒是盲区，
+      // 那期间到达的消息既不在"发送前"的快照里、也不该被当成"观望期间的"，
+      // 用发送前的快照才能把它们一起捞回来。
       const fresh = (Array.isArray(st.unread) ? st.unread : [])
         .filter((m) => m && Number.isSafeInteger(m.seq) && !seenAtStart.has(m.seq));
       if (fresh.length) {
@@ -13349,11 +13438,19 @@ async function main() {
       opts.hardCapMs === undefined ? budget + quietMs : Number(opts.hardCapMs) || 0));
     if (!budget && !quietMs) return Promise.resolve({ arrived: false, waitedMs: 0, fresh: [] });
     // 快照：观望开始的那一刻，unread 里都已经有谁。
-    const seenAtStart = new Set(
-      (Array.isArray(st.unread) ? st.unread : [])
-        .map((m) => (m && Number.isSafeInteger(m.seq) ? m.seq : null))
-        .filter((s) => s !== null)
-    );
+    //
+    // ⚠️ 2026-11-17：调用方可以传 `opts.seenAtStart` 覆盖它 —— 用于"发送前就该算基线"
+    // 的场景（qq_send_message 调 paceAfterSendV2 时，逐条发送那几秒是盲区）。
+    // 原先这里无条件自己拍，于是上层传进来的更早基线被**静默覆盖**：
+    // paceAfterSendV2 就算正确传了 snapshotBeforeSend，进来也会被这份重拍顶掉，
+    // 表现为"修了却没用"。两处必须用同一份基线。
+    const seenAtStart = opts.seenAtStart instanceof Set
+      ? opts.seenAtStart
+      : new Set(
+        (Array.isArray(st.unread) ? st.unread : [])
+          .map((m) => (m && Number.isSafeInteger(m.seq) ? m.seq : null))
+          .filter((s) => s !== null)
+      );
     const startedAt = Date.now();
     // 最后一条「新消息」到达的观测时刻；0 表示观望期间还没来过新消息。
     let lastNewAt = 0;

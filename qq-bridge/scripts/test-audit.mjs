@@ -72,6 +72,11 @@ const tests = [
   // test-double-bootstrap —— 那两个断言的是 bootstrapSent 的组级置位，
   // 而 bootstrapSent 现在只管【初始提示词】，不再决定那两句提示）。
   'test-cold-start-sharing.mjs',
+  // 多条数组「逐条发送」期间的盲区（2026-11-17 操作者实测）：
+  // sendMessagesV2 按数组间隔逐条发，3 条约 5~10 秒，那期间对方说的话
+  // 既不算"观望期间新到"、也不会被带回去。修法是发送前拍快照当基线，
+  // 并且 observeBeforeSleepV2 不能自己再拍一份把它覆盖掉。
+  'test-send-observe-gap.mjs',
   // 令牌账本 / 价目表 与 体检修复回归（纯函数，无外部依赖）
   'test-token-usage.mjs', 'test-hardening.mjs',
   // 语音发送（纯函数 + 端点存在性；真发语音只在 --live 或 CLI 里做）
