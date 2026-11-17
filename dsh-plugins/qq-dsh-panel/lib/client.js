@@ -1255,7 +1255,20 @@ window.__ModuleLoader__.load({
   function renderTab() {
     if (!modal) return
     var d = mState.data
-    if (!d || d.ok === false) {
+    // ── 诊断页的 `ok` 是「自检全部通过」，不是「请求成功」 ────────────────────
+    //
+    // ⚠️ 这里踩过一次真实的坑：诊断接口在**任何一项检查不通过**时也会返回
+    //    `ok:false`（那是它的正常语义 —— 「有项目没通过」），而下面这个大分支
+    //    本意是处理「请求失败 / 桥接没响应」。
+    //
+    //    两者一混，后果是：只要有一项自检红（比如 preset 没装），诊断页就整个
+    //    被这张「读不到数据」的兜底卡接管，真正拿到的 6 项检查结果被直接丢掉。
+    //    用户看到的是「诊断还是有问题」—— 明明数据是全的，只是被拦在渲染这一层。
+    //
+    //    判据改成「有没有 checks 数组」：有就是一份可渲染的诊断结论，交给
+    //    renderDiagnoseTab 去决定怎么显示红项。
+    var diagWithChecks = mState.tab === 'diagnose' && d && Array.isArray(d.checks)
+    if ((!d || d.ok === false) && !diagWithChecks) {
       var errNodes = [
         h('div', 'dsh-fb-empty', '读不到数据'),
         h('div', 'dsh-fb-warn', (d && d.error) || '未知错误（桥接可能没有运行）'),
@@ -2590,11 +2603,18 @@ window.__ModuleLoader__.load({
   function renderDiagnoseTab(d) {
     var checks = Array.isArray(d.checks) ? d.checks : []
     var rows = []
+    var failed = 0
     for (var i = 0; i < checks.length; i++) {
       var c = checks[i]
+      if (c.ok !== true) failed += 1
       rows.push(statusLine(c.name + (c.detail ? '：' + c.detail : ''), c.ok === true))
     }
-    var nodes = [section(d.ok ? '自检全部通过' : '自检发现问题', rows)]
+    // 标题说清楚「几项没过」，而不是笼统的「发现问题」—— 这样一眼就知道
+    // 是完全连不上（全红）还是只有一项没配好（一红五绿）。
+    var title = failed === 0
+      ? '自检全部通过'
+      : (failed === checks.length ? '自检全部未通过' : `自检有 ${failed} 项未通过（共 ${checks.length} 项）`)
+    var nodes = [section(title, rows)]
     // 端点对齐的结论：端口漂移是这类故障最常见的原因，明说「这轮做了什么」
     // 比让人去翻 bridge.log 快得多。只在真的发生过动作时显示，正常时保持安静。
     var es = d.endpointSync
