@@ -14227,8 +14227,31 @@ async function main() {
       return false;
     };
     if (v2ToolEnabled('getUnread')) {
-      // Oldest unread first: a budget cutoff must not silently acknowledge unseen messages.
-      for (const msg of st.unread.slice(0, maxUnread)) if (!tryAdd('messages', msg)) break;
+      // ── 2026-11-19 操作者要求：**给最新的 N 条**，不是最旧的 N 条 ────────
+      //
+      // 原实现 `slice(0, maxUnread)` 取最旧的 12 条，导致 #189~#200（6 小时前）
+      // 出现在唤醒包里，而 #218（19 秒前）被截掉 —— 她看不到刚发生的事。
+      //
+      // 现在取**最新**的 maxUnread 条。代价是中间会留一段空洞，所以：
+      //   ① `partial` 保持 true；
+      //   ② **水位必须停在"上一轮读到的那条"**（st.lastReadThroughSeq），
+      //      绝不能变成这批最大的 seq —— 否则空洞那段会被当成已读、永久丢失。
+      //      她调 qq_get_unread_messages(afterSeq=水位) 就能从空洞第一条开始补
+      //      （工具本身有 100 条上限，足够）。
+      //
+      // ⚠️ 这里不能用 `unread[startIdx - 1].seq` 当水位：那条**没给她看过**，
+      //    拿它当"已读"等于替她确认了没读的内容。只能用她真正读过的那条。
+      const total = st.unread.length;
+      const startIdx = Math.max(0, total - maxUnread);
+      const window = st.unread.slice(startIdx);
+      // 先记下"她真正读过哪儿"：这是唯一安全的水位基线。
+      const baseThrough = Number.isSafeInteger(st.lastReadThroughSeq) ? st.lastReadThroughSeq : 0;
+      for (const msg of window) if (!tryAdd('messages', msg)) break;
+      if (startIdx > 0) {
+        // 有空洞：水位退回上一轮读到的位置，让 afterSeq 能补上中间那批。
+        packet.readThroughSeq = baseThrough;
+        packet.partial = true;
+      }
     }
     if (v2ToolEnabled('getRecent') && maxRecent > 0) {
       const unread = new Set(st.unread.map((m) => m.seq));
@@ -14379,7 +14402,7 @@ async function main() {
           .map((v) => Number(v))
           .filter((v) => Number.isSafeInteger(v) && v >= 0);
         const fromSeq = throughs.length ? Math.min(...throughs) : 0;
-        out.push(`（还有消息没显示，用 qq_get_unread_messages(afterSeq=${fromSeq}) 继续看）`);
+        out.push(`（前面还有没显示的消息，用 qq_get_unread_messages(afterSeq=${fromSeq}) 往前补看）`);
       }
       return out.join('\n');
     }
@@ -14395,7 +14418,9 @@ async function main() {
       for (const m of recent) out.push(one(m));
     }
     if (snapshot.partial) {
-      out.push(`（还有消息没显示，用 qq_get_unread_messages(afterSeq=${snapshot.readThroughSeq}) 继续看）`);
+      // 2026-11-19：现在贴的是**最新**若干条，所以缺口在**中间/前面**，
+      // 不是"后面还有"。文案要说清楚，否则她会以为最新消息还没到。
+      out.push(`（前面还有没显示的消息，用 qq_get_unread_messages(afterSeq=${snapshot.readThroughSeq}) 往前补看）`);
     }
     return out.join('\n');
   }

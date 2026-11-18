@@ -272,16 +272,21 @@ await test('普通查询不能把已确认水位降到更低的旧值', async ({
 
 // ── 四、快照预算（内部结构，不经 HTTP）──────────────────────────────────
 
-await test('预算内的快照保留整条最旧消息', async ({ h, st, append }) => {
+// 2026-11-19 操作者改了口径：唤醒包给**最新**的 N 条，不是最旧的。
+// 原实现给最旧的，导致「6 小时前的闲聊在、19 秒前的消息被截掉」。
+await test('预算内的快照保留**最新**的整条消息', async ({ h, st, append }) => {
   h.cfg.socialV2.context.wakeMessageLimit = 2;
   h.cfg.socialV2.context.wakeRecentLimit = 0;
   append('first'); append('second'); append('third');
   const snapshot = h.buildWakeSnapshotV2(KEY);
-  assert.deepEqual(seqs(snapshot.messages), [1, 2]);
+  // 最新 2 条 = #2、#3
+  assert.deepEqual(seqs(snapshot.messages), [2, 3]);
   assert.equal(snapshot.includedUnreadCount, 2);
   assert.equal(snapshot.unreadCount, 3);
   assert.equal(snapshot.partial, true);
-  assert.equal(snapshot.readThroughSeq, 2);
+  // ⚠️ 水位必须停在**上一轮读到的位置**（这里从没读过 = 0），不能是 3：
+  // 那会把 #1 当成已读，让它永久丢失。
+  assert.equal(snapshot.readThroughSeq, 0);
   assert.ok(JSON.stringify(snapshot).length <= h.cfg.socialV2.context.wakeMaxChars);
   assert.deepEqual(seqs(st.unread), [1, 2, 3], '快照只读不写：未读原样保留');
 });
