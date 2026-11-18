@@ -99,6 +99,10 @@ const tests = [
   // 原来 recordSentMessagesV2 写 `time: now + i * 1000` 伪造，
   // 于是历史里她的消息永远相隔正好 1 秒，操作者从时间戳看出「间隔巨短」。
   'test-sent-timestamp.mjs',
+  // qq_send_message 不再暴露 gapMode/gapMs/gaps（2026-11-19）：
+  // 那是可选 enum，第一个值是 auto，模型会顺手填 —— 而桥接不传就是 auto，
+  // 这三个参数对她完全多余。桥接侧仍接受（兼容手写 HTTP 调用）。
+  'test-send-no-gap-params.mjs',
   // 令牌账本 / 价目表 与 体检修复回归（纯函数，无外部依赖）
   'test-token-usage.mjs', 'test-hardening.mjs',
   // 控制台静态契约（跑不了 Playwright 的环境下的替代回归）

@@ -970,15 +970,22 @@ server.tool(
     messages: z.union([z.string(), z.array(z.string()).min(1)]).describe('要发送的内容：字符串=一条；数组=分多条。**单次条数有上限**（面板「单次最多几条」，默认 3），超了整次调用会被拒绝（一条都发不出去）；要发更多请再调一次并传 noWait:true'),
     replyToMessageId: z.union([z.number(), z.string()]).optional().describe('要引用/回复的消息 id（非零整数，可为负数，可选）'),
     atUserId: z.union([z.number(), z.string()]).optional().describe('要 @ 的群成员 QQ 号（群聊中用于点名某个人；与引用二选一即可，不要滥用）'),
-    gapMode: z.enum(['auto', 'fixed', 'byLength']).optional().describe('auto=桥接随机；fixed=固定间隔；byLength=按字数计算'),
-    gapMs: z.number().optional().describe('fixed 模式下的统一间隔（毫秒）'),
-    gaps: z.array(z.number()).optional().describe('fixed 模式下逐条间隔（长度=条数-1）'),
+    // 2026-11-19 删掉 gapMode / gapMs / gaps 三个参数。
+    //
+    // 原因：操作者发现她会传 `"gapMode": "auto"` —— 因为 enum 的第一个值就是它，
+    // 模型看到可选枚举往往顺手填第一个。但**桥接侧不传就是 auto**
+    //（见 bridge.js: `(body.gapMode === 'fixed' || ...) ? body.gapMode : 'auto'`），
+    // 所以这三个参数对她完全多余，只会占 schema 空间、诱导无意义的传参。
+    // 句间节奏由面板的「条间最短/最长间隔」控制，不需要她每次指定。
+    //
+    // 桥接端点仍然接受这三个字段（手写 HTTP 调用或旧客户端可能用），
+    // 只是不再暴露给模型。
     // 2026-11-19：连发用。默认发完要停下来等一会儿（观察对方有没有接话），
     // 急着接着发第二段时传 true —— 只等"最后一句之后那一截"（和句与句之间
     // 同一套随机间隔），然后立刻返回，因此可以马上再调一次本工具。
     noWait: z.boolean().optional().describe('true=发完只等句末那一小段就返回，方便紧接着再发一次')
   },
-  async ({ key, token, messages, replyToMessageId, atUserId, gapMode, gapMs, gaps, noWait }) => {
+  async ({ key, token, messages, replyToMessageId, atUserId, noWait }) => {
     try {
       let finalMessages = messages;
       if (typeof finalMessages === 'string') {
@@ -1000,7 +1007,9 @@ server.tool(
       }
       const data = await agentApi('/api/socialV2/send-message', {
         method: 'POST',
-        body: JSON.stringify({ key, messages: finalMessages, replyToMessageId, atUserId: atUserId ?? null, gapMode, gapMs, gaps, noWait: noWait === true }),
+        // 2026-11-19：不再传 gapMode/gapMs/gaps —— 桥接不传就是 auto，
+        // 句间节奏由面板的「条间最短/最长间隔」决定。
+        body: JSON.stringify({ key, messages: finalMessages, replyToMessageId, atUserId: atUserId ?? null, noWait: noWait === true }),
         headers: { 'x-agent-token': token },
         timeoutMs: 300000
       });
