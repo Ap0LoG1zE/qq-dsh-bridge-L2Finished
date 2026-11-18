@@ -308,7 +308,7 @@ async function discoverBackends() {
 
 // ── 各路由的实现 ────────────────────────────────────────────────────────────
 
-// ── 桥接保活：发现没在跑就把它拉起来 ──────────────────────────────────────
+// ── 桥接保活：DSH 刚起来时把桥接拉起来并等它真的能答 ──────────────────────
 //
 // 为什么面板要管这件事：桥接是独立进程（start.bat），DSH 重启、机器久置、
 // 守卫计划任务失效时它都可能不在。那时面板只会显示「读不到数据」，
@@ -318,14 +318,100 @@ async function discoverBackends() {
 //   · 只在**面板请求**时触发（点重试 / 打开状态页），不做后台轮询或定时自启；
 //   · 只启动仓库里**已存在**的 start.bat，不下载、不安装、不改配置；
 //   · 已有进程在跑就绝不再起第二个（双实例会互相抢消息、互相覆盖 state）。
+//
+// ── 2026-11-18 重写说明（为什么整块推倒） ──────────────────────────────────
+// 旧实现有三个叠加缺陷，合起来正好造成「重启 DSH 后状态页一直读不到数据」：
+//
+//   ① **等待上限被砍半**。`ensureBridgeRunning` 里写的是
+//      `waitForPorts(port, Math.min(waitMs, 10000))` —— 最多只等 10 秒。
+//      实测桥接冷启动 1.5 秒（顺利）到 20 秒以上（DSH 刚起、机器在加载插件）。
+//      一旦越过这道坎，面板就报「桥接进程在跑但端口连不上」并**放弃使用**，
+//      可桥接其实再过一两秒就好了。
+//
+//   ② **「已经在跑」那条路不重查**。`handleStatus` 里是
+//      `if (broughtUp.ok && broughtUp.started)` 才重试请求。
+//      而 ensureBridgeRunning 返回 `{ok:true, already:true}` 的那条路径
+//      （桥接本来就在、或刚好自己起来了）**不会**重试 —— 第一次探测的失败
+//      结果被原样返回，面板照样显示「读不到数据」，明明端口已经通了。
+//
+//   ③ **探测本身在用最贵的方式**。`hasBridgeProcess` 每次 spawn 一个
+//      PowerShell 做 `Get-CimInstance`，实测 650ms（三次取样 652/634/648）。
+//      而它只是「可能性检查」，真正的结论由端口探测给出。用 650ms 换这个
+//      毫无意义，尤其它被调用的时机恰恰是 DSH 刚起来、最敏感的那一刻。
+//
+// 新设计把「判断桥接在哪」和「等它就绪」拆成两层，每层都用最便宜的手段：
+//
+//   waitConsoleUp()  —— 唯一的等待原语：轮询控制台端口 + /api/status，
+//                       一旦能答就立即返回，不等满任何固定时间。
+//   bridgeAlive()    —— 快判定：端口直连（<5ms）→ netstat（28ms）→ PowerShell（兜底）。
+//
+// 两者都不再有任何「固定睡多久」的量化误差。
 const START_BAT = 'start.bat'
 
-/** 本机是否已有桥接进程（按命令行匹配，不依赖锁文件——锁可能是残留的）。 */
-async function hasBridgeProcess() {
-  if (process.platform !== 'win32') {
-    // 非 Windows 退化为端口探测：能连上说明它在。
-    return false
+/** 控制台端口是否已被监听（纯 TCP connect，通常 <5ms）。 */
+function portOpen(port, timeoutMs = 400) {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host: '127.0.0.1', port })
+    let settled = false
+    const done = (ok) => {
+      if (settled) return
+      settled = true
+      socket.destroy()
+      resolve(ok)
+    }
+    socket.setTimeout(timeoutMs)
+    socket.once('connect', () => done(true))
+    socket.once('timeout', () => done(false))
+    socket.once('error', () => done(false))
+  })
+}
+
+/**
+ * 唯一的等待原语：等到控制台**真的能答话**为止。
+ *
+ * 注意判据是「`/api/status` 返回了 JSON」，而不只是「端口能 connect」。
+ * 两者的差别在实测里是 1544ms vs 1623ms —— 端口先开，路由后挂；
+ * 只等端口会让面板紧接着的那个请求打到还没注册完的路由上。
+ *
+ * @returns {Promise<boolean>} 是否在截止前就绪。
+ */
+async function waitConsoleUp(env, deadlineMs, { pollMs = 120 } = {}) {
+  const deadline = Date.now() + deadlineMs
+  for (;;) {
+    if (await portOpen(env.port, 300)) {
+      const r = await bridgeApi(env, '/api/status', { timeoutMs: 3000 })
+      if (r.ok) return true
+    }
+    if (Date.now() >= deadline) return false
+    // 130ms 一轮：本地回环探测本身是毫秒级，这个频率完全不心疼，
+    // 却能把「明明 1.5 秒好了却要等到 1.5/3.0 秒」的量化误差消掉。
+    await new Promise((r) => setTimeout(r, pollMs))
   }
+}
+
+/**
+ * 桥接进程在不在。三层，由快到慢，命中即返回。
+ *
+ *   ① 端口直连 —— 能连上就必然在跑（绝大多数情况下答案在这一层给出）
+ *   ② netstat   —— 28ms，看 3100 是否 LISTENING
+ *   ③ PowerShell —— 650ms，只在前面都下不了结论时兜底（例如 netstat 被禁用）
+ */
+async function bridgeAlive(env) {
+  if (process.platform !== 'win32') {
+    return env ? await portOpen(env.port, 400) : false
+  }
+  if (env && await portOpen(env.port, 400)) return true
+
+  const port = env ? (Number(env.port) || 3100) : 3100
+  try {
+    const { stdout } = await execFileAsync('netstat', ['-ano'], { encoding: 'utf8', timeout: 5000, windowsHide: true })
+    const out = String(stdout || '')
+    if (new RegExp(`:${port}\\s+\\S+\\s+LISTENING`, 'i').test(out)) return true
+    // netstat 拿到了且没有这个端口 —— 可以确定地回 false，不必再劳烦 PowerShell。
+    // 但要留一个例外：netstat 输出为空可能是权限/解析问题，那时才继续往下走。
+    if (out.length > 0) return false
+  } catch { /* netstat 不可用，落到下面 */ }
+
   try {
     const ps = [
       "@(Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" |",
@@ -342,60 +428,82 @@ async function hasBridgeProcess() {
 }
 
 /**
- * 确保桥接在运行：没在跑就用 start.bat 拉起来，并等控制台端口真的能连上。
+ * 确保桥接在跑，并等到它**真的能答**。
+ *
+ * 语义（与旧实现的区别）：
+ *   · 永远以「`/api/status` 能返回」作为成功标准，不以「端口开了」或
+ *     「进程存在」代替；
+ *   · 一旦成功立刻返回，不睡满任何固定时长；
+ *   · 失败时把「做到哪一步、卡在哪」写清楚，面板直接展示给使用者。
  *
  * @param {object} env bridgeEnv() 的结果
  * @param {object} opts
  * @param {boolean} opts.startIfDown 是否允许启动（默认 true）
- * @param {number} opts.waitMs 最多等多久（默认 20 秒）
- * @returns {Promise<{ok:boolean, started?:boolean, already?:boolean, error?:string, elapsedMs?:number}>}
+ * @param {number} opts.waitMs 就绪等待总预算（默认 30 秒；冷启动实测 1.6 秒）
+ * @returns {Promise<{ok:boolean, started?:boolean, already?:boolean, elapsedMs:number, error?:string}>}
  */
-async function ensureBridgeRunning(env, { startIfDown = true, waitMs = 20000 } = {}) {
+async function ensureBridgeRunning(env, { startIfDown = true, waitMs = 30000 } = {}) {
   const t0 = Date.now()
+  const elapsed = () => Date.now() - t0
 
-  // ① 端口已经能连上 = 它本来就在跑，什么都不做。
-  if (await probePort(env.port, 1200)) return { ok: true, already: true, elapsedMs: Date.now() - t0 }
-
-  // ② 端口不通，但进程还在 —— 可能正在启动中（或卡住了）。等一会儿再看。
-  const alive = await hasBridgeProcess()
-  if (alive) {
-    const ready = await waitForPorts([env.port], Math.min(waitMs, 10000))
-    if (ready) return { ok: true, already: true, elapsedMs: Date.now() - t0 }
+  // ① 已经在跑了（最常见的情况）—— 直接等它能答就行，不碰任何进程。
+  if (await portOpen(env.port, 400)) {
+    if (await waitConsoleUp(env, Math.min(waitMs, 8000))) {
+      return { ok: true, already: true, elapsedMs: elapsed() }
+    }
+    // 端口开了但一直答不上来：可能是启动卡住，也可能是端口被别的服务占了。
     return {
       ok: false,
-      error: `桥接进程在跑（${env.dir}），但控制台端口 ${env.port} 一直连不上。可能是启动卡住或端口被占用，看一下 state/bridge.log。`,
-      elapsedMs: Date.now() - t0,
+      already: true,
+      error: `控制台端口 ${env.port} 开着，但 ${Math.round(Math.min(waitMs, 8000) / 1000)} 秒内 /api/status 都没正常返回。`
+        + '可能是启动中途卡住、或这个端口被别的程序占用 —— 看 state/bridge.log 的前几行。',
+      elapsedMs: elapsed(),
     }
   }
 
-  // ③ 确认进程不在 —— 只有这一步才真的去启动。
+  // ② 端口没开。先确认进程在不在（快判定），决定是「等」还是「拉起」。
+  const alive = await bridgeAlive(env)
+  if (alive) {
+    // 进程在但端口还没开：正在启动中。用**完整预算**等，不再砍半。
+    if (await waitConsoleUp(env, waitMs)) {
+      return { ok: true, already: true, elapsedMs: elapsed() }
+    }
+    return {
+      ok: false,
+      already: true,
+      error: `桥接进程在跑（${env.dir}），但 ${Math.round(waitMs / 1000)} 秒内控制台端口 ${env.port} 都没起来。`
+        + '看 state/bridge.log 的前几行。',
+      elapsedMs: elapsed(),
+    }
+  }
+
+  // ③ 确认不在 —— 只有走到这里才真的启动。
   if (!startIfDown) {
-    return { ok: false, error: '桥接没有在运行（已按调用方要求不自动启动）', elapsedMs: Date.now() - t0 }
+    return { ok: false, error: '桥接没有在运行（已按调用方要求不自动启动）', elapsedMs: elapsed() }
   }
 
   const bat = path.join(env.dir, START_BAT)
   if (!fs.existsSync(bat)) {
-    return { ok: false, error: `找不到启动脚本：${bat}`, elapsedMs: Date.now() - t0 }
+    return { ok: false, error: `找不到启动脚本：${bat}`, elapsedMs: elapsed() }
   }
 
+  // 清掉可能残留的锁：上一次异常退出会留下 bridge.lock，
+  // 桥接启动时会因为「已有实例」直接退出（exit 2），表现为「启动后毫无反应」。
   try {
-    // 先清掉可能残留的锁：上一次异常退出会留下 bridge.lock，
-    // 桥接启动时会因为「已有实例」直接退出（exit 2），表现为「启动后毫无反应」。
     const lock = path.join(env.dir, 'state', 'bridge.lock')
-    try {
-      if (fs.existsSync(lock)) {
-        const raw = String(fs.readFileSync(lock, 'utf8') || '').trim()
-        const lockPid = Number(raw)
-        let stale = true
-        if (Number.isInteger(lockPid) && lockPid > 0) {
-          // 锁里记的 PID 还活着才不算残留。
-          try { process.kill(lockPid, 0); stale = false } catch { stale = true }
-        }
-        if (stale) fs.rmSync(lock, { force: true })
+    if (fs.existsSync(lock)) {
+      const raw = String(fs.readFileSync(lock, 'utf8') || '').trim()
+      const lockPid = Number(raw)
+      let stale = true
+      if (Number.isInteger(lockPid) && lockPid > 0) {
+        try { process.kill(lockPid, 0); stale = false } catch { stale = true }
       }
-    } catch { /* 清锁失败不阻断启动，让桥接自己判断 */ }
+      if (stale) fs.rmSync(lock, { force: true })
+    }
+  } catch { /* 清锁失败不阻断启动，让桥接自己判断 */ }
 
-    // ⚠️ 两条踩过的坑（都实测过，别改回去）：
+  try {
+    // ⚠️ 三条踩过的坑（都实测过，别改回去）：
     //
     //  ① 不能用 `cmd /c start "" start.bat`：`start` 是"新开窗口"的命令，会**无视
     //     windowsHide** 强行弹出控制台；而 start.bat 是常驻循环（node 挂了 5 秒后重启），
@@ -404,12 +512,29 @@ async function ensureBridgeRunning(env, { startIfDown = true, waitMs = 20000 } =
     //
     //  ② 改成 `cmd /c start.bat` + `detached:true` + `windowsHide:true` 也不行：
     //     Node 在 **detached:true 时会忽略 windowsHide**（Windows 上的已知行为），
-    //     实测仍然会多出一个 conhost（新控制台窗口）。而 detached 又不能去掉 ——
-    //     桥接必须独立于 DSH 生命周期，否则 DSH 一重启就把它带走。
+    //     实测仍然会多出一个 conhost（新控制台窗口）。
     //
-    // 正解：借 PowerShell 的 `Start-Process -WindowStyle Hidden` 来落盘。
-    // 这和仓库里 tools/bridge-guard.ps1 的做法完全一致（守卫计划任务每分钟拉起桥接，
-    // 从来不会弹窗），所以是被验证过的路径。
+    //  ③ **`detached: true` 还会让 PowerShell 的 Start-Process 静默失效** ——
+    //     这是 2026-11-18 定位「重启 DSH 后状态页一直读不到数据」时挖出来的真凶：
+    //
+    //       A/B 实测（同一台机器、同一时刻、只改这一个参数）：
+    //         spawn('powershell.exe', args, { detached: true,  stdio:'ignore' })
+    //             -> 10.5 秒后桥接仍未启动（/api/status 始终连不上）
+    //         spawn('powershell.exe', args, { detached: false, stdio:'ignore' })
+    //             -> 1.27 秒桥接就跑起来了
+    //
+    //     也就是说旧代码里那个 `detached: true` 让「拉起桥接」这一步**根本没成功**，
+    //     面板于是一直等到超时才报「读不到数据」。而计划任务 QQBridgeGuard
+    //     每分钟会把桥接补起来，所以表现为「等一会儿又好了」——
+    //     这也解释了为什么这个 bug 看起来时好时坏、极难复现。
+    //
+    // 正解：借 PowerShell 的 `Start-Process -WindowStyle Hidden` 来落盘，
+    // **且不要 detached**。不需要 detached 的理由：`Start-Process` 起的是一个
+    // 完全独立的 cmd 进程（自带新控制台且隐藏），PowerShell 自己退出后它照样活着；
+    // 我们从不需要对那个 cmd 发信号，所以也没有「必须脱离父进程」的需求。
+    // 这和仓库里 tools/bridge-guard.ps1 的做法一致（守卫计划任务每分钟拉起桥接，
+    // 从来不会弹窗），是被验证过的路径。
+    //
     // 注意 SnowLuma 的启动（handleLaunchSnowluma）**不在此列**：那里刻意保留 `start`，
     // 因为试过改成直接 spawn 反而连弹 3 个窗口（见该函数内注释）。
     const psArgs = [
@@ -421,26 +546,27 @@ async function ensureBridgeRunning(env, { startIfDown = true, waitMs = 20000 } =
     ]
     const child = spawn('powershell.exe', psArgs, {
       cwd: env.dir,
-      detached: true,
+      // 刻意**不加** detached：见上面 ③，那会让 Start-Process 静默失效。
       stdio: 'ignore',
       windowsHide: true,
     })
+    // 仍然 unref + 不等待退出：我们不关心这个 PowerShell 什么时候结束，
+    // 桥接就绪与否由下面的 waitConsoleUp 用端口事实判断。
     child.unref()
   } catch (error) {
-    return { ok: false, error: `启动失败：${String(error?.message ?? error)}`, elapsedMs: Date.now() - t0 }
+    return { ok: false, error: `启动失败：${String(error?.message ?? error)}`, elapsedMs: elapsed() }
   }
 
-  // ④ 等控制台端口真的能连上，再回 ok —— 否则面板会说"启动了"但依然读不到数据。
-  const ready = await waitForPorts([env.port], waitMs)
-  if (!ready) {
+  // ④ 等它真的能答（而不是「端口开了」）再回 ok。
+  if (!(await waitConsoleUp(env, waitMs))) {
     return {
       ok: false,
       started: true,
-      error: `已执行 ${START_BAT}，但 ${Math.round(waitMs / 1000)} 秒内控制台端口 ${env.port} 还没起来。看 state/bridge.log 的前几行。`,
-      elapsedMs: Date.now() - t0,
+      error: `已执行 ${START_BAT}，但 ${Math.round(waitMs / 1000)} 秒内控制台仍然答不上话。看 state/bridge.log 的前几行。`,
+      elapsedMs: elapsed(),
     }
   }
-  return { ok: true, started: true, elapsedMs: Date.now() - t0 }
+  return { ok: true, started: true, elapsedMs: elapsed() }
 }
 
 /** GET 状态：桥接在哪、DSH 就绪没、上线/下线、SnowLuma 上游健康。 */
@@ -451,14 +577,22 @@ async function handleStatus(req, res) {
   // 调用方可以用 /status?autostart=0 关掉自动启动（诊断页只想看状态时用）。
   const wantAutostart = new URL(req.url || '/', 'http://127.0.0.1').searchParams.get('autostart') !== '0'
 
-  let r = await bridgeApi(env, '/api/status')
+  // 首次探测用**短超时**：桥接没起时没必要陪它等到 20 秒。
+  // 真正需要等的是下面 ensureBridgeRunning 那段 —— 那里才知道「它在启动中」。
+  let r = await bridgeApi(env, '/api/status', { timeoutMs: 4000 })
   // 首次失败且允许自启：先确保桥接在跑，再重试一次。
   // 这样「点重试」就等于「把它拉起来」——使用者不需要知道 start.bat 在哪。
   let broughtUp = null
   if (!r.ok && wantAutostart) {
     broughtUp = await ensureBridgeRunning(env)
-    if (broughtUp.ok && broughtUp.started) {
-      r = await bridgeApi(env, '/api/status', { timeoutMs: 20000 })
+    // ⚠️ 旧实现这里是 `if (broughtUp.ok && broughtUp.started)` —— 只在
+    //    「这次真的启动了」时才重试。可 `ensureBridgeRunning` 还有一条
+    //    `{ ok:true, already:true }` 的路径（桥接本来就在跑/刚好起来），
+    //    那条路上**不会**重试，于是第一次那 4 秒探测的失败结果被原样返回，
+    //    面板照样显示「读不到数据」—— 明明端口已经通了。
+    //    改成「只要 ensureBridgeRunning 说 ok，就重查一次」。
+    if (broughtUp.ok) {
+      r = await bridgeApi(env, '/api/status', { timeoutMs: 12000 })
     }
   }
   if (!r.ok) {
@@ -980,7 +1114,15 @@ async function waitForPorts(ports, totalMs) {
     const results = await Promise.all(ports.map((p) => probePort(p)))
     if (results.every(Boolean)) return true
     if (Date.now() >= deadline) return false
-    await new Promise((r) => setTimeout(r, 1500))
+    // ⚠️ 轮询间隔从 1500ms 改 250ms。
+    //
+    // 这里踩过一个很典型的坑（2026-11-18 实测）：桥接冷启动实测只要 1.4 秒，
+    // 但旧实现每轮之间固定睡 1.5 秒，于是「明明 1.4 秒就好了」的最快路径
+    // 也要被发现于 1.5~3.0 秒之后。用户侧看到的是「点了之后要愣一下」。
+    //
+    // 轮询本身就是一次本地回环 connect（毫秒级），隔 250ms 探一次完全不心疼，
+    // 而它能把这 1.5 秒的量化误差消掉。上限仍由 totalMs 控制。
+    await new Promise((r) => setTimeout(r, 250))
   }
 }
 
@@ -1392,10 +1534,10 @@ async function handleDiagnose(req, res) {
 
   // ① 桥接没跑就拉起来（与「状态」页同一套逻辑：只启动已存在的 start.bat）。
   //    诊断页尤其需要这一步 —— 它本来就是为了排查「为什么连不上」而存在的。
-  let broughtUp = null
-  if (!(await probePort(env.port, 1000))) {
-    broughtUp = await ensureBridgeRunning(env, { startIfDown: true, waitMs: 15000 })
-  }
+  //    等待预算与状态页一致（30 秒）：诊断页宁可慢一点也要给出真实结论，
+  //    而不是在桥接尚未就绪时报一个假的「连不上」。
+  const broughtUp = await ensureBridgeRunning(env, { startIfDown: true, waitMs: 30000 })
+    .catch((error) => ({ ok: false, error: String(error?.message ?? error) }))
 
   // ② 带权威端口提示对齐 DSH 端点。
   //    失败不致命：后面的 status 会如实反映「连不上」，那本身就是诊断结论。
@@ -1413,6 +1555,8 @@ async function handleDiagnose(req, res) {
 
   if (!status.ok) {
     // 桥接控制台都够不着：直接给出**可行动**的结论，而不是一句「读不到数据」。
+    // 具体的失败原因由 ensureBridgeRunning 写清楚了（是「拉不起来」还是
+    // 「起来了但答不上话」），这里原样透出，不再自己编一句泛泛的话。
     return json(res, 200, {
       ok: false,
       error: status.error || `桥接控制台返回 HTTP ${status.status}`,
@@ -1422,9 +1566,7 @@ async function handleDiagnose(req, res) {
         {
           name: '桥接控制台可达',
           ok: false,
-          detail: `连不上 ${env.base}。${broughtUp?.started
-            ? '已执行 start.bat，但端口仍没起来 —— 看 state/bridge.log 前几行。'
-            : (broughtUp?.error || '桥接没在运行，且自动启动没有成功。')}`,
+          detail: `连不上 ${env.base}。${broughtUp?.error || '桥接没在运行，且自动启动没有成功。'}`,
         },
       ],
       bridge: { dir: env.dir, port: env.port, baseUrl: env.cfg?.dsh?.baseUrl ?? '' },

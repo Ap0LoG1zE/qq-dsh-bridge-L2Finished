@@ -2956,39 +2956,60 @@ window.__ModuleLoader__.load({
   // 球体会孤零零浮在空白页上闪一下，而且那一刻 CSS 变量（--dsw-alias-*）可能还没注入，
   // 球体会先渲染成兜底色。
   //
-  // 判定「就绪」用两个信号，任一满足即可：
-  //   ① body 下出现非空的 #root（DSH 的 React 根，挂载后里面有实际内容）
-  //   ② 距离 apply 已经过了 MAX_WAIT_MS（兜底，绝不允许永远不显示）
-  // 等 DSH 把界面真正渲染出来再挂球体。
+  // ── 为什么不能靠「文案里有没有 loading plugin」判断 ─────────────────────
+  // 旧实现是 `body.innerText.indexOf('loading plugin') !== -1`。这条判据有两个坑，
+  // 而且**两头都会错**（实测 2026-11-18）：
   //
-  // 为什么不能只看 #root 有子元素：DSH 的启动画面（HARNESS / Loading plugins…）
-  // **本身就是 React 渲染进 #root 的**，所以「#root 非空」在加载阶段就已成立，
-  // 球体会照旧浮在加载页上。
+  //   ① 坑一：DSH 的启动提示是**本地化**的。英文环境是 "Loading plugins…"，
+  //      中文界面则是别的话术，于是 `stillLoading()` 恒为 false。
+  //      这时 shellReady() 只剩「元素数 > 60」一条 —— 而启动页本身也能凑够
+  //      60 个元素，于是球会在**界面真正就绪之前**就挂上去。
   //
-  // 可靠的判据是「启动画面消失」：它的文案是固定的 Loading plugins…，
-  // 只要页面里这个字样没了，就说明插件加载完、界面已经接管。
-  // 再配两个兜底，避免文案改动或异常时永远不显示。
+  //   ② 坑二（用户实际遇到的那个）：整个过程最慢的一步是**插件模块加载**，
+  //      而这段判定要等模块执行完才跑得起来。等它跑起来时页面早已就绪，
+  //      所以这条判据对「缩短等待」毫无贡献 —— 真正决定用户等多久的，
+  //      是模块图和主界面渲染，不是这里的轮询。
+  //
+  //      更要命的是旧轮询靠 `setInterval(..., 150)` + 15 秒硬兜底，
+  //      一旦判据因为文案不匹配而永不成立，就**固定等满 15 秒**才显示球。
+  //      用户看到的「等了大概 10 秒」正是这一档。
+  //
+  // 现在的判据改成**结构化、与语言无关**：
+  //   ① 启动卡片消失（DSH 启动页的 root 带 data-dsh-boot 标记，或 body 里还有
+  //      `[data-dsh-boot-spinner]`）—— 这是宿主自己打的标记，不随文案变；
+  //   ② 主界面骨架出现：有 `#root` 且其下元素数超过阈值；
+  //   ③ 上面两条任一成立即可；并且**轮询间隔从 150ms 改 60ms**，
+  //      同时一旦命中就立刻挂球，不再等多一轮。
+  // 仍然保留硬兜底，但压到 5 秒 —— 超过这个时间还没就绪，宁可先显示球
+  // （它只是一个浮球，浮在启动页上也不影响任何操作），也不要让人干等。
   function waitForShell(cb) {
-    var MAX_WAIT_MS = 15000;     // 硬兜底：无论如何 15 秒后显示
-    var MIN_WAIT_MS = 400;       // 起步缓冲：太早查询会拿到空 DOM
+    var MAX_WAIT_MS = 5000;      // 硬兜底：再怎么慢也 5 秒内显示
     var started = Date.now();
     var done = false;
 
-    // 启动画面判定：文本里出现 Loading plugin 字样就还在加载
+    // 启动页是否还在：优先用宿主自己的标记，其次才退回文案（仅英文环境有效）。
     function stillLoading() {
       var body = document.body;
       if (!body) return true;
-      var txt = (body.innerText || '').toLowerCase();
-      return txt.indexOf('loading plugin') !== -1;
+      // 宿主在启动卡片上打的标记（见 asar: dataset.dshBootSpinner）
+      if (body.querySelector('[data-dsh-boot-spinner]')) return true;
+      if (body.querySelector('[data-dsh-boot]')) return true;
+      // 兜底：英文环境下的文案。**不作为唯一依据** —— 中文界面匹配不到，
+      // 靠它判断会出现「永远 loading」或「过早就绪」两种错。
+      var txt = (body.innerText || '')
+      return txt.indexOf('Loading plugins') !== -1
     }
 
-    // 界面接管判定：出现主界面才有的结构
+    // 界面接管判定：主界面骨架已经出现。
     function shellReady() {
-      if (stillLoading()) return false;
-      // DSH 主界面挂载后 body 里会有较多元素；只用数量做个宽松下限
       var body = document.body;
       if (!body) return false;
-      return body.getElementsByTagName('*').length > 60;
+      var root = document.getElementById('root')
+      // 启动卡片还在 = 还没就绪（无论文案是什么语言）
+      if (body.querySelector('[data-dsh-boot-spinner]') || body.querySelector('[data-dsh-boot]')) return false;
+      // 主界面挂载后 #root 里会有较多元素；只用数量做个宽松下限
+      var host = root || body
+      return host.getElementsByTagName('*').length > 60
     }
 
     function finish() {
@@ -2997,15 +3018,11 @@ window.__ModuleLoader__.load({
       cb();
     }
 
-    // 先建 observer，再建 timer —— timer 的回调里要用 obs，顺序反了会命中 TDZ。
-    var obs = new MutationObserver(function () {});
-    try { obs.observe(document.body, { childList: true, subtree: true, characterData: true }); } catch (err) {}
-
     var timer = setInterval(function () {
       var elapsed = Date.now() - started;
-      if (elapsed >= MIN_WAIT_MS && shellReady()) { clearInterval(timer); obs.disconnect(); finish(); return; }
-      if (elapsed > MAX_WAIT_MS) { clearInterval(timer); obs.disconnect(); finish(); }
-    }, 150);
+      if (shellReady()) { clearInterval(timer); finish(); return; }
+      if (elapsed > MAX_WAIT_MS) { clearInterval(timer); finish(); }
+    }, 60);
   }
 
   function apply() {

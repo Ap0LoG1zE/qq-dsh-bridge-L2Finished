@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.7.2 — 2026-11-18
+
+主题：**修掉「重启 DSH 后状态页一直读不到数据」**。根因是四层缺陷叠加，不是单点。
+
+- **真凶：`detached: true` 让「拉起桥接」静默失效。** 面板用
+  `spawn('powershell.exe', [...Start-Process...], { detached: true })` 启动桥接时，
+  `Start-Process` 根本不生效 —— 桥接进程一个都没起来。A/B 实测（同机同时刻、
+  只改这一个参数）：`detached: true` → 10.5 秒后仍未启动；`detached: false` → 1.27 秒就绪。
+  去掉 `detached` 即可；`Start-Process` 起的 cmd 本来就是独立进程，不需要脱离父进程。
+  这个 bug 之所以看起来「时好时坏」，是因为计划任务 `QQBridgeGuard` 每分钟会把桥接
+  补起来 —— 等一分钟又好了，极难复现。
+- **等待上限被砍半。** `ensureBridgeRunning` 原本是 `Math.min(waitMs, 10000)`，
+  最多等 10 秒；桥接冷启动实测 1.3~20 秒波动，越过这道坎面板就放弃。
+  现在用满预算（默认 30 秒），且端口一通立即返回。
+- **「已经在跑」那条路不重查。** `handleStatus` 原本只在 `broughtUp.started` 为真时
+  重试请求；而 `ensureBridgeRunning` 还有 `{ok:true, already:true}` 的路径，走那条路
+  不会重试，第一次探测的失败结果被原样返回 —— 端口明明已经通了却报「读不到数据」。
+  改成只要 `ok` 就重查。
+- **探测方式换便宜的那条。** `hasBridgeProcess` 每次 spawn PowerShell 做进程枚举，
+  实测 650ms（三次取样 652/634/648）。改成三层：端口直连（<5ms）→ `netstat`（28ms）
+  → PowerShell 兜底。它只是「可能性检查」，不值得用最贵的手段。
+- 整块保活逻辑重写为 `waitConsoleUp` / `bridgeAlive` 两个原语：
+  前者是唯一的等待入口，判据是「`/api/status` 真的返回了」而不是「端口开了」
+  （实测两者差 80ms：端口先开、路由后挂）；后者由快到慢三层判定，命中即返回。
+  轮询间隔 1500ms → 120ms，消掉量化误差。
+- 顺带修掉 `waitForShell` 的两头错：它靠「页面文案里有没有 `loading plugin`」判断
+  启动页是否消失，而 DSH 的启动提示是**本地化**的 —— 中文界面恒为 false（过早就绪），
+  匹配不上时又要等满 15 秒硬兜底。改成认宿主自己打的 `data-dsh-boot-spinner` 标记，
+  与语言无关；硬兜底 15 秒 → 5 秒。
+
+实测（桥接完全停止、计划任务临时禁用、只改代码）：
+- 修复前：请求 30095ms 后返回 `ok:false`，桥接始终没启动
+- 修复后：连续三轮 1363 / 1460 / 1298 ms，全部 `ok:true` 且桥接就绪
+
 ## 0.7.1 — 2026-11-17
 
 - **修「诊断页还是有问题」**：`renderTab` 开头用 `d.ok === false` 判定「读不到数据」，
