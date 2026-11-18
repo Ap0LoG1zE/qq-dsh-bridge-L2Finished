@@ -57,22 +57,27 @@ test('first reply does not wait out timeout when the snapshot message is already
   const started = Date.now();
   const result = await request('wait', { purpose: 'reply', timeoutMs: 1200, quietMs: 100 });
   assert.equal(result.status, 200);
-  assert.ok(Date.now() - started < 600, `already-quiet message waited ${result.data.waitedMs}ms`);
-  assert.equal(result.data.quiet, true);
-  assert.equal(result.data.timeout, false);
-  assert.equal(result.data.arrived, false);
-  assert.equal(result.data.preSleepWaitObserved, false);
-  assert.equal(result.data.preSleepWaitSatisfied, false);
-  assert.equal('preSleepWaitRemainingMs' in result.data, false, 'first reply must not be presented as an unfinished sleep countdown');
+  // 2026-11-19：wait 的回包精简后只剩 ok/key/arrived/newMessages/readThroughSeq/
+  // unreadCount/text —— quiet / timeout / waitedMs / preSleepWait* 都已移除。
+  // 「不等满 timeout」这条语义改用**外部实测耗时**验证，比读字段更贴近事实。
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed < 600, `已经安静的消息不该等满 timeout，实际等了 ${elapsed}ms`);
+  assert.equal(result.data.arrived, false, '没有新消息时 arrived 必须是 false');
+  assert.deepEqual(result.data.newMessages, []);
+  // 防止「第一轮回复被当成没做完的沉睡倒计时」：那个字段本身已不存在。
+  assert.equal('preSleepWaitRemainingMs' in result.data, false);
 }));
 
 test('reply waits only for the remaining quiet time after model reading', () => fixture(async ({ h, key, st, request, append }) => {
   append('complete message');
   await h.sendWakePromptV2(key, 'question');
   st.lastIncomingAt = Date.now() - 600;
+  const started = Date.now();
   const result = await request('wait', { purpose: 'reply', timeoutMs: 1500, quietMs: 800 });
-  assert.equal(result.data.quiet, true);
-  assert.ok(result.data.waitedMs >= 100 && result.data.waitedMs < 600, `remaining wait was ${result.data.waitedMs}ms`);
+  const elapsed = Date.now() - started;
+  // 消息已经安静了 600ms，安静窗要 800ms ⇒ 只剩约 200ms 要等（回包不再给 waitedMs）。
+  assert.ok(elapsed >= 100 && elapsed < 900, `剩余等待应约为剩余安静窗，实际 ${elapsed}ms`);
+  assert.equal(result.data.arrived, false);
 }));
 
 test('a message between snapshot and wait is returned without duplicate snapshot content', () => fixture(async ({ h, key, st, request, append }) => {
@@ -82,7 +87,6 @@ test('a message between snapshot and wait is returned without duplicate snapshot
   st.lastIncomingAt = Date.now() - 1000;
   const result = await request('wait', { purpose: 'reply', timeoutMs: 1200, quietMs: 100, minNewMessages: 20 });
   assert.equal(result.data.arrived, true);
-  assert.equal(result.data.quiet, true);
   assert.deepEqual(result.data.newMessages.map(m => m.seq), [2]);
   assert.equal(result.data.readThroughSeq, 2);
   assert.equal(st.unread.length, 2, 'visibility never acknowledges messages');
@@ -94,9 +98,11 @@ test('each supplement restarts quiet from its actual arrival, and appears exactl
   st.lastIncomingAt = Date.now();
   const timers = [setTimeout(() => append('second'), 120), setTimeout(() => append('third'), 240)];
   try {
+    const started = Date.now();
     const result = await request('wait', { purpose: 'reply', timeoutMs: 1500, quietMs: 300 });
-    assert.equal(result.data.quiet, true);
-    assert.ok(result.data.waitedMs >= 500 && result.data.waitedMs < 1200);
+    const elapsed = Date.now() - started;
+    // 两条补充分别在 ~120ms / ~240ms 到达，每次都要重新计 300ms 安静窗 ⇒ 总耗时 ≥ 500ms。
+    assert.ok(elapsed >= 500 && elapsed < 1600, `安静窗应被每次到达重置，实际等了 ${elapsed}ms`);
     assert.deepEqual(result.data.newMessages.map(m => m.seq), [2, 3]);
     assert.equal(result.data.readThroughSeq, 3);
   } finally { timers.forEach(clearTimeout); }
@@ -108,13 +114,12 @@ test('reply timeout is a hard budget and cannot grant sleep observation, even wi
   await request('unread');
   const timer = setTimeout(() => append('supplement near deadline'), 220);
   try {
+    const started = Date.now();
     const result = await request('wait', { purpose: 'reply', timeoutMs: 300, quietMs: 600 });
-    assert.equal(result.data.timeout, true);
-    assert.equal(result.data.quiet, false);
-    assert.equal(result.data.speakerLikelyDone, false);
-    assert.ok(result.data.waitedMs >= 300 && result.data.waitedMs < 900);
-    assert.equal(result.data.preSleepWaitObserved, false);
-    assert.equal(result.data.preSleepWaitSatisfied, false);
+    const elapsed = Date.now() - started;
+    // timeout/quiet/waitedMs 字段已移除；「硬预算」改用实测耗时 + 没拿到消息来表达。
+    assert.ok(elapsed >= 300 && elapsed < 1500, `timeout 应作为硬预算，实际等了 ${elapsed}ms`);
+    // 关键安全断言：reply 等待**绝不能**授予沉睡观测（这两个是桥接内部状态，仍然存在）。
     assert.equal(st.preSleepWaitObservedAt, 0);
     assert.equal(st.preSleepWaitSatisfiedAt, 0);
   } finally { clearTimeout(timer); }
@@ -125,10 +130,11 @@ test('ordinary and omitted purpose keep waiting for future messages', () => fixt
   await request('unread');
   st.lastIncomingAt = Date.now() - 10000;
   for (const purpose of [undefined, 'messages']) {
+    const started = Date.now();
     const result = await request('wait', { purpose, timeoutMs: 600, quietMs: 100 });
-    assert.ok(result.data.waitedMs >= 600);
-    assert.equal(result.data.timeout, true);
-    assert.equal(result.data.quiet, false);
+    const elapsed = Date.now() - started;
+    // 已经安静过 10s 了，但仍然要等满预算（这两个 purpose 会等到有新消息为止）。
+    assert.ok(elapsed >= 550, `purpose=${purpose} 应该等满预算，实际 ${elapsed}ms`);
     assert.deepEqual(result.data.newMessages, []);
   }
 }));

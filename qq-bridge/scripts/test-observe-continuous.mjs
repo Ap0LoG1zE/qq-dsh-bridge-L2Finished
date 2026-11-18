@@ -1,10 +1,13 @@
-// 锁定操作者 2026-11-17 定的观望语义：
+// 锁定**当前**（2026-11-19 操作者纠正后）的观望语义：
 //
-//   「总预算 = 发送那几秒 + 20 秒；期间我发了消息就重置为 10 秒倒计时，
-//     无最长，直到 10 秒倒计时结束才贴给她」
+//   「句间那几秒是真实流逝的，之后还要再等满 observeAfterSendMs；
+//     期间我发了消息就重置为 10 秒倒计时，无最长，直到 10 秒倒计时结束才贴给她」
 //
 // 三个必须同时成立的契约：
-//   ① 总预算**包含**发送耗时（不是"发完再等 20 秒"）
+//   ① ⚠️ 2026-11-19 操作者**纠正**：句间耗时是额外叠加的，发完**还要再等满**
+//      observeAfterSendMs。所以 总时长 = 句间 + observeAfterSendMs。
+//      （更早的 11-17 口径是"总预算包含发送耗时"，已被推翻；bridge.js 的
+//       paceAfterSendV2 注释里记着这次反复。）
 //   ② 来一条消息 → 安静计时重置为 10 秒（不是从第一条开始一路计到 10 秒）
 //   ③ 无额外上限：只要还在 10 秒内来消息，就一直不返回
 //
@@ -105,28 +108,28 @@ await test('连续来消息时，每条都把 10 秒安静窗顶回起点（不�
   });
 });
 
-// ── ① 总预算包含发送耗时 ─────────────────────────────────────────────
-await test('发送本身耗时算进总预算（不是发完再等满预算）', async () => {
+// ── ① 句间耗时额外叠加，发完还要再等满预算（2026-11-19 口径）──────────
+await test('句间耗时额外叠加：发完还要再等满预算，不从预算里扣', async () => {
   await withBridge(async ({ request, sleep }) => {
-    // 发 4 条、每条间隔 200ms ⇒ 发送要花约 600ms，占 BUDGET_MS(1200) 的一半
+    // 发 4 条、每条间隔 300ms ⇒ 发送要花约 900ms，接近 BUDGET_MS(1200) 的量级
     const t0 = Date.now();
     const p = request('send-message', { messages: ['1', '2', '3', '4'], gapMode: 'fixed', gapMs: GAP_MS });
     const r = await p;
     const elapsed = Date.now() - t0;
     const sendCost = GAP_MIN_MS * 3;   // 4 条 = 3 个间隔，每个按钳制后的最小值算
 
-    // 没人说话时，总耗时 ≈ 发送耗时 + 剩余预算（BUDGET - sendCost）≈ BUDGET
-    // 若实现是"发完再等满 BUDGET"，总耗时会接近 sendCost + BUDGET
+    // 2026-11-19 操作者明确纠正过这件事（见 bridge.js 里 paceAfterSendV2 的注释）：
+    //   句间那几秒是真实流逝的，之后**还要再等满** observeAfterSendMs。
+    //   曾经写成 `remainingBudget = waitMs - alreadySpent`（总预算口径），那是错的。
+    // 所以判据反过来：总耗时应当接近「句间 + 预算」，明显短于它就说明又扣掉了。
     const naive = sendCost + BUDGET_MS;
-    const budgetOnly = BUDGET_MS;
-    // 判据：应当明显短于"发完再等满"，并且接近"总预算"本身
-    if (elapsed > naive - 300) {
-      throw new Error(`总耗时 ${elapsed}ms 接近"发完再等满预算"(${naive}ms)，说明发送耗时没从预算里扣`);
+    if (elapsed < naive - 400) {
+      throw new Error(`总耗时 ${elapsed}ms 明显短于「句间+预算」(${naive}ms)，说明发送耗时又被从预算里扣掉了`);
     }
-    if (elapsed > budgetOnly + 600) {
-      throw new Error(`总耗时 ${elapsed}ms 明显超过总预算 ${budgetOnly}ms，预算没生效`);
+    if (elapsed > naive + 900) {
+      throw new Error(`总耗时 ${elapsed}ms 远超「句间+预算」(${naive}ms)，安静窗没生效`);
     }
-    console.log(`    发送 ${sendCost}ms + 观望，总耗时 ${elapsed}ms（预算 ${budgetOnly}ms，未叠满 ✅）`);
+    console.log(`    发送 ${sendCost}ms + 观望 ${BUDGET_MS}ms，总耗时 ${elapsed}ms（额外叠加 ✅）`);
     void r;
     void sleep;
   });

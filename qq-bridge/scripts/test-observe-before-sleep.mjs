@@ -181,26 +181,28 @@ await test('安静窗内连发两条：合并成一次贴回，且计时器被�
   });
 });
 
-// ── 6. 20 秒是"发完之后额外等"，不是数组内部间隔的替代 ────────────────────
+// ── 6. 句间耗时额外叠加：发完还要再等满 observeAfterSendMs ────────────────
 //
-// 操作者澄清的语义：`空转时间 = Σ(数组内间隔) + 20秒`。
+// 2026-11-19 操作者最后一次澄清：`空转时间 = Σ(数组内间隔) + observeAfterSendMs`。
 // 数组间隔由 sendMessagesV2 真的 sleep 掉（见那边的 sendChain.then(sleep)），
-// 所以 paceAfterSendV2 只需要补那 20 秒。
-// 这条用例确认：3 条数组时，总耗时 ≈ 间隔之和 + observeAfterSendMs，而不是只有 20 秒。
-await test('多条数组：发送耗时算进总预算，不是发完再等满', async () => {
+// paceAfterSendV2 再补满那一整段预算 —— **不从预算里扣掉已花的发送时间**。
+// 这条用例确认：3 条数组时，总耗时 ≈ 间隔之和 + observeAfterSendMs。
+await test('多条数组：句间耗时额外叠加，发完还要再等满预算', async () => {
     await withBridge(async ({ request }) => {
       const t0 = Date.now();
       const r = await request('send-message', { body: { messages: ['一', '二', '三'], gapMode: 'fixed', gapMs: 300 } });
       const elapsed = Date.now() - t0;
       assert.equal(r.status, 200, `实际：${JSON.stringify(r.data)}`);
-      // 2026-11-17 操作者改了口径：「总预算 = 发送那几秒 + 20 秒」——
-      // 发送耗时**包含在**预算里，不是"发完再额外等满"。
+      // 2026-11-19 操作者最后一次纠正（bridge.js 的 paceAfterSendV2 注释里有完整记录）：
+      //   「句间那几秒是真实流逝的，之后还要再等满 observeAfterSendMs」
+      //   ⇒ 总耗时 = 句间 + observeAfterSendMs。
+      // 中间一度按「总预算包含发送耗时」实现过（那会得到更短的总时长），已被推翻。
       const sendCost = 300 * 2;                    // 2 个间隔
-      const naiveSum = sendCost + SEND_OBSERVE_MS; // 旧语义下的总耗时
-      assert.ok(elapsed < naiveSum - 100,
-        `总耗时 ${elapsed}ms 接近"发完再等满"(${naiveSum}ms)，说明发送耗时没被算进预算`);
-      assert.ok(elapsed >= SEND_OBSERVE_MS - 150,
-        `总耗时 ${elapsed}ms 太短，预算 ${SEND_OBSERVE_MS}ms 没生效`);
+      const expectedSum = sendCost + SEND_OBSERVE_MS;
+      assert.ok(elapsed >= expectedSum - 400,
+        `总耗时 ${elapsed}ms 明显短于「句间+预算」(${expectedSum}ms)，说明发送耗时又被从预算里扣掉了`);
+      assert.ok(elapsed < expectedSum + 900,
+        `总耗时 ${elapsed}ms 远超「句间+预算」(${expectedSum}ms)，安静窗没生效`);
     });
   });
 

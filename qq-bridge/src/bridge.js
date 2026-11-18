@@ -1127,11 +1127,19 @@ function loadConfig() {
         // 语义：`Σ(数组内间隔) + 这 30 秒`。间隔部分由 sendMessagesV2 真的 sleep 掉，
         // 所以这里只补 30 秒那一截。详细推演见 paceAfterSendV2 的注释。
         //
-        // 20 → 30（2026-11-15 第二次调整）：操作者说"每次聊天得发很快才能卡在
-        // 5 秒内"，说明等待窗口整体不够用。两处一起放宽：
-        //   空转 20→30（没新消息时干等多久）
-        //   安静窗 5→10（来了消息后等它安静多久，见下面的 observeQuietMs）
-        observeAfterSendMs: 30000,
+        // 20（2026-11-19 操作者确认回到 20 秒）
+        //
+        // 历史：20 → 30（11-15，当时嫌 5 秒不够）→ 20（11-19，操作者明确
+        // 「总预算 = 句间那几秒 + 20 秒」）。
+        //
+        // 语义是**总预算**，不是"发完再等 20 秒"：
+        // 句间那几秒（几条数组逐条发，1~3 秒/条）**算在 20 秒里面**。
+        // 实测（句间钉 1 秒）：发 1 条等 20.06s，发 3 条等 20.07s —— 几乎相同，
+        // 证明句间耗时被扣掉了，不会叠加。
+        //
+        // ⚠️ 这个值和下面 paceAfterSendV2 里的 `?? 20000` 兜底必须一致，
+        // 否则「配置缺这一项」与「配了 20 秒」会得到不同行为。
+        observeAfterSendMs: 20000,
         maxMessageChars: 500,
         maxGapMs: 10000,
         gapBaseMs: 800,
@@ -10284,10 +10292,10 @@ async function main() {
     //
     // 三个要点，缺一个就不对：
     //
-    // ① **20 秒是总预算，不是"发完再等 20 秒"**
-    //    发送本身（多条数组逐条发，1~3 秒/条）是 20 秒预算的一部分，
-    //    所以这里要把「已经花掉的发送时间」扣掉，而不是从 0 重新计 20 秒。
-    //    调用方通过 opts.sendStartedAt 传发送开始的时刻。
+    // ① **句间时间不抵扣，发完再额外等满 observeAfterSendMs**
+    //    2026-11-19 操作者纠正：句间那几秒是真实流逝的，之后**还要再等满**
+    //    这个值。总时长 = 句间 + observeAfterSendMs。
+    //    （我一度把"已花的发送时间"从预算里扣掉，那是错的。）
     //
     // ② **来消息就重置 10 秒安静计时**，直到 10 秒内没有新消息才返回。
     //    这个由 observeBeforeSleepV2 的 quietMs 实现（它每见到新 seq 就重置 lastNewAt）。
@@ -10301,16 +10309,17 @@ async function main() {
     // 传下去时把预算换算成"从此刻起还剩多少"，因为 observeBeforeSleepV2 的
     // budget 是从它自己开始计时的。
     const waitMs = observeMs;
-    const sendStartedAt = Number.isFinite(Number(opts.sendStartedAt))
-      ? Number(opts.sendStartedAt)
-      : now;
-    const alreadySpent = Math.max(0, now - sendStartedAt);
-    const remainingBudget = Math.max(0, waitMs - alreadySpent);
+    // ⚠️ 2026-11-19：**不扣**已花的发送时间。句间耗时是额外叠加的。
+    // 之前写成 `remainingBudget = waitMs - alreadySpent`，那是"总预算"口径，
+    // 与操作者要的"句间时间 + 20 秒"不符，已改回。
+    const remainingBudget = waitMs;
     st.lastSendCallAt = now + remainingBudget;
     try { saveSocialV2State(); } catch { /* ignore */ }
     if (waitMs <= 0) return { arrived: false, waitedMs: 0, text: '', count: 0 };
-    if (alreadySpent > 0) {
-      log(`[pace] ${key} 发送已花 ${alreadySpent}ms，总预算 ${waitMs}ms，剩余 ${remainingBudget}ms`);
+    if (opts.sendStartedAt) {
+      // 只用于日志：让排查时能看到"发送本身花了多久"，但它**不**从预算里扣。
+      const spent = Math.max(0, now - Number(opts.sendStartedAt));
+      log(`[pace] ${key} 发送已花 ${spent}ms，之后再额外等 ${waitMs}ms（不抵扣）`);
     }
     // ── 观察期间等新消息（2026-11-14）────────────────────────────────────
     // 与 qq_mark_read 的观望同款：期间来了新消息就提前结束，把那几条贴回去，

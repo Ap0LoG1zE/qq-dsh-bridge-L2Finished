@@ -67,7 +67,14 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // ── R1. 无令牌智能体调用（closed-agent 的发送面） ────────────────────────────
 await test('R1 无令牌智能体调用：closed-agent 可发送/探测，v2 面仍拒绝', async () => {
-  const h = await bridgeHarness();
+  // ⚠️ 必须关掉「发送后观望」：这条测的是**鉴权**，而 send/private 成功后
+  // paceAfterSendV2 会按 socialV2.send.observeAfterSendMs 默认 20000ms 空转，
+  // 超过 call() 的 15s 超时 ⇒ 表现为 "request hung"（假失败）。
+  // 观望本身另有专门用例（test-observe-continuous / test-send-observe-gap）。
+  const h = await bridgeHarness({ config: { socialV2: {
+    observeBeforeSleepMs: 0,
+    send: { observeAfterSendMs: 0, observeQuietMs: 0 },
+  } } });
   try {
     h.setMode('closed-agent');
     await withServer(h, async (port) => {
@@ -215,7 +222,8 @@ await test('R7 未知 preset 名直接被拒（含路径穿越形态）', async 
   try {
     h.setPresets([]); // 模拟 DSH 未连接：清单为空
     // 给临时仓库放一份真实的预设源文件，验证「已知 preset 不会被误伤」
-    const presetFile = path.join(h.temp, 'dsh', 'agent-presets', 'qq-chat-v2', 'agent.cordis.yml');
+    // 2026-11-07 合并后唯一 preset 是 qq-chat-agent（旧的 qq-chat-v2 已不存在）。
+    const presetFile = path.join(h.temp, 'dsh', 'agent-presets', 'qq-chat-agent', 'agent.cordis.yml');
     fs.mkdirSync(path.dirname(presetFile), { recursive: true });
     fs.writeFileSync(presetFile, '- id: persona\n  config:\n    prefix: |-\n      测试用仿真提示词。\n');
     await withServer(h, async (port) => {
@@ -223,7 +231,7 @@ await test('R7 未知 preset 名直接被拒（含路径穿越形态）', async 
         const res = await call(port, '/api/preset/sim-prompt?preset=' + encodeURIComponent(bad));
         assert.equal(res.status, 400, `preset=${bad} 必须被拒，实际 ${res.status}`);
       }
-      const ok = await call(port, '/api/preset/sim-prompt?preset=qq-chat-v2');
+      const ok = await call(port, '/api/preset/sim-prompt?preset=qq-chat-agent');
       assert.equal(ok.status, 200, `已知 preset 仍应可用：${ok.body}`);
       assert.equal(ok.json?.content, '测试用仿真提示词。');
     });
@@ -246,9 +254,11 @@ await test('R8 wake-config 丢弃未知 triggers 键（不落盘、不回传模�
         }
       });
       assert.equal(res.status, 200, res.body);
-      assert.equal('junkKey' in res.json.wakeConfig.triggers, false, '响应里不得回传垃圾键');
-      assert.equal('another' in res.json.wakeConfig.triggers, false);
+      // 2026-11-10 起 wake-config 只回一句话（text），不再回 wakeConfig 对象。
+      // 要守的东西没变：垃圾键既不能进内存、也不能落盘、也不能回传模型。
+      assert.equal(/junkKey/.test(res.body), false, '响应里不得出现垃圾键');
       assert.equal(st.wakeConfig.triggers.junkKey, undefined, '内存态不得被污染');
+      assert.equal(st.wakeConfig.triggers.another, undefined, '嵌套垃圾键同样不得进内存');
       assert.equal(st.wakeConfig.triggers.atMention, true, '已知字段仍需生效');
       const file = JSON.parse(fs.readFileSync(path.join(h.temp, 'state', 'social-v2.json'), 'utf8'));
       assert.equal(file.conversations['group:456'].wakeConfig.triggers.junkKey, undefined, '落盘文件不得含垃圾键');
@@ -262,13 +272,17 @@ await test('R9 memory-update 只编辑已有条目，不写穿 Object.prototype'
   try {
     h.setMode('reserved2');
     const st = h.getSocialV2State('group:456');
-    st.memberImpressions['群友A'] = { traits: ['友善'], interactionCount: 1, lastSeenAt: Date.now() };
+    // ⚠️ 2026-11-19 修：memberImpression 属于**全局记忆**（memoryKeyFor 返回 'global'），
+    // 不再挂在会话 state 上。测试写 group:456 的 memberImpressions，接口却去 global 里找，
+    // 于是"编辑已有条目"永远是 404 —— 那是测试走错了地方，不是接口的 bug。
+    const memSt = h.getSocialV2State('global');
+    memSt.memberImpressions['群友A'] = { traits: ['友善'], interactionCount: 1, lastSeenAt: Date.now() };
     await withServer(h, async (port) => {
       const inherited = await call(port, '/api/socialV2/memory-update', {
         method: 'POST', token: st.agentToken, body: { key: 'group:456', category: 'memberImpression', target: 'toString', newContent: 'hacked' }
       });
       assert.equal(inherited.status, 404, '继承来的属性名不得被当成已有条目');
-      assert.equal(Object.prototype.hasOwnProperty.call(st.memberImpressions, 'toString'), false);
+      assert.equal(Object.prototype.hasOwnProperty.call(memSt.memberImpressions, 'toString'), false);
       assert.equal(Object.prototype.toString.traits, undefined, '不得往内置函数对象上写属性');
 
       const unknown = await call(port, '/api/socialV2/memory-update', {
@@ -281,7 +295,7 @@ await test('R9 memory-update 只编辑已有条目，不写穿 Object.prototype'
       });
       assert.equal(ok.status, 200, ok.body);
       // 跨 vm realm 的数组原型不同，deepEqual 会误判；逐元素断言。
-      const traits = st.memberImpressions['群友A'].traits;
+      const traits = memSt.memberImpressions['群友A'].traits;
       assert.equal(traits.length, 2);
       assert.equal(traits[0], '幽默');
       assert.equal(traits[1], '爱接梗');

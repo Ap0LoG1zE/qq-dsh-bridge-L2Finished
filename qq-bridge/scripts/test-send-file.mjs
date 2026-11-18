@@ -21,6 +21,16 @@ import {
 } from '../src/send-file-lib.js';
 import { auditOutbound } from '../src/sensitive.js';
 
+/**
+ * 真正「把文件发出去」的出站调用。
+ *
+ * ⚠️ 不能直接用 h.calls.http.length：桥接启动时会自己探活
+ * （GET / 与 GET /api/status），每次 withBridge 都有 2 条。
+ * 拿它比较 0 会永远失败，还会让人误以为「被拒时仍然发了东西」。
+ * 我们只关心有没有真的调用 upload_private_file。
+ */
+const uploadCalls = (h) => h.calls.http.filter((c) => String(c.url).endsWith('/upload_private_file'));
+
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 let failures = 0;
 let tests = 0;
@@ -222,7 +232,7 @@ await test('owner 私聊：合法文件真的走网关发出去（upload_private
     assert.equal(out.data.ok, true);
     assert.equal(out.data.file, '报告.docx');
     assert.equal(out.data.bytes, 2048);
-    const calls = h.calls.http.filter((c) => String(c.url).endsWith('/upload_private_file'));
+    const calls = uploadCalls(h);
     assert.equal(calls.length, 1, '必须恰好调用一次 upload_private_file');
     assert.equal(calls[0].body.user_id, 123);
     assert.equal(calls[0].body.name, '报告.docx');
@@ -236,7 +246,7 @@ await test('白名单私聊 / 白名单群 / 陌生私聊：一律 403 且不碰
     const out = await post({ key: 'private:777', token: st.agentToken, path: docx });
     assert.equal(out.status, 403, JSON.stringify(out.data));
     assert.match(out.data.error, /Owner/);
-    assert.equal(h.calls.http.length, 0, '被拒时不允许有任何出站调用');
+    assert.equal(uploadCalls(h).length, 0, '被拒时不允许有任何出站调用');
   }, { config: { allow: { private: ['123', '777'], groups: ['456'] } }, key: 'private:777' });
 
   // 白名单群
@@ -244,14 +254,14 @@ await test('白名单私聊 / 白名单群 / 陌生私聊：一律 403 且不碰
     const out = await post({ key: 'group:456', token: st.agentToken, path: docx });
     assert.equal(out.status, 403, JSON.stringify(out.data));
     assert.match(out.data.error, /Owner/);
-    assert.equal(h.calls.http.length, 0);
+    assert.equal(uploadCalls(h).length, 0);
   }, { key: 'group:456' });
 
   // 陌生私聊（靠 allowAllWhenEmpty 放行聊天，仍不能发文件）
   await withBridge(async ({ h, st, post }) => {
     const out = await post({ key: 'private:999', token: st.agentToken, path: docx });
     assert.equal(out.status, 403, JSON.stringify(out.data));
-    assert.equal(h.calls.http.length, 0);
+    assert.equal(uploadCalls(h).length, 0);
   }, { config: { allowAllWhenEmpty: true, allow: { private: [], groups: [] } }, key: 'private:999' });
 });
 
@@ -259,7 +269,7 @@ await test('ownerQQ 未配置时没人能发（fail-closed）', async () => {
   await withBridge(async ({ h, st, post }) => {
     const out = await post({ key: 'private:123', token: st.agentToken, path: docx });
     assert.equal(out.status, 403, JSON.stringify(out.data));
-    assert.equal(h.calls.http.length, 0);
+    assert.equal(uploadCalls(h).length, 0);
   }, { config: { ownerQQ: null } });
 });
 
@@ -268,27 +278,27 @@ await test('令牌 / 开关 / 功能开关：缺一不可', async () => {
   await withBridge(async ({ h, post }) => {
     const out = await post({ key: 'private:123', path: docx });
     assert.ok([401, 403].includes(out.status), `无凭据必须拒绝，实际 ${out.status}`);
-    assert.equal(h.calls.http.length, 0);
+    assert.equal(uploadCalls(h).length, 0);
   });
   // 错令牌
   await withBridge(async ({ h, post }) => {
     const out = await post({ key: 'private:123', token: 'deadbeef', path: docx });
     assert.equal(out.status, 403);
-    assert.equal(h.calls.http.length, 0);
+    assert.equal(uploadCalls(h).length, 0);
   });
   // 工具开关关闭
   await withBridge(async ({ h, st, post }) => {
     const out = await post({ key: 'private:123', token: st.agentToken, path: docx });
     assert.equal(out.status, 403);
     assert.match(out.data.error, /qq_send_file/);
-    assert.equal(h.calls.http.length, 0);
+    assert.equal(uploadCalls(h).length, 0);
   }, { config: { socialV2: { tools: { sendFile: false } } } });
   // 功能总开关关闭
   await withBridge(async ({ h, st, post }) => {
     const out = await post({ key: 'private:123', token: st.agentToken, path: docx });
     assert.equal(out.status, 403);
     assert.match(out.data.error, /关闭/);
-    assert.equal(h.calls.http.length, 0);
+    assert.equal(uploadCalls(h).length, 0);
   }, { config: { socialV2: { files: { enabled: false } } } });
 });
 
@@ -304,14 +314,14 @@ await test('敏感路径 / 非白名单类型 / 超体积：400 且不碰网关'
       assert.equal(out.status, 400, `${p}: ${JSON.stringify(out.data)}`);
       assert.match(String(out.data.error), re);
     }
-    assert.equal(h.calls.http.length, 0, '校验失败时不允许有任何出站调用');
+    assert.equal(uploadCalls(h).length, 0, '校验失败时不允许有任何出站调用');
   });
   // 体积上限（配置收敛到 1KB，big 是 4KB）
   await withBridge(async ({ h, st, post }) => {
     const out = await post({ key: 'private:123', token: st.agentToken, path: big });
     assert.equal(out.status, 400);
     assert.match(String(out.data.error), /过大/);
-    assert.equal(h.calls.http.length, 0);
+    assert.equal(uploadCalls(h).length, 0);
   }, { config: { socialV2: { files: { maxBytes: 1024 } } } });
 });
 
@@ -320,7 +330,7 @@ await test('文件名含凭据赋值时被出站审计拦下（连文件都不�
     const blocked = await post({ key: 'private:123', token: st.agentToken, path: tokenNamed });
     assert.equal(blocked.status, 400, JSON.stringify(blocked.data));
     assert.match(String(blocked.data.error), /凭据|敏感/);
-    assert.equal(h.calls.http.length, 0, '被审计拦下时不允许发出任何东西');
+    assert.equal(uploadCalls(h).length, 0, '被审计拦下时不允许发出任何东西');
     // 反向：`token-report.docx` 只是名字里有 token 字样，不该被误伤（否则正常文件会被拦）
     const allowed = await post({ key: 'private:123', token: st.agentToken, path: tokenWorded });
     assert.equal(allowed.status, 200, JSON.stringify(allowed.data));
@@ -335,7 +345,7 @@ await test('限流：同一会话每分钟上限生效，失败不吃额度', as
     assert.equal(second.status, 400, JSON.stringify(second.data));
     assert.match(String(second.data.error), /频率超限/);
     // 只有成功的第一次真的发出了
-    assert.equal(h.calls.http.filter((c) => String(c.url).endsWith('/upload_private_file')).length, 1);
+    assert.equal(uploadCalls(h).length, 1);
   }, { config: { socialV2: { files: { maxPerMinute: 1, maxPerHour: 5 } } } });
 });
 
