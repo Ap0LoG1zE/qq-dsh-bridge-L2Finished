@@ -11017,7 +11017,10 @@ async function main() {
         // 闲置压缩：idleCompactedAt 非 0 表示「这一轮对话已经压过」，直到用户
         // 再发消息才清零；idleCompactingAt 是正在压的防重入锁（跨扫描周期）。
         idleCompactedAt: 0,
-        idleCompactingAt: 0
+        idleCompactingAt: 0,
+        // 主动机会的会话级开关：true = 这个聊天里不许她主动冒泡。
+        // 默认 false（跟随全局开关），面板上按会话切换。
+        proactiveDisabled: false
       };
       rememberAgentToken(key, st.agentToken);
       socialV2.conversations.set(key, st);
@@ -11086,6 +11089,8 @@ async function main() {
             // 只恢复「已压过」的标记；idleCompactingAt 属于进程内的锁，不落盘，
             // 否则崩溃/重启后会永久卡在「正在压缩」。
             idleCompactedAt: Number(val.idleCompactedAt) || 0,
+            // 主动机会的会话级开关：必须显式读回来，否则重启后开关会自己变回"开启"。
+            proactiveDisabled: val.proactiveDisabled === true,
             preSleepWaitSatisfiedAt: Number(val.preSleepWaitSatisfiedAt) || 0,
             preSleepWaitObservedAt: Number(val.preSleepWaitObservedAt) || 0,
             preSleepWaitAccumMs: Number(val.preSleepWaitAccumMs) || 0,
@@ -11505,6 +11510,13 @@ async function main() {
           preSleepWaitAccumMs: st.preSleepWaitAccumMs || 0,
           lastUnreadSeq: st.lastUnreadSeq || 0,
           lastReadThroughSeq: st.lastReadThroughSeq || 0,
+          // 2026-11-18：**主动机会的会话级开关**（面板「主动机会」页）。
+          //
+          // ⚠️ 这个字段必须显式列在这里 —— 本函数是**白名单落盘**，
+          // 没列出的字段在 saveSocialV2State 时会被静默丢掉。
+          // 第一版就漏了它，症状很阴：关掉当下有效（内存里是 true），
+          // 但桥接重启/重读状态后开关自己变回开启，面板看着"关不掉"。
+          proactiveDisabled: st.proactiveDisabled === true,
           // 长期事实的内容指纹（id 序列 + hits）：判断「内容变了没有」，没变就不提示。
           factFingerprint: String(st.factFingerprint || ''),
           // 上一次「全量看到过」的事实 id 列表（冷启动注入时写入）。

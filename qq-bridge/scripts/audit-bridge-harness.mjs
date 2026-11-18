@@ -181,6 +181,11 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     ensureSession, resolvePresetName, deliverPrompt, drainPromptQueue,
     sendToQQ, sendStickerV2, handleIncoming, startConsoleServer, cfg, state, api, promptQueues,
     getSocialV2State, appendSocialV2Message, recordSentMessagesV2,
+    // 落盘/读回：test-proactive-persist 要验证「新加的会话级字段真的存下来了」。
+    // 白名单式 save/load 漏字段是静默故障（内存对、文件没有），只能这样测。
+    saveSocialV2State, loadSocialV2State,
+    // 落盘路径：测试要读临时目录里的 social-v2.json 检查字段。
+    paths: { socialV2File: SOCIAL_V2_FILE, stateDir: STATE_DIR },
     buildWakePromptV2, buildWakeSnapshotV2, sendWakePromptV2, socialV2,
     // 唤醒调度：给「观望期间必须压住唤醒」这条回归用（test-observe-before-sleep.mjs）。
     // 不导出的话那条断言只能靠等定时器真的触发，慢 8 秒还测不稳定。
