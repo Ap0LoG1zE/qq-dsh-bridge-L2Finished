@@ -107,14 +107,16 @@ await test('只有 5 条未读（< 12）→ 全给，且无缺口', async () => 
     }
     const snap = h.buildWakeSnapshotV2(KEY);
     if (snap?.partial === true) throw new Error('没有缺口却标了 partial');
+    // 2026-11-19：「读到 #N」现在是**上一轮读到哪**，不是本轮给到哪。
+    // 这批用例从没设过 lastReadThroughSeq，所以是 #0（而不是 #5）。
     const m = prompt.match(/读到 #(\d+)/);
-    if (!m || Number(m[1]) !== 5) throw new Error(`水位应 #5，实际 ${m ? m[1] : '(无)'}`);
-    console.log('    5 条全给、水位 #5、无缺口 ✅');
+    if (!m || Number(m[1]) !== 0) throw new Error(`水位应是 #0（上轮没读过），实际 ${m ? m[1] : '(无)'}`);
+    console.log('    5 条全给、读到 #0（上轮没读过）、无缺口 ✅');
   });
 });
 
 // ── ⑤ 恰好等于上限 → 全给、无缺口 ───────────────────────────────────
-await test('恰好 12 条 → 全给、水位到头、无缺口', async () => {
+await test('恰好 12 条 → 全给、无缺口', async () => {
   await withBridge(async (h) => {
     seed(h, 12, '满');
     const prompt = snapshotText(h);
@@ -124,8 +126,8 @@ await test('恰好 12 条 → 全给、水位到头、无缺口', async () => {
     const snap = h.buildWakeSnapshotV2(KEY);
     if (snap?.partial === true) throw new Error('刚好 12 条却标了 partial');
     const m = prompt.match(/读到 #(\d+)/);
-    if (!m || Number(m[1]) !== 12) throw new Error(`水位应 #12，实际 ${m ? m[1] : '(无)'}`);
-    console.log('    12 条全给、水位 #12、无缺口 ✅');
+    if (!m || Number(m[1]) !== 0) throw new Error(`水位应 #0（上轮没读过），实际 ${m ? m[1] : '(无)'}`);
+    console.log('    12 条全给、读到 #0（上轮没读过）、无缺口 ✅');
   });
 });
 
@@ -154,6 +156,34 @@ await test('上一轮读到 #20，再来 20 条 → 给最新 12 条、水位停
     // 中间的空洞（#21~#28）不该出现
     if (/新21\b/.test(prompt)) throw new Error('#21 不该出现（应只给最新 12 条）');
     console.log(`    水位 #${through}、含 #40、不含 #21 ✅`);
+  });
+});
+
+// ── ⑦ afterSeq=上轮读数 不会把本轮已给的带回来 ───────────────────────
+await test('afterSeq=上轮读数 → 只返回本轮之后的（不重复本轮已给的）', async () => {
+  await withBridge(async (h) => {
+    seed(h, 5, '旧');                         // #1~#5
+    const st0 = h.getSocialV2State(KEY);
+    st0.lastReadThroughSeq = 5;                // 假装上一轮读到 #5
+    seed(h, 4, '新');                          // 实际 seq 会是 #6~#9
+
+    const prompt = snapshotText(h);
+    const m = prompt.match(/读到 #(\d+)/);
+    const through = m ? Number(m[1]) : NaN;
+    if (through !== 5) throw new Error(`水位应 #5，实际 ${through}`);
+
+    // 调 unread 接口，模拟她"往前补看"
+    const st = h.getSocialV2State(KEY);
+    const after = st.unread.filter((x) => Number(x.seq) > through);
+    // afterSeq 是严格大于，所以 #5 自己不该出现
+    if (after.some((x) => Number(x.seq) === 5)) {
+      throw new Error('#5 被带回来了（afterSeq 应该严格大于）');
+    }
+    // 必须从 #6 开始
+    if (!after.length || Number(after[0].seq) !== 6) {
+      throw new Error(`应从 #6 开始，实际 ${after.length ? after[0].seq : '(空)'}`);
+    }
+    console.log(`    afterSeq=#${through} → 返回 #${after[0].seq} 起（不含 #${through} 本身）✅`);
   });
 });
 

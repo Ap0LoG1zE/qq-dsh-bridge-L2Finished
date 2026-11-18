@@ -14210,14 +14210,31 @@ async function main() {
       ...(newestAgo ? { newestAgo } : {}),
       unreadCount: st.unread.length,
       includedUnreadCount: 0,
-      readThroughSeq: readThroughSeqV2(st),
+      // ── 2026-11-19 操作者定义 ───────────────────────────────────────────
+      //
+      // `readThroughSeq`（渲染成「读到 #N」）= **上一轮读到哪**，
+      // 也就是「本轮新消息的起点前一条」。
+      //
+      // 原来它跟的是"本轮给到哪"，于是永远等于最新那条 —— 那个标记没有信息量
+      //（她本来就知道最后一条是几号）。而且本轮给最新 12 条、中间留空洞时，
+      // "给到哪"根本没法当 afterSeq 用。
+      //
+      // 现在它是起点前一条，直接可以拿去补读：
+      //   `qq_get_unread_messages(afterSeq=14)` → 返回 #15 起
+      //   （源码里是 `m.seq > afterSeq` 严格大于，不会把 #14 带进来）。
+      //
+      // 渲染期间它是**常量**，不随本轮加了多少条而变（见 tryAdd 的说明）。
+      readThroughSeq: Number.isSafeInteger(st.lastReadThroughSeq) ? st.lastReadThroughSeq : 0,
       partial: st.unread.length > 0
     };
     const tryAdd = (field, msg) => {
       const previousThrough = packet.readThroughSeq;
       packet[field].push(compactModelMessage(msg, { now }));
       packet.includedUnreadCount = packet.messages.length;
-      packet.readThroughSeq = readThroughSeqV2(st, [...packet.messages, ...packet.recent]);
+      // ⚠️ 2026-11-19：**不再**在这里重算 readThroughSeq。
+      // 它的语义已改成"上一轮读到哪"（本轮新消息的起点前一条），
+      // 是本轮渲染期间固定不变的常量，跟着消息增删浮动就没有意义了。
+      // 如果调用方需要"本轮给到哪"，用 ownThroughSeq。
       packet.partial = packet.messages.length < st.unread.length;
       if (JSON.stringify(packet).length <= maxChars) return true;
       packet[field].pop();
@@ -14232,26 +14249,17 @@ async function main() {
       // 原实现 `slice(0, maxUnread)` 取最旧的 12 条，导致 #189~#200（6 小时前）
       // 出现在唤醒包里，而 #218（19 秒前）被截掉 —— 她看不到刚发生的事。
       //
-      // 现在取**最新**的 maxUnread 条。代价是中间会留一段空洞，所以：
-      //   ① `partial` 保持 true；
-      //   ② **水位必须停在"上一轮读到的那条"**（st.lastReadThroughSeq），
-      //      绝不能变成这批最大的 seq —— 否则空洞那段会被当成已读、永久丢失。
-      //      她调 qq_get_unread_messages(afterSeq=水位) 就能从空洞第一条开始补
-      //      （工具本身有 100 条上限，足够）。
-      //
-      // ⚠️ 这里不能用 `unread[startIdx - 1].seq` 当水位：那条**没给她看过**，
-      //    拿它当"已读"等于替她确认了没读的内容。只能用她真正读过的那条。
+      // 现在取**最新**的 maxUnread 条。中间留的空洞靠两件事兜住：
+      //   ① `partial` 保持 true，提示里告诉她前面还有没显示的；
+      //   ② `readThroughSeq` 已经是「上一轮读到哪」（见 packet 初始化处的说明），
+      //      天然就停在空洞之前，直接当 afterSeq 用就能补上中间那批。
+      //      所以这里**不需要**再退回水位 —— 那个值本轮根本不动。
       const total = st.unread.length;
       const startIdx = Math.max(0, total - maxUnread);
       const window = st.unread.slice(startIdx);
-      // 先记下"她真正读过哪儿"：这是唯一安全的水位基线。
-      const baseThrough = Number.isSafeInteger(st.lastReadThroughSeq) ? st.lastReadThroughSeq : 0;
       for (const msg of window) if (!tryAdd('messages', msg)) break;
-      if (startIdx > 0) {
-        // 有空洞：水位退回上一轮读到的位置，让 afterSeq 能补上中间那批。
-        packet.readThroughSeq = baseThrough;
-        packet.partial = true;
-      }
+      // 有空洞就算 partial（即使窗口塞满了 maxUnread 条）。
+      if (startIdx > 0) packet.partial = true;
     }
     if (v2ToolEnabled('getRecent') && maxRecent > 0) {
       const unread = new Set(st.unread.map((m) => m.seq));

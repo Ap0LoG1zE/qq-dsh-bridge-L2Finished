@@ -315,7 +315,9 @@ await test('快照里的历史按时间正序，且不重复未读', async ({ h,
   assert.deepEqual(seqs(snapshot.messages), [4]);
   assert.deepEqual(seqs(snapshot.recent), [2, 3]);
   assert.equal(snapshot.partial, false);
-  assert.equal(snapshot.readThroughSeq, 4);
+  // 2026-11-19：`readThroughSeq` 改成「上一轮读到哪」（本轮新消息的起点前一条）。
+  // 这里 mark-read 读到 #3、本轮新消息是 #4，所以显示 #3 而不是 #4。
+  assert.equal(snapshot.readThroughSeq, 3);
 });
 
 await test('快照不能借内联历史绕过特性与工具开关', async ({ h, request, append }) => {
