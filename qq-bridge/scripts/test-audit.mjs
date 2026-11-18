@@ -95,6 +95,10 @@ const tests = [
   // 场景：读到 #20 → 来了 #21~#40 → 本轮给最新 12 条(#29~#40)，
   // afterSeq=20 能补回 #21~#28 那批空洞，且本轮给过的不会被重复当新消息。
   'test-wake-gap-afterseq.mjs',
+  // 她自己的消息时间戳必须是真实发送时刻（2026-11-19）：
+  // 原来 recordSentMessagesV2 写 `time: now + i * 1000` 伪造，
+  // 于是历史里她的消息永远相隔正好 1 秒，操作者从时间戳看出「间隔巨短」。
+  'test-sent-timestamp.mjs',
   // 令牌账本 / 价目表 与 体检修复回归（纯函数，无外部依赖）
   'test-token-usage.mjs', 'test-hardening.mjs',
   // 控制台静态契约（跑不了 Playwright 的环境下的替代回归）

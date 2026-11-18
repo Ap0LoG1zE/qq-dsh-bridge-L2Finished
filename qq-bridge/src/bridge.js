@@ -6211,7 +6211,7 @@ async function main() {
             const preSendSnapshot = snapshotUnreadBeforeSendV2(st);
             const sendStartedAt = Date.now();   // 总预算从这里开始算（含逐条发送耗时）
             const sentMessages = await sendMessagesV2(key, messages, delays);
-            recordSentMessagesV2(key, sentMessages, sentMessages?.ids);
+            recordSentMessagesV2(key, sentMessages, sentMessages?.ids, sentMessages?.sentAt);
             st.lastAiReplyAt = now;
             st.lastActionAt = now;
             st.wakeConfig.noActionCount = 0;
@@ -6236,7 +6236,7 @@ async function main() {
             sendJson({ ok: true, key, ...(postSendObserve?.text ? { text: postSendObserve.text, arrived: true, arrivedCount: postSendObserve.count } : {}), sent: sentMessages.length, failed: messages.length - sentMessages.length });
           } catch (error) {
             if (error?.sent?.length) {
-              recordSentMessagesV2(key, error.sent, error?.sentIds);
+              recordSentMessagesV2(key, error.sent, error?.sentIds, error?.sentAt);
               log(`[reserved2] 工具分条发送部分成功 ${error.sent.length}/${messages.length} 条，已记录已发消息`);
             }
             // 失败/未发出的消息回滚预占的发送额度，避免假 429。
@@ -6381,7 +6381,7 @@ async function main() {
             const preSendSnapshot = snapshotUnreadBeforeSendV2(st);
             const sendStartedAt = Date.now();   // 总预算从这里开始算（含逐条发送耗时）
             const sentMessages = await sendMessagesV2(key, messages, delays, actualReplyToMessageId, atUserId);
-            recordSentMessagesV2(key, sentMessages, sentMessages?.ids);
+            recordSentMessagesV2(key, sentMessages, sentMessages?.ids, sentMessages?.sentAt);
             st.lastAiReplyAt = now;
             st.lastActionAt = now;
             st.wakeConfig.noActionCount = 0;
@@ -6402,7 +6402,7 @@ async function main() {
             sendJson({ ok: true, key, ...(postSendObserve?.text ? { text: postSendObserve.text, arrived: true, arrivedCount: postSendObserve.count } : {}), sent: sentMessages.length, failed: messages.length - sentMessages.length, delays, quoted: quotedInfo });
           } catch (error) {
             if (error?.sent?.length) {
-              recordSentMessagesV2(key, error.sent, error?.sentIds);
+              recordSentMessagesV2(key, error.sent, error?.sentIds, error?.sentAt);
               log(`[reserved2] 工具统一发送部分成功 ${error.sent.length}/${messages.length} 条，已记录已发消息`);
             }
             // 失败/未发出的消息回滚预占的发送额度，避免假 429。
@@ -9024,7 +9024,7 @@ async function main() {
             const preSendSnapshot = snapshotUnreadBeforeSendV2(st);
             const sendStartedAt = Date.now();   // 总预算从这里开始算（含逐条发送耗时）
             const sentMessages = await sendMessagesV2(key, [message], [], actualReplyToMessageId, atUserId);
-            recordSentMessagesV2(key, sentMessages, sentMessages?.ids);
+            recordSentMessagesV2(key, sentMessages, sentMessages?.ids, sentMessages?.sentAt);
             st.lastAiReplyAt = now;
             st.lastActionAt = now;
             st.wakeConfig.noActionCount = 0;
@@ -9047,7 +9047,7 @@ async function main() {
             sendJson({ ok: true, key, ...(postSendObserve?.text ? { text: postSendObserve.text, arrived: true, arrivedCount: postSendObserve.count } : {}), sent: sentMessages.length, failed: sentMessages.length ? 0 : 1, quoted: quotedInfo });
           } catch (error) {
             if (error?.sent?.length) {
-              recordSentMessagesV2(key, error.sent, error?.sentIds);
+              recordSentMessagesV2(key, error.sent, error?.sentIds, error?.sentAt);
               log(`[send] ${url.pathname} ${key} 部分成功 ${error.sent.length}/1 条，已记录已发消息`);
             }
             // 失败/未发出的消息回滚预占的发送额度，避免假 429。
@@ -10521,6 +10521,14 @@ async function main() {
     const [kind, id] = key.split(':');
     const sent = [];
     const failed = [];
+    // 2026-11-19：记录**每条真正发出去的时刻**。
+    //
+    // 原来 recordSentMessagesV2 用 `now + i * 1000` 伪造时间戳，于是她自己的消息
+    // 在历史里永远相隔正好 1 秒 —— 而真实间隔是 burstIntervalMin~Max（1~3 秒随机）
+    // 外加网络耗时。操作者从消息时间戳看出"间隔巨短"，就是被这行伪造骗了。
+    //
+    // 现在按实际完成时刻记：第 i 条 = 它 onebotSend 返回的那一刻。
+    const sentAt = [];
     // 2026-11-15：把每条真正发出去的 message_id 也留下来。
     // 之前只 push 文本，于是「发出去之后想撤回」根本无 id 可用
     // （qq_recall_message 需要它）。顺序与 messages 一一对应。
@@ -10534,6 +10542,7 @@ async function main() {
           assertSendAllowed();
           const receipt = await onebotSend(kind, id, msg, useReply, useAt);
           sent.push(msg);
+          sentAt.push(Date.now());   // 真实发出时刻
           // OneBot 的发送回执形如 { message_id: 123 }；拿不到就记 null（不编造）。
           const mid = receipt && (receipt.message_id ?? receipt.messageId);
           sentIds.push(Number.isFinite(Number(mid)) ? Number(mid) : null);
@@ -10552,6 +10561,8 @@ async function main() {
         const err = new Error(`QQ 发送失败 ${failed.length}/${messages.length} 条：${failed[0]?.message ?? '未知错误'}`);
         err.sent = sent.slice();
         err.sentIds = sentIds.slice();
+        // 2026-11-19：部分成功时也要带上真实时刻，否则回填历史又会退回伪造时间。
+        err.sentAt = sentAt.slice();
         throw err;
       }
       // 返回值形状保持"数组"（既有调用方都在用 .length / 遍历），
@@ -10559,6 +10570,8 @@ async function main() {
       // `${sent}` / for...of 仍然只看到文本，行为不变。
       const out = sent.slice();
       out.ids = sentIds.slice();
+      // 2026-11-19：真实发出时刻（与 out 一一对应），供 recordSentMessagesV2 用。
+      out.sentAt = sentAt.slice();
       return out;
     });
   }
@@ -13447,12 +13460,12 @@ async function main() {
     if (i >= 0) st.sentReceipts.splice(i, 1);
   }
 
-  function recordSentMessagesV2(key, messages, ids = null) {
+  function recordSentMessagesV2(key, messages, ids = null, sentAt = null) {
     const st = getSocialV2State(key);
     const now = Date.now();
     const recentLimit = Number(cfg.socialV2?.context?.recentLimit) || 100;
     const list = Array.isArray(messages) ? messages : [];
-    for (let i = 0; i < list.length; i++) {
+    for (let i = 0; i < list.length; i += 1) {
       const text = redactKnownTokensOnly(String(list[i] ?? '')).slice(0, 200);
       // ── 自己的消息**不带 seq**（2026-11-15 操作者明确要求）──────────────
       //
@@ -13463,6 +13476,15 @@ async function main() {
       //
       // 现在的做法：自己发的消息照旧不带 seq；撤回按**原文匹配**去找是哪条
       // （见 /api/socialV2/recall-message 的实现）。
+      //
+      // ── 时间戳必须是**真实的**（2026-11-19 修）────────────────────────
+      // 原来写 `now + i * 1000` 伪造，于是她的消息在历史里永远相隔正好 1 秒。
+      // 而真实间隔是 burstIntervalMin~Max（1~3 秒随机）+ 网络耗时 ——
+      // 操作者从时间戳看出"间隔巨短"，就是被这行骗了。
+      // 现在优先用调用方传进来的真实发出时刻，没有再退回 now。
+      const realAt = Array.isArray(sentAt) && Number.isFinite(Number(sentAt[i]))
+        ? Number(sentAt[i])
+        : now;
       const item = {
         sender: '我',
         text,
@@ -13471,10 +13493,10 @@ async function main() {
         isOwner: true,
         ownerLabel: '我',
         isSelf: true,
-        time: now + i * 1000
+        time: realAt
       };
       // 回执：正文 + message_id + 时刻。撤回时按正文匹配、按时刻判 2 分钟窗口。
-      noteSentReceiptV2(st, text, Number(ids?.[i]), now + i * 1000);
+      noteSentReceiptV2(st, text, Number(ids?.[i]), realAt);
       st.recentMessages.push(item);
       // 自己发出去的话也是原文的一部分：以后复盘"当时我怎么说的"只能靠它。
       // 用时间戳当 seq，避免与入站消息的本地 seq 撞号。
