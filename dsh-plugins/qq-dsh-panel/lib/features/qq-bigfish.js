@@ -529,14 +529,25 @@ async function ensureBridgeRunning(env, { startIfDown = true, waitMs = 30000 } =
     //     这也解释了为什么这个 bug 看起来时好时坏、极难复现。
     //
     // 正解：借 PowerShell 的 `Start-Process -WindowStyle Hidden` 来落盘，
-    // **且不要 detached**。不需要 detached 的理由：`Start-Process` 起的是一个
-    // 完全独立的 cmd 进程（自带新控制台且隐藏），PowerShell 自己退出后它照样活着；
-    // 我们从不需要对那个 cmd 发信号，所以也没有「必须脱离父进程」的需求。
-    // 这和仓库里 tools/bridge-guard.ps1 的做法一致（守卫计划任务每分钟拉起桥接，
-    // 从来不会弹窗），是被验证过的路径。
+    // **且不要 detached**。
     //
-    // 注意 SnowLuma 的启动（handleLaunchSnowluma）**不在此列**：那里刻意保留 `start`，
-    // 因为试过改成直接 spawn 反而连弹 3 个窗口（见该函数内注释）。
+    // ── 「去掉 detached 会不会害桥接被 DSH 带走？」—— 实测不会 ──────────────
+    // 这是最容易被质疑的一点，所以做了专门验证（2026-11-18）：
+    //   用一个独立进程当「启动器」→ 里面 spawn PowerShell → Start-Process 起 start.bat
+    //   → 等 3100 就绪后**让启动器进程立刻退出**（模拟 DSH 关闭）。
+    //   结果：启动器已退出，桥接照样活着，3 秒后仍在监听。
+    //   实际的父进程链是：bridge.js → cmd.exe /c start.bat → （Start-Process 创建，
+    //   父进程随 PowerShell 退出而脱离），与启动器无关。
+    //
+    // 原因：`Start-Process` 起的是**由 Session Manager 创建的新进程**，不是 PowerShell
+    // 的子进程；PowerShell 只是个「发起者」，它退出不会波及这个新进程。
+    // 所以「必须 detached 才能独立于 DSH」这条经验，只适用于**直接 spawn node** 的写法
+    // （那种情况下 node 确实是调用者的子进程，会被作业对象一起收走）；
+    // 一旦经由 PowerShell 的 Start-Process 中转，detached 就是多余且有害的。
+    //
+    // 注意 SnowLuma 的启动（handleLaunchSnowluma）**不在此列**：那里是直接
+    // `cmd /c start "" launcher.bat`，没有 Start-Process 中转，所以它确实需要
+    // detached。两处写法不同、原因也不同，不要互相套用。
     const psArgs = [
       '-NoProfile',
       '-NonInteractive',
@@ -550,7 +561,7 @@ async function ensureBridgeRunning(env, { startIfDown = true, waitMs = 30000 } =
       stdio: 'ignore',
       windowsHide: true,
     })
-    // 仍然 unref + 不等待退出：我们不关心这个 PowerShell 什么时候结束，
+    // unref + 不等待退出：我们不关心这个 PowerShell 什么时候结束，
     // 桥接就绪与否由下面的 waitConsoleUp 用端口事实判断。
     child.unref()
   } catch (error) {
