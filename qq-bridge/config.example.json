@@ -186,7 +186,7 @@
       "maxSendPerMinute": 8,
       "maxSendPerHour": 60,
       "minSendIntervalMs": 10000,
-      "observeAfterSendMs": 30000,
+      "observeAfterSendMs": 20000,
       "observeQuietMs": 10000,
       "maxMessageChars": 500,
       "maxGapMs": 10000,
