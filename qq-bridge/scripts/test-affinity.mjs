@@ -265,7 +265,10 @@ assert.ok(/【开口前/.test(presetSrc), '预设里应有【开口前】流程'
 for (const pair of ['疏远=冷漠', '平淡=观察', '在意=朋友', '依赖=舍不得', '喜欢=想', '偏爱=只对他一个人这样']) {
   assert.ok(presetSrc.includes(pair), `预设的档名索引里缺少「${pair}」`)
 }
-assert.ok(/防线更少|防线少一层/.test(presetSrc), '预设里应写明"往上走是防线更少，不是变热情"')
+// 2026-11-17：删掉了「防线更少一点」那句 —— 它与档名索引同义，工具返回还逐档写了状态。
+// 改成检查保留下来的两条核心：档名索引、以及"好感度是参考不是命令"这个定位。
+assert.ok(/档名索引/.test(presetSrc), '预设应保留档名索引（硫远=冷漠 … 偏爱=只对他一个人这样）')
+assert.ok(/好感度是\*\*参考\*\*，不是命令/.test(presetSrc), '预设应保留"好感度是参考，不是命令"这个定位')
 // 精简的红线：预设里**不该**再逐档展开那五段长描述（它们归工具返回管）。
 // 只要有一档的长描述回来了，就说明有人又把重复内容抄了回去。
 const verboseStageMarkers = [
@@ -465,7 +468,8 @@ assert.ok(
 const zeroFiveLine = presetSrc.split('\n').find((l) => l.trim().startsWith('0.5 ')) || ''
 assert.ok(!zeroFiveLine.includes('发生以下'), '0.5 条不该重复列条件，应交给【开口前】')
 assert.ok(zeroFiveLine.includes('【开口前'), '0.5 条应指向【开口前】')
-assert.ok(zeroFiveLine.includes('没查过'), '0.5 条应点明「没查过这个人就先查」这个硬性要求')
+// 2026-11-17：措辞改成「没有这个人的好感度信息，就先查再开口，这是硬性规定」。
+assert.ok(/硬性规定|没查过/.test(zeroFiveLine), '0.5 条应点明"先查再开口"这个硬性要求')
 // 反例：这些是操作者明确嫌"太啰嗦"的旧措辞，不许回来。
 assert.ok(!presetSrc.includes('第一次要回'), '「第一次要回」表述不清，已按操作者要求替换')
 assert.ok(!presetSrc.includes('从「X」变成了「Y」'), '唤醒提示里不该再剧透"从哪档到哪档"')

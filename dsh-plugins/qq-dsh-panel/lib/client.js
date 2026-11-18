@@ -410,6 +410,28 @@ window.__ModuleLoader__.load({
       // 顺序本身是信息，卡片流会把这个信息压平。
       '.dsh-fb-self{display:flex;flex-direction:column;gap:0}',
       '.dsh-fb-selfnote{position:relative;display:flex;gap:12px;padding:9px 0 9px 0}',
+    // ── 主动机会页（2026-11-18）───────────────────────────────────────────
+    // 页头做成一块浅色卡片：全局状态 + 说明 + 汇总数字。
+    // 全局关着时整块降低对比度（.is-off），让"开了也没用"这件事一眼可见。
+    '.dsh-fb-proact-head{position:relative;padding:13px 15px;border-radius:12px;margin-bottom:10px;',
+    'background:var(--dsw-alias-bg-l2,rgba(127,127,127,.06));',
+    'border:1px solid var(--dsw-alias-border-l2,rgba(127,127,127,.18))}',
+    '.dsh-fb-proact-head.is-off{opacity:.72}',
+    '.dsh-fb-proact-headtop{display:flex;align-items:center;gap:8px;font-size:13.5px;',
+    'color:var(--dsw-alias-text-primary,inherit)}',
+    // 状态灯：开启时是品牌色 + 呼吸光，关闭时灰点
+    '.dsh-fb-proact-dot{flex:none;width:8px;height:8px;border-radius:999px;',
+    'background:var(--dsw-alias-text-quaternary,rgba(127,127,127,.5))}',
+    '.dsh-fb-proact-dot.is-on{background:var(--dsw-alias-brand-primary,#4d6bfe);',
+    'box-shadow:0 0 0 3px color-mix(in srgb,var(--dsw-alias-brand-primary,#4d6bfe) 22%,transparent)}',
+    '.dsh-fb-proact-sub{display:block;margin-top:7px;font-size:11.5px;line-height:1.6;',
+    'color:var(--dsw-alias-text-tertiary,rgba(127,127,127,.95))}',
+    '.dsh-fb-proact-stats{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}',
+    '.dsh-fb-proact-stat{font-size:11px;padding:3px 9px;border-radius:999px;',
+    'background:var(--dsw-alias-bg-l3,rgba(127,127,127,.10));',
+    'color:var(--dsw-alias-text-secondary,rgba(127,127,127,1))}',
+    // 会话列表：每行之间的分隔线收得更轻，避免和开关本身抢视觉
+    '.dsh-fb-proact-list .dsh-fb-item + .dsh-fb-item{border-top:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.10))}',
       // 竖线：除最后一条外都画，且从圆点中心往下延伸
       '.dsh-fb-selfspine{flex:none;width:11px;position:relative;display:flex;justify-content:center}',
       '.dsh-fb-selfspine::before{content:"";position:absolute;top:15px;bottom:-9px;width:1px;',
@@ -716,6 +738,9 @@ window.__ModuleLoader__.load({
     { id: 'facts', label: '长期记忆' },
     { id: 'impressions', label: '群友印象' },
     { id: 'todos', label: '待办' },
+    // 2026-11-18：按会话开关「她能不能主动开口」。
+    // 放在待办旁边：都属于"她自己会做的事"，和状态/节奏分开看更清楚。
+    { id: 'proactive', label: '主动机会' },
     { id: 'self', label: '自我' },
     { id: 'rhythm', label: '回复节奏' },
     { id: 'persona', label: '人格' },
@@ -1197,6 +1222,7 @@ window.__ModuleLoader__.load({
     else if (tabId === 'facts') url = f.api + '/facts'
     else if (tabId === 'impressions') url = f.api + '/impressions'
     else if (tabId === 'todos') url = f.api + '/todos'
+    else if (tabId === 'proactive') url = f.api + '/proactive'
     else if (tabId === 'self') url = f.api + '/self-notes'
     else if (tabId === 'persona') url = f.api + '/persona'
     else if (tabId === 'tokens') url = f.api + '/tokens'
@@ -1302,6 +1328,7 @@ window.__ModuleLoader__.load({
     if (mState.tab === 'facts') return renderFactsTab(d)
     if (mState.tab === 'impressions') return renderImpressionsTab(d)
     if (mState.tab === 'todos') return renderTodosTab(d)
+    if (mState.tab === 'proactive') return renderProactiveTab(d)
     if (mState.tab === 'self') return renderSelfTab(d)
     if (mState.tab === 'rhythm') return renderRhythmTab(d)
     if (mState.tab === 'persona') return renderPersonaTab(d)
@@ -1798,8 +1825,139 @@ window.__ModuleLoader__.load({
     setBody(nodes)
   }
 
-  function deleteTodo(key, text) {
-    if (!modal) return
+  // ── 主动机会（2026-11-18）──────────────────────────────────────────────
+  //
+  // 她"主动开口"要同时满足两件事：
+  //   ① 全局开关开着（socialV2.proactive.enabled，在「回复节奏」里调参数）
+  //   ② **这个聊天**没被关掉（st.proactiveDisabled，这一页管的）
+  //
+  // 桥接侧的调度逻辑（scheduleProactiveCheckV2）还会额外判断：
+  // 群安静够久、概率命中、不在夜间、最近没说过太多话。
+  // 这一页只负责"许不许"，不负责"会不会"——所以页头要写清楚。
+
+  var PROACTIVE_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" '
+    + 'stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/>'
+    + '<circle cx="12" cy="12" r="4.2"/><path d="M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1"/></svg>'
+
+  // 「多久以前」：只到分钟/小时/天，不显示秒——这一页看的是粗粒度。
+  function proactiveAgo(ms) {
+    var n = Number(ms)
+    if (!isFinite(n) || n <= 0) return '从没说过话'
+    if (n < 60000) return '刚刚'
+    if (n < 3600000) return Math.round(n / 60000) + ' 分钟前'
+    if (n < 86400000) return Math.round(n / 3600000) + ' 小时前'
+    return Math.round(n / 86400000) + ' 天前'
+  }
+
+  // 「还有多久」用于下一次检查倒计时。未排程返回空串。
+  function proactiveLeft(ms) {
+    var n = Number(ms)
+    if (!isFinite(n) || n < 0) return ''
+    if (n < 60000) return '不到 1 分钟'
+    if (n < 3600000) return Math.round(n / 60000) + ' 分钟'
+    return Math.round(n / 3600000) + ' 小时'
+  }
+
+  function renderProactiveTab(d) {
+    var g = d.global || {}
+    var list = Array.isArray(d.sessions) ? d.sessions : []
+
+    if (!list.length) {
+      setBody([
+        section('主动机会', [
+          (function () {
+            var box = h('div', 'dsh-fb-facts-empty')
+            box.appendChild(h('div', 't', '还没有会话'))
+            box.appendChild(h('div', 's', '她收到过消息才会建立会话。等群里有人说话，这里就会出现那一栏。'))
+            return box
+          })(),
+        ]),
+        actionsRow([{ label: '刷新', ghost: true, onClick: function () { loadTab('proactive') } }]),
+      ])
+      return
+    }
+
+    var onCount = 0
+    for (var c = 0; c < list.length; c++) if (list[c].enabled) onCount += 1
+
+    // 页头：全局状态 + 汇总。全局关着时整页标灰，避免"我明明开了怎么不冒泡"的困惑。
+    var globalOff = g.enabled === false
+    var head = h('div', 'dsh-fb-proact-head' + (globalOff ? ' is-off' : ''))
+    var headTop = h('div', 'dsh-fb-proact-headtop')
+    headTop.appendChild(h('span', 'dsh-fb-proact-dot' + (globalOff ? '' : ' is-on')))
+    headTop.appendChild(h('b', null, globalOff ? '主动机会：全局已关闭' : '主动机会：全局开启'))
+    head.appendChild(headTop)
+
+    var idleMin = Math.round((Number(g.idleThresholdMs) || 900000) / 60000)
+    var probPct = Math.round((Number(g.probability) || 0) * 100)
+    head.appendChild(h('span', 'dsh-fb-proact-sub',
+      globalOff
+        ? '在「回复节奏」里把主动机会打开，下面这些开关才会真正起作用。'
+        : '聊天要安静满 ' + idleMin + ' 分钟、且按 ' + probPct + '% 概率命中，她才可能主动开口。'
+          + '每轮检查间隔 ' + Math.round((Number(g.checkIntervalMinMs) || 1800000) / 60000)
+          + '~' + Math.round((Number(g.checkIntervalMaxMs) || 5400000) / 60000) + ' 分钟。'))
+
+    var stat = h('div', 'dsh-fb-proact-stats')
+    stat.appendChild(h('span', 'dsh-fb-proact-stat', onCount + ' 个会话允许'))
+    stat.appendChild(h('span', 'dsh-fb-proact-stat', (list.length - onCount) + ' 个已关闭'))
+    head.appendChild(stat)
+
+    var nodes = [head]
+
+    // 逐个会话一个开关行。复用 switchRow 的视觉（它已经是这个面板统一的开关样式）。
+    var wrap = h('div', 'dsh-fb-proact-list')
+    for (var i = 0; i < list.length; i++) {
+      (function (item) {
+        var isGroup = String(item.key || '').indexOf('group:') === 0
+        var num = String(item.key || '').split(':')[1] || ''
+        var label = isGroup ? ('群 ' + num) : ('私聊 ' + num)
+
+        // 第二行提示：给她一点上下文，知道这个聊天"多久没动静了"。
+        var bits = []
+        bits.push(proactiveAgo(Number(item.idleMs)))
+        if (item.unreadCount > 0) bits.push(item.unreadCount + ' 条未读')
+        if (item.enabled && item.nextCheckInMs != null) {
+          var left = proactiveLeft(Number(item.nextCheckInMs))
+          if (left) bits.push('下次检查还有 ' + left)
+        } else if (item.enabled) {
+          bits.push('已排程')
+        }
+        var hintText = bits.join(' · ')
+
+        var row = switchRow({
+          icon: PROACTIVE_ICON,
+          title: label,
+          hint: hintText,
+          on: item.enabled === true,
+          hintFor: function (on) {
+            return on ? hintText : '已关闭，她不会主动在这个聊天里开口'
+          },
+          onFlip: function (next, revert) {
+            postJson(mState.feature.api + '/proactive', { key: item.key, enabled: next })
+              .then(function (r) {
+                if (r && r.ok) {
+                  toast(next ? '已允许主动开口' : '已关闭主动开口')
+                  loadTab('proactive')
+                } else {
+                  revert(false)
+                  mState.note = (r && r.error) || '保存失败'
+                  renderProactiveTab(mState.data)
+                }
+              })
+          },
+        })
+        // 全局关着时开关仍可点（改的是会话级意愿），但视觉上弱化，避免误解。
+        if (globalOff) row.style.opacity = '.62'
+        wrap.appendChild(row)
+      })(list[i])
+    }
+    nodes.push(section('按会话控制', [wrap]))
+    nodes.push(actionsRow([{ label: '刷新', ghost: true, onClick: function () { loadTab('proactive') } }]))
+    if (mState.note) nodes.push(h('div', 'dsh-fb-warn', mState.note))
+    setBody(nodes)
+  }
+
+  function deleteTodo(key, text) {    if (!modal) return
     fetchJson(mState.feature.api + '/todos', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -2449,7 +2607,11 @@ window.__ModuleLoader__.load({
         delBtn.type = 'button'
         delBtn.addEventListener('click', function () {
           if (delBtn.dataset.armed === '1') {
-            postJson(api, { action: 'delete', stickerId: s.id }).then(function (res) {
+            // 用 resId（完整 emoji_id）而不是 id：列表里的 id 是 md5（省 token 用的），
+            // 而删除协议要整串 emoji_id。桥接现在两种都能解析，这里发准确的更好。
+            postJson(api, { action: 'delete', stickerId: s.resId || s.id }).then(function (res) {
+              // 桥接会重新拉取列表核实是否真的删掉，删除未生效时返回 ok:false，
+              // 所以这里如实显示它的报错，不要一律提示「已删除」。
               toast(res && res.ok ? '已删除' : ((res && res.error) || '删除失败'))
               loadTab('stickers')
             })

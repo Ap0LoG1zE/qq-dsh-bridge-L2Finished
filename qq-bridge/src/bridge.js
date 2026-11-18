@@ -2363,7 +2363,12 @@ async function main() {
   async function collectStickerV2(key, messageRef, remark) {
     const assertSendAllowed = captureSendGuard(key);
     const st = getSocialV2State(key);
-    const found = (st.recentMessages || []).find((m) => m && (String(m.seq) === String(messageRef) || (m.messageId && String(m.messageId) === String(messageRef))));
+    // `#4` 与 `4` 是同一个引用（消息行里 seq 就渲染成 #N，模型会照抄）
+    const refs = [...new Set([String(messageRef), normalizeMessageRef(messageRef)].filter(Boolean))];
+    const found = (st.recentMessages || []).find((m) => m && (
+      refs.includes(String(m.seq ?? '').trim())
+      || (m.messageId && refs.includes(String(m.messageId).trim()))
+    ));
     if (!found) throw new Error('找不到这条消息，请确认 messageId/seq 有效且属于当前会话');
     if (found.isSelf) throw new Error('不能收藏自己发的表情，只能收藏群友发的');
     const mediaList = Array.isArray(found.media) ? found.media : [];
@@ -4956,8 +4961,7 @@ async function main() {
         // ── 纯语音（智能体通道）──────────────────────────────────────────
         // 她能自己开关纯语音，但**只有跟主人私聊时才能开**。
         //
-        // 身份判定不靠她传参数（2026-11-13 操作者：消息行末尾已有「（主人）」标记，
-        // 她本来就知道谁是主人），而是桥接自己看当前 key：
+        // 身份判定不靠她传参数，而是桥接自己看当前 key：
         //   · private:<ownerQQ> → 就是主人，允许开
         //   · 群里 / 其他人的私聊 → 一律拒绝
         // 这样即使她在群里被某人要求"开语音"，也开不起来 —— 纯语音是熟人在私聊里用的东西，
@@ -5111,6 +5115,75 @@ async function main() {
             lastWakeReason: st.lastWakeReason,
             lastAiReplyAt: st.lastAiReplyAt
           });
+          return;
+        }
+        // ── 主动机会：会话级开关（2026-11-18，面板「主动机会」页用）──────────
+        //
+        // 全局 proactive.enabled 管「这个功能开不开」，这里管「**每个聊天**允不允许
+        // 她主动冒泡」。两个都要满足才会排检查（见 scheduleProactiveCheckV2）。
+        //
+        // 只给面板/控制台用，不接受 agent token —— 她不该能改这个，
+        // 否则"能不能主动找人说活"就变成她自己的权限了。
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/proactive-sessions') {
+          const p = cfg.socialV2?.proactive ?? {};
+          const rows = [];
+          for (const [key, st] of socialV2.conversations.entries()) {
+            if (!st) continue;
+            if (!isSessionAllowedInCurrentMode(key)) continue;
+            const idleMs = Date.now() - (st.lastIncomingAt || 0);
+            rows.push({
+              key,
+              enabled: st.proactiveDisabled !== true,
+              lastIncomingAt: Number(st.lastIncomingAt) || 0,
+              idleMs,
+              lastAiReplyAt: Number(st.lastAiReplyAt) || 0,
+              // 下一次检查还有多久（没排就是 null —— 关掉了 / 没进过调度）
+              nextCheckInMs: st.proactiveTimer ? Math.max(0, Number(st.proactiveNextCheckAt || 0) - Date.now()) : null,
+              unreadCount: Array.isArray(st.unread) ? st.unread.length : 0
+            });
+          }
+          // 群在前、私聊在后；同类按最近活跃排（最近说过话的更可能是你在意的）
+          rows.sort((a, b) => {
+            const ga = a.key.startsWith('group:') ? 0 : 1;
+            const gb = b.key.startsWith('group:') ? 0 : 1;
+            return ga - gb || (b.lastIncomingAt || 0) - (a.lastIncomingAt || 0);
+          });
+          sendJson({
+            ok: true,
+            global: {
+              enabled: p.enabled !== false,
+              idleThresholdMs: Number(p.idleThresholdMs) || 900000,
+              probability: Number(p.probability) || 0.3,
+              checkIntervalMinMs: Number(p.checkIntervalMinMs) || 1800000,
+              checkIntervalMaxMs: Number(p.checkIntervalMaxMs) || 5400000
+            },
+            sessions: rows
+          });
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/proactive-sessions') {
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+          if (!/^(group|private):\d+$/.test(key)) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
+          const st = getSocialV2State(key);
+          const want = body.enabled !== false;
+          if (want) {
+            // 打开 = 清掉禁用标记，让它重新参与调度（立刻排一次，不用等下一次事件）
+            delete st.proactiveDisabled;
+            saveSocialV2State();
+            scheduleProactiveCheckV2(key);
+          } else {
+            st.proactiveDisabled = true;
+            if (st.proactiveTimer) {
+              clearTimeout(st.proactiveTimer);
+              st.proactiveTimer = null;
+            }
+            st.proactiveNextCheckAt = 0;
+            saveSocialV2State();
+          }
+          log(`[proactive] 面板${want ? '开启' : '关闭'}了 ${key} 的主动机会`);
+          sendJson({ ok: true, key, enabled: want });
           return;
         }
         if (req.method === 'GET' && url.pathname === '/api/socialV2/prompt') {
@@ -6948,19 +7021,48 @@ async function main() {
         }
         if (req.method === 'POST' && url.pathname === '/api/stickers/delete') {
           // 从 QQ 账号里删掉一张收藏表情（OneBot delete_custom_face）。
+          //
+          // ⚠️ 必须用**完整 emoji_id**，不能用 md5。
+          //   · 列表接口给模型/面板的 `id` 字段填的是 md5（32 位，省 token）
+          //   · 但 DeleteCustomFace 的协议体是 { emojiId }，服务端按整串匹配
+          //   · 更坑的是 SnowLuma 的 invoke 只检查「有没有响应/发没发出去」，
+          //     **完全不看服务端返回的结果** —— 传 md5 时它会照常回 status:ok，
+          //     于是旧代码一路走到 sendJson({ok:true})，表情纹丝不动。
+          //     这正是「点了删除、显示成功、但删不掉」的全部原因。
           const body = await readBody();
-          const stickerId = String(body.stickerId ?? '').trim();
-          if (!stickerId) { sendJson({ ok: false, error: 'stickerId 不能为空' }, 400); return; }
+          const rawId = String(body.stickerId ?? '').trim();
+          if (!rawId) { sendJson({ ok: false, error: 'stickerId 不能为空' }, 400); return; }
           try {
-            const delRes = await bot.request('delete_custom_face', { emoji_id: stickerId });
+            // 先把 md5 / 备注 之类的引用还原成真正的 emoji_id。
+            const resolved = resolveSticker(stickerEntries, rawId);
+            if (!resolved.entry) {
+              sendJson({ ok: false, error: resolved.error || `找不到表情 ${rawId}` }, 404);
+              return;
+            }
+            const emojiId = String(resolved.entry.id || '').trim();
+            // 防御：emoji_id 形如 `<uin>_0_0_0_<32位md5>_0_0`，长度明显大于 md5。
+            // 万一是异常数据，宁可报错也不要发一条无效删除请求然后谎报成功。
+            if (!/_\d+_\d+_\d+_[0-9A-Fa-f]{32}_\d+_\d+$/.test(emojiId)) {
+              sendJson({ ok: false, error: `表情 ${emojiId} 的 id 格式不是合法 emoji_id，已拒绝（未做任何删除）` }, 400);
+              return;
+            }
+            const delRes = await bot.request('delete_custom_face', { emoji_id: emojiId });
             if (!delRes || delRes.status !== 'ok' || delRes.retcode !== 0) {
               throw new Error(`delete_custom_face 失败: ${delRes?.wording || delRes?.retcode || 'unknown'}`);
             }
             // 删除后用 HTTP 重新同步：WS 侧的列表是旧的，用它判断"删没删掉"永远为否。
             const synced = await syncStickerLibrary(true, { preferHttp: true });
-            log(`[sticker] 删除表情 ${stickerId}`);
-            appendActivity(`[sticker] 控制台删除表情：${stickerId}`);
-            sendJson({ ok: true, total: synced?.entries?.length ?? stickerEntries.length });
+            const stillThere = (synced?.entries ?? stickerEntries).some((e) => e && e.id === emojiId);
+            // ⚠️ 不信 retcode，只信**重新拉回来的列表**：
+            // 上游对无效 emoji_id 也会回 status:ok，唯一可靠的证据是它还在不在。
+            if (stillThere) {
+              log(`[sticker] 删除未生效 ${emojiId}（服务端仍返回该表情）`);
+              sendJson({ ok: false, error: `删除未生效：表情 ${emojiId} 仍在收藏里（可能已被 QQ 端限制）` }, 409);
+              return;
+            }
+            log(`[sticker] 删除表情 ${emojiId}`);
+            appendActivity(`[sticker] 控制台删除表情：${emojiId}`);
+            sendJson({ ok: true, total: synced?.entries?.length ?? stickerEntries.length, deleted: emojiId });
           } catch (error) {
             sendJson({ ok: false, error: `删除表情失败：${error?.message ?? error}` }, 500);
           }
@@ -7359,7 +7461,12 @@ async function main() {
           const id = Number(keyMatch[2]);
           try {
             const st = getSocialV2State(key);
-            const found = (st.recentMessages || []).find((m) => m && (String(m.seq) === messageId || (m.messageId && String(m.messageId) === messageId)));
+            // `#4` 与 `4` 是同一个引用（消息行里 seq 渲染成 #N，模型会照抄）
+            const detailRefs = [...new Set([String(messageId), normalizeMessageRef(messageId)].filter(Boolean))];
+            const found = (st.recentMessages || []).find((m) => m && (
+              detailRefs.includes(String(m.seq ?? '').trim())
+              || (m.messageId && detailRefs.includes(String(m.messageId).trim()))
+            ));
             const forwardFields = found ? {
               forwardIds: Array.isArray(found.forwardIds) ? found.forwardIds : [],
               hasForward: !!found.hasForward
@@ -8768,7 +8875,20 @@ async function main() {
           }
           const media = findMessageMedia(key, messageId);
           if (!media.length) {
-            sendJson({ ok: true, messageId, media: [], images: [], note: '该消息没有可读取的图片/表情元数据' });
+            // ⚠️ 「没找到这条消息」和「消息存在但没有图」是两件事，必须分开报。
+            // 都回一句「没有可读取的图片/表情元数据」会让模型以为图真没了，
+            // 而实际上它可能只是把引用写错了（比如传了 `#4` 之外的别的写法、
+            // 或者那条消息已经滑出 recentMessages 窗口）。
+            const probed = findMessageByRef(key, messageId);
+            if (!probed.found) {
+              sendJson({
+                ok: false,
+                messageId,
+                error: `找不到消息 ${messageId}。可传消息行开头的 #seq（如 #4，带不带 # 都行）或 messageId；超出最近窗口的消息要用 qq_get_recent_messages 先把它取回来。`
+              }, 404);
+              return;
+            }
+            sendJson({ ok: true, messageId, media: [], images: [], note: '这条消息确实没有图片/表情（纯文字）' });
             return;
           }
           try {
@@ -9964,9 +10084,57 @@ async function main() {
     return `\n【图片/表情】本条消息包含 ${what}${stickerNote}（消息ID=${messageRef}）。`;
   }
 
+  /**
+   * 把「模型会怎么写出来的消息引用」归一成可比较的几种形态。
+   *
+   * 为什么必须做（2026-11-17 线上踩到）：
+   *   桥接渲染消息行时把 seq 显示成 `#4`（见 compactModelMessage 的注释：
+   *   "`seq` → `#123` 保留（引用、水位）"）。模型于是照着抄，把 `#4` 原样
+   *   传给 qq_get_message_images —— 而查找只比对裸数字 `4`，永远对不上，
+   *   于是那条明明带表情包的消息被判成「没有可读取的图片/表情元数据」。
+   *
+   * 归一规则（宽松读、严格写）：
+   *   `#4` / `＃4`（全角）/ `消息#4` / ` #4 ` → `4`
+   *   其余形态原样返回，交给调用方按 messageId 再试。
+   */
+  function normalizeMessageRef(ref) {
+    const raw = String(ref ?? '').trim();
+    if (!raw) return '';
+    // 只剥「井号前缀」这一种明确写法，不做别的猜测
+    const m = /^(?:消息|訊息)?\s*[#＃]\s*(\d+)$/.exec(raw);
+    return m ? m[1] : raw;
+  }
+
+  /**
+   * 按引用找**消息本身**（不管它有没有图）。只用于把「找不到消息」和
+   * 「消息没图」区分开 —— 这两种情况的报错对模型的意义完全不同。
+   */
+  function findMessageByRef(key, ref) {
+    const refStr = String(ref ?? '').trim();
+    if (!refStr) return { found: false, message: null };
+    const refCandidates = [...new Set([refStr, normalizeMessageRef(refStr)].filter(Boolean))];
+    if (currentMode === 'reserved2' || socialV2.conversations.has(key)) {
+      try {
+        const st = getSocialV2State(key);
+        if (st) {
+          for (const messages of [st.recentMessages, st.unread]) {
+            const hit = (Array.isArray(messages) ? messages : []).find((m) => m && (
+              refCandidates.includes(String(m.messageId || '').trim())
+              || refCandidates.includes(String(m.seq || '').trim())
+            ));
+            if (hit) return { found: true, message: hit };
+          }
+        }
+      } catch {}
+    }
+    return { found: false, message: null };
+  }
+
   function findMessageMedia(key, ref) {
     const refStr = String(ref ?? '').trim();
     if (!refStr) return [];
+    // `#4` 和 `4` 指向同一条消息，两种都要试（见 normalizeMessageRef 的说明）。
+    const refCandidates = [...new Set([refStr, normalizeMessageRef(refStr)].filter(Boolean))];
     // 二代：消息对象上直接带 media（仅在确实存在二代会话状态时读取，避免为 gen1 创建影子状态）
     if (currentMode === 'reserved2' || socialV2.conversations.has(key)) {
       try {
@@ -9975,7 +10143,10 @@ async function main() {
           // Unread can outlive the recent window. Compact model views retain
           // handles instead of transport URLs, so both buffers must resolve.
           for (const messages of [st.recentMessages, st.unread]) {
-            const found = (Array.isArray(messages) ? messages : []).find((m) => m && (String(m.messageId || '') === refStr || String(m.seq || '') === refStr));
+            const found = (Array.isArray(messages) ? messages : []).find((m) => m && (
+              refCandidates.includes(String(m.messageId || '').trim())
+              || refCandidates.includes(String(m.seq || '').trim())
+            ));
             if (found && Array.isArray(found.media) && found.media.length) return found.media;
           }
         }
@@ -9984,11 +10155,13 @@ async function main() {
     // 一代/普通模式：messageMediaStore
     const byRef = messageMediaStore.get(key);
     if (byRef) {
-      const hit = byRef.get(refStr);
-      if (Array.isArray(hit)) return hit;
+      for (const rc of refCandidates) {
+        const hit = byRef.get(rc);
+        if (Array.isArray(hit)) return hit;
+      }
       // 兼容按 seq 查找（messageMediaStore 只存 messageId 时，尝试遍历所有值）
       for (const [storedRef, media] of byRef) {
-        if (String(storedRef) === refStr && Array.isArray(media)) return media;
+        if (refCandidates.includes(String(storedRef).trim()) && Array.isArray(media)) return media;
       }
     }
     return [];
@@ -12724,9 +12897,13 @@ async function main() {
   async function resolveReplyTargetV2(st, kind, convId, ref) {
     const refStr = String(ref ?? '').trim();
     if (!refStr) return null;
-    const found = Array.isArray(st?.recentMessages) ? st.recentMessages.find((m) => m && String(m.seq) === refStr) : null;
+    // `#4` 与 `4` 都指向同一条（消息行里 seq 渲染成 #N，模型会照抄）
+    const refCandidates = [...new Set([refStr, normalizeMessageRef(refStr)].filter(Boolean))];
+    const found = Array.isArray(st?.recentMessages)
+      ? st.recentMessages.find((m) => m && refCandidates.includes(String(m.seq ?? '').trim()))
+      : null;
     // 若 ref 命中本地 seq，且本地存有真实 messageId，优先按 seq 映射，避免与真实 id 冲突。
-    if (found && found.messageId && String(found.messageId) !== refStr) {
+    if (found && found.messageId && !refCandidates.includes(String(found.messageId))) {
       const realId = String(found.messageId);
       const realInfo = await resolveReplyInfo(kind, convId, realId);
       return {
@@ -13803,11 +13980,17 @@ async function main() {
   /** 聊天标签：与发言时 key 参数一一对应，模型照着抄即可。 */
   function chatLabelForV2(key) {
     const canonical = canonicalV2Key(key) || key;
-    // 2026-11-10（操作者要求）：**只简化群聊**，私聊保持原样带 QQ 号。
+    // 2026-11-10（操作者要求）：**只简化群聊**，私聊保留号码（可能有多个私聊）。
     //   群：`群20001` → `群`（消息行每条都带，实测 2113 行；群号在同一会话里恒等，
     //       对模型决策零信息量，真正要抄的 key 由【令牌】行给一次就够）
-    //   私聊：维持 `私聊10001（主人）` —— 私聊可能不止一个，号码是天然消歧符，
-    //       不简化（操作者明确要求）。
+    //   私聊：维持 `私聊10001` —— 私聊可能不止一个，号码是天然消歧符。
+    //
+    // 2026-11-18（操作者要求）：**私聊标签里不再带「（主人）」**。
+    // 原来私聊标签是 `私聊84420221（主人）`，每条消息行前缀都带一遍；
+    // 一个会话上百行就是上千字符的白烧。
+    // 注意：**群聊消息行末尾仍保留「（主人）」**（见 renderOneMessageLine）——
+    // 群里人多，需要一眼看出谁是管理员、谁的话权重更高。
+    // 私聊里对方就是主人，没必要每条重复。
     //
     // 群聊仍需消歧：组内有两个以上群时退回带号码，否则两个群都叫「群」就串号了。
     try {
@@ -13818,12 +14001,12 @@ async function main() {
         return sameKind.length > 1 ? `群${canonical.slice('group:'.length)}` : '群';
       }
       const uid = canonical.slice('private:'.length);
-      return String(cfg.ownerQQ ?? '') === uid ? `私聊${uid}（主人）` : `私聊${uid}`;
+      return `私聊${uid}`;
     } catch {
       // 兜底：拿不到共享组就退回旧行为，宁可啰嗦也不能让两个聊天撞名。
       if (canonical.startsWith('group:')) return `群${canonical.slice('group:'.length)}`;
       const uid = canonical.slice('private:'.length);
-      return String(cfg.ownerQQ ?? '') === uid ? `私聊${uid}（主人）` : `私聊${uid}`;
+      return `私聊${uid}`;
     }
   }
 
@@ -13967,7 +14150,8 @@ async function main() {
    *   · `text`     → 原样（超 300 字截断）          保留
    *   · `at`       → `16:34`                       保留（操作者要求）
    *   · `ago`      → `（1小时前）`                  保留，与 at 并列
-   *   · `isOwner`+`ownerLabel` → `（主人）`          合并，省约 52 字符
+   *   · `isOwner`+`ownerLabel` → **不输出**（2026-11-18 删）：谁是主人由【令牌】行
+ *                 和 preset 说明，每条消息重复一遍纯属白烧。
    *   · `messageId`→ 仅媒体/转发时 `图id=`/`转发id=` 其余删（引用走 seq）
    *   · `media[]`  → 删（正文已有 `[图片]`/`[表情]`） 省约 80 字符
    */
@@ -14003,7 +14187,17 @@ async function main() {
     }
     const tail = refs.length ? `（${refs.join(' ')}）` : '';
     const selfMark = m?.quoteTargetIsSelf ? '↩你 ' : '';
-    const ownerMark = m?.isOwner ? '（主人）' : '';
+    // 2026-11-18（操作者要求）：**只有私聊才省略「（主人）」**。
+    //
+    // 群聊里人多、同一个人可能和一群人混在一起说话，「（主人）」是一个有用的区分
+    // （谁是管理员、谁的话权重更高）—— 保留。
+    // 私聊里对方就是主人，这个标记每条都重复一遍纯属白烧（一个会话几十上百条），
+    // 而且【令牌】行和 preset 已经把「跟主人在私聊」这件事说清楚了。
+    //
+    // 判定依据是 label 是否以「私聊」开头 —— 那正是 chatLabelForV2 给私聊的标签，
+    // 也是唯一在渲染时才拿得到的信息（renderOneMessageLine 不知道 key）。
+    const isPrivateLabel = String(opts.label ?? '').startsWith('私聊');
+    const ownerMark = (m?.isOwner && !isPrivateLabel) ? '（主人）' : '';
     // 2026-11-12（操作者方案）：**消息行不再带 QQ 号**。
     // 以前每条都挂 `userId:123456789`（18 字符），唤醒词 2113 行加起来是白烧。
     // 现在只显示人名；需要号时用 qq_get_userid（query=人名）反查 ——
@@ -14019,7 +14213,7 @@ async function main() {
     const recent = Array.isArray(snapshot.recent) ? snapshot.recent : [];
     const one = (m) => renderOneMessageLine(m);
     // ── 共用会话：组内多条聊天混排，每条标来源 ────────────────────────────
-    // 格式：`[群] 阿三·16:34（2分钟前）：…` / `[私聊10001（主人）] 主人·…：…`
+    // 格式：`[群] 阿三·16:34（2分钟前）：…` / `[私聊10001] 主人·…：…`
     // 标签写的就是发言时要传的 key 的"人话版"，模型照着标签就知道回哪儿。
     if (snapshot.shared) {
       const rows = Array.isArray(snapshot.messages) ? snapshot.messages : [];
@@ -14040,7 +14234,7 @@ async function main() {
       const out = [`【本轮消息】${head}${through ? `，${through}` : ''}`];
       if (rows.length) {
         for (const row of rows) out.push(oneRow(row));
-        // 「上面带方括号的就是去处…」这句删了：标签现在是 `[群]` / `[私聊10001（主人）]`，
+        // 「上面带方括号的就是去处…」这句删了：标签现在是 `[群]` / `[私聊10001]`，
         // 和【令牌】行的「群 → key "group:…"」一眼对得上，再解释一遍纯属重复。
       }
       if (past.length) {
@@ -14160,7 +14354,7 @@ async function main() {
     // 2026-11-10 起不再单独出这段：群聊标签已缩成「群」，私聊保持带 QQ 号，
     // 而「标签 → key → 令牌」的三元组统一由 sessionTokenLineV2 给一次。
     // 同一个映射写两遍（场景段给 key、令牌段再给 key+令牌）是纯重复。
-    // 【怎么回】那段也删了：消息行本身就带 `[群]` / `[私聊10001（主人）]` 前缀，
+    // 【怎么回】那段也删了：消息行本身就带 `[群]` / `[私聊10001]` 前缀，
     // 「想回哪个就把 key 填成对应的那个」属于一眼可推的推论。
     if (group.length > 1) return '';
     // 非共享组（只有一个聊天）保留一句最短定位，它没有"多聊天"的上下文可推。
@@ -15263,13 +15457,30 @@ async function main() {
     if (socialV2.paused || currentMode !== 'reserved2') return;
     if (!isSessionAllowedInCurrentMode(key)) return;
     const st = getSocialV2State(key);
+    // 2026-11-18：**会话级开关**（面板「主动机会」页）。
+    //
+    // 全局 cfg.socialV2.proactive.enabled 是"这个功能开不开"，
+    // 会话级 st.proactiveDisabled 是"这个聊天允不允许她主动冒泡" ——
+    // 一个活跃的群里可能希望她偶尔接话，一个工作私聊则完全不希望被打扰。
+    // 关掉时不排定时器，也不会留下已经排好的（下次进这里就 return）。
+    if (st.proactiveDisabled === true) {
+      if (st.proactiveTimer) {
+        clearTimeout(st.proactiveTimer);
+        st.proactiveTimer = null;
+      }
+      return;
+    }
     if (st.proactiveTimer) return;
     const p = cfg.socialV2?.proactive ?? {};
     const min = Math.max(60 * 1000, Number(p.checkIntervalMinMs) || 30 * 60 * 1000);
     const max = Math.max(min, Number(p.checkIntervalMaxMs) || 90 * 60 * 1000);
     const delay = Math.floor(min + Math.random() * (max - min));
+    // 记下"预计什么时候检查"，纯粹给面板显示倒计时用。
+    // 原来的定时器是黑盒：面板只能写"已安排"，看不出还有多久。
+    st.proactiveNextCheckAt = Date.now() + delay;
     st.proactiveTimer = setTimeout(() => {
       st.proactiveTimer = null;
+      st.proactiveNextCheckAt = 0;
       ensureWakeableV2(st, { key });
       const idleThreshold = Number(p.idleThresholdMs) || 15 * 60 * 1000;
       const idle = Date.now() - (st.lastIncomingAt || 0);

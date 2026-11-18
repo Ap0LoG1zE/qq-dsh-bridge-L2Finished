@@ -45,6 +45,10 @@ export const ROUTES = {
   impressions: `${routePath}/impressions`,
   selfNotes: `${routePath}/self-notes`,
   todos: `${routePath}/todos`,
+  // 主动机会：按会话列出 / 切换（2026-11-18）。
+  // 桥接侧有两个概念：全局 proactive.enabled（功能开不开）和
+  // 会话级 st.proactiveDisabled（这个聊天允不允许她主动冒泡）。这里管后者。
+  proactive: `${routePath}/proactive`,
   tokens: `${routePath}/tokens`,
   stickers: `${routePath}/stickers`,
   launchSnowluma: `${routePath}/launch-snowluma`,
@@ -772,8 +776,42 @@ async function handleTodos(req, res) {
   return json(res, 400, { ok: false, error: '未知 action' })
 }
 
-async function handleFacts(req, res) {
+/**
+ * 主动机会（2026-11-18）：按会话列出 / 开关她"主动冒泡"的许可。
+ *
+ * 桥接里有两层开关，别混淆：
+ *   · 全局 proactive.enabled —— 整个功能开不开（在「回复节奏」里，是参数不是开关）
+ *   · 会话级 proactiveDisabled —— **这个聊天**允不允许她主动开口（这一页管的）
+ * 两个都满足才会排检查。这里只看后者，前者作为提示写在页头。
+ */
+async function handleProactive(req, res) {
   const env = bridgeEnv()
+  if (!env.ok) return json(res, 200, { ok: false, error: env.error })
+
+  if ((req.method || 'GET') === 'GET') {
+    const r = await bridgeApi(env, '/api/socialV2/proactive-sessions')
+    if (!r.ok) return json(res, 200, { ok: false, error: r.error || `HTTP ${r.status}` })
+    const data = r.data || {}
+    return json(res, 200, {
+      ok: true,
+      global: data.global || {},
+      sessions: Array.isArray(data.sessions) ? data.sessions : [],
+    })
+  }
+
+  let body
+  try { body = await readJsonBody(req) } catch (error) { return json(res, 400, { ok: false, error: String(error.message || error) }) }
+  const key = String(body.key || '').trim()
+  if (!key) return json(res, 400, { ok: false, error: 'key 不能为空' })
+
+  const r = await bridgeApi(env, '/api/socialV2/proactive-sessions', {
+    method: 'POST',
+    body: { key, enabled: body.enabled !== false },
+  })
+  return json(res, 200, r.ok ? { ok: true, ...(r.data || {}) } : { ok: false, error: r.error || `HTTP ${r.status}` })
+}
+
+async function handleFacts(req, res) {  const env = bridgeEnv()
   if (!env.ok) return json(res, 200, { ok: false, error: env.error })
 
   if ((req.method || 'GET') === 'GET') {
@@ -1464,6 +1502,7 @@ export function mount(ctx) {
     [ROUTES.impressions, handleImpressions],
     [ROUTES.selfNotes, handleSelfNotes],
     [ROUTES.todos, handleTodos],
+  [ROUTES.proactive, handleProactive],
     [ROUTES.tokens, handleTokens],
     [ROUTES.stickers, handleStickers],
     [ROUTES.launchSnowluma, handleLaunchSnowluma],
