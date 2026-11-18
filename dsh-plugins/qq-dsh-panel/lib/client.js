@@ -751,18 +751,27 @@ window.__ModuleLoader__.load({
     { id: 'diagnose', label: '诊断' },
   ]
 
-  // [字段路径, 显示名, 说明]
+  // [字段路径, 显示名, 说明, 附加]
+  //   附加 'bool'      → 渲染成勾选框
+  //   附加 'sec'       → 单位是**秒**（后端存毫秒，读写时自动 ×1000 / ÷1000）
+  //
+  // 2026-11-19 操作者要求：时间类字段一律显示秒。填 "30" 就是 30 秒，
+  // 比填 30000 直观得多。字段名里带 Ms 的那些都要加 'sec'。
   var RHYTHM_FIELDS = [
-    ['autoReplyCheckMs', '唤醒检查间隔', '毫秒。越小越「秒回」，但轮询更频繁'],
+    ['autoReplyCheckMs', '唤醒检查间隔', '秒。越小越「秒回」，但轮询更频繁', 'sec'],
     ['send.burstMaxMessages', '单次最多几条', '一轮回复最多拆成几条消息'],
-    ['send.burstIntervalMinMs', '条间最短间隔', '毫秒'],
-    ['send.burstIntervalMaxMs', '条间最长间隔', '毫秒'],
+    ['send.burstIntervalMinMs', '条间最短间隔', '秒', 'sec'],
+    ['send.burstIntervalMaxMs', '条间最长间隔', '秒', 'sec'],
+    // 2026-11-19 新增：操作者要在面板上调「发完空转多久」。
+    // 语义（2026-11-17 定）：总预算 = 发送那几秒 + 这个值；
+    // 期间对方发消息就重置下面的「静默判定窗口」，直到安静满才一次贴给她。
+    ['send.observeAfterSendMs', '发送后空转', '秒。总预算 = 发送耗时 + 这个值', 'sec'],
     ['send.maxSendPerMinute', '每分钟峰值', '超过会被桥接限流（防 QQ 风控）'],
     ['send.maxSendPerHour', '每小时峰值', '同上'],
     ['send.maxMessageChars', '单条最大字数', '超出自动按句读切分'],
-    ['wait.defaultMs', '等待消息默认时长', '毫秒。AI 调 qq_wait_for_messages 的默认值'],
-    ['wait.defaultQuietMs', '静默判定窗口', '毫秒。连续安静这么久才算对方说完'],
-    ['wake.batchWindowMs', '唤醒合并窗口', '毫秒。多条消息合并成一次唤醒'],
+    ['wait.defaultMs', '等待消息默认时长', '秒。AI 调 qq_wait_for_messages 的默认值', 'sec'],
+    ['wait.defaultQuietMs', '静默判定窗口', '秒。连续安静这么久才算对方说完；发送后空转期间也用它', 'sec'],
+    ['wake.batchWindowMs', '唤醒合并窗口', '秒。多条消息合并成一次唤醒', 'sec'],
     ['wake.maxWakePerHour', '每小时最多唤醒', '防止反复自我唤醒'],
     ['context.recentLimit', '历史消息保留条数', '每个会话最多存多少条历史（只是缓存上限）。真正每轮注入几条由下面的唤醒包参数决定，不受这个影响'],
     // QQ 空间：它只是一个工具，不是日程任务。这里控制「能不能发 / 一天最多几条」，
@@ -2295,9 +2304,21 @@ window.__ModuleLoader__.load({
         } else {
           input = h('input', 'dsh-fb-input')
           input.type = 'number'
-          input.value = (v === undefined || v === null) ? '' : String(v)
+          // 2026-11-19：单位是秒的字段，把后端存的毫秒换算成秒再显示。
+          // 注意 undefined/null 要留空，不能变成 0 —— 0 秒是有意义的配置值，
+          // 和"没配过"不是一回事（没必要但容易混淆，留空更清楚）。
+          if (spec[3] === 'sec' && v !== undefined && v !== null && v !== '') {
+            var sec = Number(v) / 1000
+            // 去掉浮点尾巴：30000/1000=30 而不是 30.000000000000004
+            input.value = String(Math.round(sec * 1000) / 1000)
+          } else {
+            input.value = (v === undefined || v === null) ? '' : String(v)
+          }
+          input.step = spec[3] === 'sec' ? 'any' : '1'
+          input.min = '0'
         }
         input.dataset.key = spec[0]
+        if (spec[3] === 'sec') input.dataset.unit = 'sec'
         field.appendChild(input)
         field.appendChild(h('small', null, spec[2]))
         grid.appendChild(field)
@@ -2354,6 +2375,9 @@ window.__ModuleLoader__.load({
       }
       var num = Number(input.value)
       if (input.value === '' || !isFinite(num)) continue
+      // 2026-11-19：单位是秒的字段，存回配置时要换算成毫秒。
+      // 不换算的话「30 秒」会被当成 30 毫秒存下去 —— 安静窗直接归零。
+      if (input.dataset.unit === 'sec') num = Math.round(num * 1000)
       cur[parts[parts.length - 1]] = num
     }
     setBody([h('div', 'dsh-fb-empty', '保存中…')])

@@ -8,7 +8,21 @@ const KEY = 'group:456';
 const ACTIVE = { mode: 'active' };
 const DIVING = { mode: 'diving', infinite: true, triggers: { atMention: true, anyMessage: false } };
 const plain = (value) => JSON.parse(JSON.stringify(value));
-const seqs = (messages) => Array.from(messages, (message) => message.seq);
+const seqs = (messages) => Array.from(messages ?? [], (message) => message.seq);
+// 2026-11-10 起 mark-read / wake-config 只回一句话（操作者要求省 token），
+// markedCount 字段已经不存在 —— 数字写在「✅ 收尾完成：标记 N 条已读」里。
+const markedOf = (data) => {
+  const text = String(data?.text ?? '');
+  const m = /标记 (\d+) 条已读/.exec(text);
+  if (m) return Number(m[1]);
+  // 「一条都没标」时桥接换了一种说法：「✅ 收尾完成：读到 #1（没有新的要标记）。」
+  // 这不是失败，就是 0 —— 别再当成"回包里缺字段"抛错。
+  if (/没有新的要标记/.test(text)) return 0;
+  throw new Error(`回包里既没有「标记 N 条已读」也没有「没有新的要标记」：${JSON.stringify(text || data)}`);
+};
+// unread / recent 同样只回渲染好的文本行（`[群] #seq 谁·时间：内容`），
+// 所以按行里的 #N 取 seq，语义与原来的 messages[].seq 一致。
+const lineSeqs = (data) => [...String(data?.text ?? '').matchAll(/#(\d+)\s/g)].map((m) => Number(m[1]));
 let failures = 0;
 let tests = 0;
 
@@ -66,7 +80,7 @@ await test('mark-read acknowledges only the displayed watermark and preserves a 
   append('new arrival while model thinks');
   const marked = await request('mark-read', { body: { throughSeq: read.data.readThroughSeq } });
   assert.equal(marked.status, 200);
-  assert.equal(marked.data.markedCount, 1);
+  assert.equal(markedOf(marked.data), 1);
   assert.deepEqual(seqs(st.unread), [2]);
   assert.equal(st.lastReadThroughSeq, 1);
 });
@@ -77,7 +91,7 @@ await test('wake-config atomically acknowledges its displayed watermark while pr
   append('unseen new arrival');
   const result = await request('wake-config', { body: { config: ACTIVE, throughSeq: read.data.readThroughSeq } });
   assert.equal(result.status, 200);
-  assert.equal(result.data.markedCount, 1);
+  assert.equal(markedOf(result.data), 1);
   assert.equal(st.wakeConfig.confirmedBy, 'set_wake_config');
   assert.equal(st.wakeConfig.mode, 'active');
   assert.deepEqual(seqs(st.unread), [2]);
@@ -103,17 +117,17 @@ await test('a late slice cannot authorize clearing an earlier unseen message', a
   append('older unseen message');
   append('latest message');
   const latest = await request('unread', { query: '&limit=1' });
-  assert.deepEqual(seqs(latest.data.messages), [2]);
+  assert.deepEqual(lineSeqs(latest.data), [2]);
   assert.equal(latest.data.readThroughSeq, 0);
   const denied = await request('mark-read', { body: { throughSeq: 2 } });
   assert.equal(denied.status, 400);
   assert.deepEqual(seqs(st.unread), [1, 2]);
   const older = await request('recent', { query: '&limit=1&offset=1' });
-  assert.deepEqual(seqs(older.data.messages), [1]);
+  assert.deepEqual(lineSeqs(older.data), [1]);
   assert.equal(older.data.readThroughSeq, 2);
   const marked = await request('mark-read', { body: { throughSeq: older.data.readThroughSeq } });
   assert.equal(marked.status, 200);
-  assert.equal(marked.data.markedCount, 2);
+  assert.equal(markedOf(marked.data), 2);
   assert.deepEqual(seqs(st.unread), []);
 });
 
@@ -131,7 +145,7 @@ await test('my-recent returns an existing safe cursor without authorizing unrela
   h.recordSentMessagesV2(KEY, ['my own earlier reply']);
   const mine = await request('my-recent');
   assert.equal(mine.status, 200);
-  assert.equal(mine.data.messages.length, 1);
+  assert.equal(lineSeqs(mine.data).length, 1);
   assert.equal(mine.data.readThroughSeq, 0);
   assert.equal((await request('mark-read', { body: { throughSeq: 1 } })).status, 400);
   await request('unread');
@@ -160,7 +174,7 @@ await test('a full quiet observation allows a single combined close', async ({ h
   assert.equal(waited.data.readThroughSeq, read.data.readThroughSeq);
   const close = await request('wake-config', { body: { config: DIVING, throughSeq: waited.data.readThroughSeq } });
   assert.equal(close.status, 200);
-  assert.equal(close.data.markedCount, 1);
+  assert.equal(markedOf(close.data), 1);
   assert.deepEqual(seqs(st.unread), []);
 }, { observe: true });
 
@@ -178,7 +192,7 @@ await test('wait exposes new messages and grants only their actually observed cu
   assert.equal(waited.data.readThroughSeq, 2);
   const close = await request('wake-config', { body: { config: DIVING, throughSeq: waited.data.readThroughSeq } });
   assert.equal(close.status, 200);
-  assert.equal(close.data.markedCount, 2);
+  assert.equal(markedOf(close.data), 2);
   assert.deepEqual(seqs(st.unread), []);
 }, { observe: true });
 
@@ -207,7 +221,7 @@ await test('legacy mark-read still clears all unread and legacy wake-config pres
   append('legacy second message');
   const marked = await request('mark-read', { body: {} });
   assert.equal(marked.status, 200);
-  assert.equal(marked.data.markedCount, 2);
+  assert.equal(markedOf(marked.data), 2);
   assert.deepEqual(seqs(st.unread), []);
 });
 
@@ -227,11 +241,11 @@ await test('an invalid wake configuration cannot acknowledge an otherwise valid 
 await test('zero and repeated watermarks never acknowledge a later unseen arrival', async ({ st, request, append }) => {
   append('first seen');
   await request('unread');
-  assert.equal((await request('mark-read', { body: { throughSeq: 0 } })).data.markedCount, 0);
+  assert.equal(markedOf((await request('mark-read', { body: { throughSeq: 0 } })).data), 0);
   assert.deepEqual(seqs(st.unread), [1]);
-  assert.equal((await request('mark-read', { body: { throughSeq: 1 } })).data.markedCount, 1);
+  assert.equal(markedOf((await request('mark-read', { body: { throughSeq: 1 } })).data), 1);
   append('later unseen');
-  assert.equal((await request('mark-read', { body: { throughSeq: 1 } })).data.markedCount, 0);
+  assert.equal(markedOf((await request('mark-read', { body: { throughSeq: 1 } })).data), 0);
   assert.deepEqual(seqs(st.unread), [2]);
   assert.equal((await request('mark-read', { body: { throughSeq: 2 } })).status, 400);
 });
@@ -244,7 +258,7 @@ await test('combined close respects the separate mark-read and wake-config tool 
   // the wake config still lands and the unread messages stay pending.
   const ignoredCursor = await request('wake-config', { body: { throughSeq: 1, config: ACTIVE } });
   assert.equal(ignoredCursor.status, 200, 'a disabled markRead must not fail the closing call');
-  assert.equal(ignoredCursor.data.markedCount, 0);
+  assert.equal(markedOf(ignoredCursor.data), 0);
   assert.equal((await request('mark-read', { body: { throughSeq: 1 } })).status, 403);
   assert.deepEqual(seqs(st.unread), [1], 'no unread may be cleared while markRead is off');
   assert.equal((await request('wake-config', { body: { config: ACTIVE } })).status, 200);
@@ -345,7 +359,7 @@ await test('oversized first stored unread remains intact and cannot be skipped b
   assert.ok(JSON.stringify(snapshot).length <= 500);
   assert.deepEqual(plain(st.unread[0]), storedBefore);
   const unread = await request('unread');
-  assert.deepEqual(unread.data.messages[0], storedBefore);
+  assert.ok(String(unread.data.text).includes('消息前半部分'), '超大消息仍要能被读到（回包是文本行）');
 });
 
 await test('snapshot recent history stays chronological and does not duplicate unread', async ({ h, request, append }) => {
@@ -508,13 +522,13 @@ await test('oldest-first unread paging can drain a backlog beyond both recent an
   h.cfg.socialV2.context.inlineWakeMessages = false;
   for (let i = 1; i <= 150; i++) append(`backlog ${i}`);
   const tail = await request('unread', { query: '&limit=100' });
-  assert.equal(tail.data.messages[0].seq, 51, 'legacy tail ordering stays unchanged');
+  assert.equal(lineSeqs(tail.data)[0], 51, 'legacy tail ordering stays unchanged');
   assert.equal(tail.data.readThroughSeq, 0);
   const first = await request('unread', { query: '&limit=30&afterSeq=0' });
-  assert.deepEqual(seqs(first.data.messages), Array.from({ length: 30 }, (_, i) => i + 1));
+  assert.deepEqual(lineSeqs(first.data), Array.from({ length: 30 }, (_, i) => i + 1));
   assert.equal(first.data.readThroughSeq, 30);
   const next = await request('unread', { query: '&limit=30&afterSeq=30' });
-  assert.equal(next.data.messages[0].seq, 31);
+  assert.equal(lineSeqs(next.data)[0], 31);
   assert.equal(next.data.readThroughSeq, 150, 'previous tail receipt now joins the complete prefix');
   append('arrived after complete read');
   assert.equal((await request('wake-config', { body: { config: ACTIVE, throughSeq: next.data.readThroughSeq } })).status, 200);
@@ -557,7 +571,7 @@ await test('an evicted unread window cannot drag the acknowledged watermark back
   assert.deepEqual(seqs(st.unread), [7, 8, 9, 10, 11], 'older unread was evicted by unreadLimit');
   const after = await request('unread', { query: '&limit=5&afterSeq=5' });
   assert.ok(after.data.readThroughSeq >= 5, `watermark regressed to ${after.data.readThroughSeq}`);
-  assert.equal(after.data.messages.length, 5, `afterSeq returned ${JSON.stringify(seqs(after.data.messages))}`);
+  assert.equal(lineSeqs(after.data).length, 5, `afterSeq returned ${JSON.stringify(lineSeqs(after.data))}`);
   assert.equal(after.data.readThroughSeq, 11, `newly displayed messages must extend the watermark from its floor (got ${after.data.readThroughSeq})`);
   const again = await request('mark-read', { body: { throughSeq: 11 } });
   assert.equal(again.status, 200, 'a cursor earned by the model must stay acceptable after eviction');
@@ -601,8 +615,8 @@ await test('a displayed page extends the watermark across an eviction gap it can
   assert.equal((await request('mark-read', { body: { throughSeq: 4 } })).status, 400);
   assert.equal((await request('mark-read', { body: { throughSeq: 6 } })).status, 400);
   const page = await request('unread', { query: '&limit=2&afterSeq=2' });
-  assert.deepEqual(seqs(page.data.messages), [3, 4]);
-  assert.equal(page.data.messages.some((m) => m.seq === 3), true);
+  assert.deepEqual(lineSeqs(page.data), [3, 4]);
+  assert.ok(lineSeqs(page.data).includes(3), '第 3 条必须出现在这一页里');
   // With 3 and 4 displayed, the run from the floor 2 is unbroken: the cursor is 4, and
   // seq 5,6 stay pending rather than being cleared by it.
   assert.equal(page.data.readThroughSeq, 4);

@@ -230,9 +230,21 @@ export function mount(ctx) {
   // whether it applies here.
   const disposeSection = ctx.systemPrompt.section({
     name: 'thinking-language-zh',
-    // 10250 is deliberately past DEPLOYMENT_PERSONA_SUFFIX (10200): the last
-    // thing the model reads before it starts reasoning.
-    order: 10250,
+    // ── 2026-11-19：从 10250 改到 100（与 qq-agent-context 的 qq:session-context 同位置）──
+    //
+    // 原设计把这段放在整个 prompt 的最末尾（10250 > DEPLOYMENT_PERSONA_SUFFIX
+    // 的 10200），注释理由是「模型开始推理前最后读到的东西」。实测这个理由是错的：
+    //
+    // session-0d17e66f 的 turn 1：系统提示词 12,698 字，本段落在 12,387（97.6%），
+    // 前面 8.2 千字是 persona 与工具清单。结果 17 条 reasoning **全部是英文**：
+    //   「Let me get the prompt and the session token. Wait — I need to know...」
+    // 指令完整无损，但对推理语言毫无约束力 —— 排在一万多字之后的最后 311 字，
+    // 在注意力上和没写差不多。
+    //
+    // 现在挪到 100：紧跟 persona（0）、在 FILE_REFERENCE(900) 与所有工具段之前。
+    // 与 qq:session-context 同序（同 order 时按段名排序，两者都在 3~4 号位），
+    // 模型一建立身份就读到「用中文思考」，而不是在 8 千字工具说明之后才看到。
+    order: 100,
     text: (context) => promptFor(state, context),
   })
 

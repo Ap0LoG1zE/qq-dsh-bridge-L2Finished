@@ -910,9 +910,10 @@ server.tool(
   {
     groupId: z.union([z.number(), z.string()]).describe('群号（必须在白名单内）'),
     token: z.string().describe('会话令牌（见唤醒提示中的【令牌】）'),
-    messages: z.union([z.array(z.string()).min(1), z.string()]).describe('要发送的消息数组，每条为纯文本；也兼容传入 JSON 数组字符串')
+    messages: z.union([z.array(z.string()).min(1), z.string()]).describe('要发送的消息数组，每条为纯文本；也兼容传入 JSON 数组字符串'),
+    noWait: z.boolean().optional().describe('true=发完只等句末那一小段就返回，方便紧接着再发一次')
   },
-  async ({ groupId, token, messages }) => {
+  async ({ groupId, token, messages, noWait }) => {
     try {
       const key = `group:${groupId}`;
       let finalMessages = messages;
@@ -935,7 +936,7 @@ server.tool(
       }
       const data = await agentApi('/api/socialV2/send-burst', {
         method: 'POST',
-        body: JSON.stringify({ key, messages: finalMessages }),
+        body: JSON.stringify({ key, messages: finalMessages, noWait: noWait === true }),
         headers: { 'x-agent-token': token },
         timeoutMs: 300000
       });
@@ -971,9 +972,13 @@ server.tool(
     atUserId: z.union([z.number(), z.string()]).optional().describe('要 @ 的群成员 QQ 号（群聊中用于点名某个人；与引用二选一即可，不要滥用）'),
     gapMode: z.enum(['auto', 'fixed', 'byLength']).optional().describe('auto=桥接随机；fixed=固定间隔；byLength=按字数计算'),
     gapMs: z.number().optional().describe('fixed 模式下的统一间隔（毫秒）'),
-    gaps: z.array(z.number()).optional().describe('fixed 模式下逐条间隔（长度=条数-1）')
+    gaps: z.array(z.number()).optional().describe('fixed 模式下逐条间隔（长度=条数-1）'),
+    // 2026-11-19：连发用。默认发完要停下来等一会儿（观察对方有没有接话），
+    // 急着接着发第二段时传 true —— 只等"最后一句之后那一截"（和句与句之间
+    // 同一套随机间隔），然后立刻返回，因此可以马上再调一次本工具。
+    noWait: z.boolean().optional().describe('true=发完只等句末那一小段就返回，方便紧接着再发一次')
   },
-  async ({ key, token, messages, replyToMessageId, atUserId, gapMode, gapMs, gaps }) => {
+  async ({ key, token, messages, replyToMessageId, atUserId, gapMode, gapMs, gaps, noWait }) => {
     try {
       let finalMessages = messages;
       if (typeof finalMessages === 'string') {
@@ -995,7 +1000,7 @@ server.tool(
       }
       const data = await agentApi('/api/socialV2/send-message', {
         method: 'POST',
-        body: JSON.stringify({ key, messages: finalMessages, replyToMessageId, atUserId: atUserId ?? null, gapMode, gapMs, gaps }),
+        body: JSON.stringify({ key, messages: finalMessages, replyToMessageId, atUserId: atUserId ?? null, gapMode, gapMs, gaps, noWait: noWait === true }),
         headers: { 'x-agent-token': token },
         timeoutMs: 300000
       });

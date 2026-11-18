@@ -1003,9 +1003,7 @@ function loadConfig() {
       burstEnabled: true,             // 总开关：是否允许按空格拆成多条 QQ 消息
       burstIntervalMinMs: 1000,       // 条间随机间隔下限（毫秒）
       burstIntervalMaxMs: 3000,       // 条间随机间隔上限（毫秒）
-      longGapProbability: 0.1,        // 长间隔概率（当前控制台保存值）
-      longGapMinMs: 2500,             // 长间隔下限（当前控制台保存值）
-      longGapMaxMs: 5000,             // 长间隔上限（当前控制台保存值）
+      // 长间隔（longGap*）已删除，见下方 socialV2.send 默认值处的说明。
       ...(file.social ?? {})
     },
     // 共用会话（默认关）。开启后：私聊与群共用一个 DSH 会话 + 一套记忆，
@@ -1108,9 +1106,9 @@ function loadConfig() {
         burstMaxMessages: 8,
         burstIntervalMinMs: 1000,
         burstIntervalMaxMs: 3000,
-        longGapProbability: 0.2,
-        longGapMinMs: 5000,
-        longGapMaxMs: 10000,
+        // 2026-11-19：longGapProbability / longGapMinMs / longGapMaxMs 已删除。
+        // 那个"20% 概率卡 5~10 秒"的设计被操作者否掉了（连发时突然停顿 8 秒
+        // 不像真人）。现在一律只在 burstIntervalMin~Max 之间随机。
         maxSendPerMinute: 8,
         maxSendPerHour: 60,
         // 同一会话**两次工具调用**之间至少隔多久（跨回合防砸屏）。
@@ -1885,6 +1883,17 @@ const TIER_PRESETS = Object.freeze({
   OWNER: 'qq-chat-agent',
   READONLY: 'qq-chat-agent',
 });
+
+/**
+ * 本地消息存储的正文预览长度（字符）。
+ *
+ * 为什么要抽成常量（2026-11-19）：这个 200 原本散落在十几处 `.slice(0, 200)` 里，
+ * 而 `message-detail` 要靠「文本长度是否顶到这个上限」来判断有没有被截断。
+ * 两边各写各的数字时，改一处忘了另一处，模型就会把 200 字预览当成全文
+ * （长剧情被静默截断，而且它没有任何理由再去调 qq_get_message_full）。
+ * 新增/修改这一族的截断点时**必须**引用本常量。
+ */
+const MESSAGE_STORE_PREVIEW_CHARS = 200;
 
 /**
  * 「明确列在白名单里」—— 与 {@link allowed} 的区别是**不要 allowAllWhenEmpty 兜底**。
@@ -4641,11 +4650,11 @@ async function main() {
             }
           }
           // 分条间隔 clamp 到非负
-          for (const k of ['burstIntervalMinMs', 'burstIntervalMaxMs', 'longGapMinMs', 'longGapMaxMs']) {
+          for (const k of ['burstIntervalMinMs', 'burstIntervalMaxMs']) {
             if (merged[k] !== undefined) merged[k] = Math.max(0, Number(merged[k]) || 0);
           }
           // 概率字段 clamp 到 0~1
-          for (const k of ['triggerProbability', 'idleRetryProbability', 'proactiveProbability', 'skipProbability', 'surrenderProbability', 'longGapProbability']) {
+          for (const k of ['triggerProbability', 'idleRetryProbability', 'proactiveProbability', 'skipProbability', 'surrenderProbability']) {
             if (merged[k] !== undefined) merged[k] = Math.min(1, Math.max(0, Number(merged[k])));
           }
           // contextWindow 限制 1~100
@@ -4825,15 +4834,14 @@ async function main() {
           // send：数值归一化
           if (body.send && typeof body.send === 'object') {
             merged.send = { ...(current.send ?? {}), ...body.send };
-            for (const k of ['burstMaxMessages', 'burstIntervalMinMs', 'burstIntervalMaxMs', 'longGapProbability', 'longGapMinMs', 'longGapMaxMs', 'maxSendPerMinute', 'maxSendPerHour', 'maxMessageChars', 'maxGapMs', 'gapBaseMs', 'gapPerCharMs', 'minSendIntervalMs', 'observeQuietMs', 'observeAfterSendMs']) {
+            for (const k of ['burstMaxMessages', 'burstIntervalMinMs', 'burstIntervalMaxMs', 'maxSendPerMinute', 'maxSendPerHour', 'maxMessageChars', 'maxGapMs', 'gapBaseMs', 'gapPerCharMs', 'minSendIntervalMs', 'observeQuietMs', 'observeAfterSendMs']) {
               if (merged.send[k] !== undefined) {
                 const n = Number(merged.send[k]);
                 merged.send[k] = Number.isFinite(n) ? n : current.send?.[k] ?? 0;
                 // 次数/毫秒/字符数统一非负取整；概率字段单独 clamp。
-                if (k !== 'longGapProbability') merged.send[k] = Math.max(0, Math.round(merged.send[k]));
+                merged.send[k] = Math.max(0, Math.round(merged.send[k]));
               }
             }
-            if (merged.send.longGapProbability !== undefined) merged.send.longGapProbability = Math.min(1, Math.max(0, Number(merged.send.longGapProbability) || 0));
             if (merged.send.burstEnabled !== undefined) merged.send.burstEnabled = merged.send.burstEnabled === true;
             if (merged.send.recommendedHint !== undefined) merged.send.recommendedHint = String(merged.send.recommendedHint ?? '');
           }
@@ -6115,6 +6123,9 @@ async function main() {
           const messages = Array.isArray(rawMessages)
             ? rawMessages.map((m) => String(m ?? '').trim()).filter(Boolean)
             : (typeof rawMessages === 'string' ? [String(rawMessages).trim()].filter(Boolean) : []);
+          // 2026-11-19：noWait 让她连着调两次发送时不必等完整空转，
+          // 只等"句末那一截"（与句间同区间）。语义见 paceAfterSendV2。
+          const noWait = body.noWait === true;
           const replyToMessageId = body.replyToMessageId;
           if (replyToMessageId !== undefined && replyToMessageId !== null && String(replyToMessageId).trim() !== '') {
             sendJson({ ok: false, error: 'qq_send_burst 暂不支持引用，请使用 qq_reply' }, 400);
@@ -6204,7 +6215,7 @@ async function main() {
             let postSendObserve = null;
             if (sentMessages.length > 0) {
               // 用发送前的快照当基线：覆盖"逐条发送那几秒"的盲区。
-              postSendObserve = await paceAfterSendV2(st, key, Date.now(), { snapshotBeforeSend: preSendSnapshot, sendStartedAt });
+              postSendObserve = await paceAfterSendV2(st, key, Date.now(), { snapshotBeforeSend: preSendSnapshot, sendStartedAt, noWait });
             }
             log(`[reserved2] 工具分条发送 ${key}: 成功 ${sentMessages.length}/${messages.length} 条`);
             appendActivity(`${key} [reserved2] 工具分条发送：成功 ${sentMessages.length}/${messages.length} 条`);
@@ -6260,6 +6271,9 @@ async function main() {
             : (isRawString ? [String(rawMessages).trim()].filter(Boolean) : []);
           const replyToMessageId = body.replyToMessageId;
           const atUserId = body.atUserId ?? null;
+          // 2026-11-19：noWait 让她连着调两次发送时不必等完整空转，
+          // 只等"句末那一截"（与句间同区间）。语义见 paceAfterSendV2。
+          const noWait = body.noWait === true;
           // 二代不再按空格自动分条：字符串就是一条消息，数组模式原样使用调用方间隔。
           // 旧写法是 `(isRawString && messages.length > 1) ? 'auto' : ...` —— 上面 messages 的构造
           // 保证 isRawString 为真时 length 恒为 1，这个分支永远不可达，留着只会让人以为
@@ -6371,7 +6385,7 @@ async function main() {
             let postSendObserve = null;
             if (sentMessages.length > 0) {
               // 用发送前的快照当基线：覆盖"逐条发送那几秒"的盲区。
-              postSendObserve = await paceAfterSendV2(st, key, Date.now(), { snapshotBeforeSend: preSendSnapshot, sendStartedAt });
+              postSendObserve = await paceAfterSendV2(st, key, Date.now(), { snapshotBeforeSend: preSendSnapshot, sendStartedAt, noWait });
             }
             log(`[reserved2] 工具统一发送 ${key}: 成功 ${sentMessages.length}/${messages.length} 条`);
             appendActivity(`${key} [reserved2] 工具统一发送：成功 ${sentMessages.length}/${messages.length} 条`);
@@ -7511,9 +7525,21 @@ async function main() {
             // 无论 info 来自本地还是 OneBot，只要本地有 found 就补充转发字段，避免提示词与实现不一致。
             if (found) Object.assign(info, forwardFields);
             // textTruncated 由未截断长度判断，计算完就把内部字段摘掉（不让它进模型上下文）。
+            //
+            // ⚠️ 2026-11-19 修（真实 bug）：不能只看 `fullLen` 存不存在。
+            // `resolveReplyInfo()` 走 QQ get_msg 那条路径返回的 info **不带 textLength**
+            // （它只是把段拼成文本，没有"原始长度"概念），于是：
+            //   · fullLen = undefined → Number.isFinite 为假 → textTruncated 恒为 false；
+            //   · 本地命中那条更糟：`full` 取的是 row.text，而存储时就已经截成 200 字，
+            //     所以 fullLen=200、text.length=200 ⇒ 400 字的消息被判成"没截断"。
+            // 症状：模型以为拿到全文，不会去调 qq_get_message_full，长剧情/长吐槽被静默截断。
+            // 判据补两条：① 本地行若带"存储时被截断"的明确标记就算截断；
+            //             ② 文本正好卡在 200 字的存储上限时，也按截断处理（保守但不会骗模型）。
             const fullLen = Number(info.textLength);
             delete info.textLength;
-            info.textTruncated = Number.isFinite(fullLen) && fullLen > String(info.text ?? '').length;
+            const textLen = String(info.text ?? '').length;
+            const cappedByStore = textLen >= MESSAGE_STORE_PREVIEW_CHARS;
+            info.textTruncated = cappedByStore || (Number.isFinite(fullLen) && fullLen > textLen);
             sendJson({ ok: true, key, messageId, info });
           } catch (error) {
             sendJson({ ok: false, error: `获取消息详情失败：${error?.message ?? error}` }, 500);
@@ -9502,19 +9528,17 @@ async function main() {
     return { main: main.filter(Boolean), followUp: null };
   }
 
-  // 分条发送：与 sendToQQ 共用同一 sendChain，严格顺序；条间随机间隔，
-  // 有概率使用长间隔（错落感）；最后一条后不再 sleep。
+  // 分条发送：与 sendToQQ 共用同一 sendChain，严格顺序；条间随机间隔。
+  // 最后一条后不再 sleep。
+  // 2026-11-19：长间隔（longGap*）已删除，见 socialV2.send 默认值处的说明。
   function sendBurstToQQ(key, messages, socialCfgOrMin, maybeMax) {
     const assertSendAllowed = captureSendGuard(key);
     const [kind, id] = key.split(':');
-    let min, max, longProb = 0, longMin = 0, longMax = 0;
+    let min, max;
     if (typeof socialCfgOrMin === 'object' && socialCfgOrMin !== null) {
       const cfg = socialCfgOrMin;
       min = Math.max(0, Number(cfg.burstIntervalMinMs) || 1000);
       max = Math.max(min, Number(cfg.burstIntervalMaxMs) || min);
-      longProb = Math.min(1, Math.max(0, Number(cfg.longGapProbability) || 0));
-      longMin = Math.max(0, Number(cfg.longGapMinMs) || 8000);
-      longMax = Math.max(longMin, Number(cfg.longGapMaxMs) || longMin);
     } else {
       min = Math.max(0, Number(socialCfgOrMin) || 0);
       max = Math.max(min, Number(maybeMax) || min);
@@ -9539,8 +9563,8 @@ async function main() {
           lastSendFailed.set(key, true);
         });
       if (!isLast) {
-        const useLong = longProb > 0 && Math.random() < longProb;
-        const delay = useLong ? randInt(longMin, longMax) : randInt(min, max);
+        // 2026-11-19：只取常规区间，不再有长间隔分支。
+        const delay = randInt(min, max);
         sendChain = sendChain.then(() => sleep(delay));
       }
     }
@@ -10317,6 +10341,51 @@ async function main() {
     if (opts.snapshotBeforeSend instanceof Set) {
       log(`[pace] ${key} 使用发送前快照（覆盖逐条发送期间的盲区）基线=${seenAtStart.size} 条`);
     }
+
+    // ── noWait：只补"句末那一截"，然后立刻返回 ───────────────────────────
+    //
+    // 2026-11-19 操作者要求：她如果想连着调两次 qq_send_message，不该被
+    // 那 20/30 秒的完整空转挡住。传 `noWait: true` 时：
+    //   · **不**等完整的 observeAfterSendMs；
+    //   · 但要等"最后一句之后的那一截"，且这段**用和句间完全相同的随机逻辑**
+    //     （同一个 clampGapV2 / 同一组配置项），这样节奏是一致的：
+    //     对方听到的是"句子之间 1~3 秒"，不是"最后一句之后突然变 0 秒"。
+    //   · 期间来的消息**不刷新**计时（操作者明确要求"直接贴，不用刷新空转"），
+    //     空转结束后一次性带回。
+    if (opts.noWait === true) {
+      const tailMs = computeTailGapV2();
+      const tailStart = Date.now();
+      log(`[pace] ${key} noWait：只等句末一截 ${tailMs}ms（与句间同区间）`);
+      if (tailMs > 0) await new Promise((r) => setTimeout(r, tailMs));
+      // 空转结束后把期间新到的消息一次性带回（不重置计时）。
+      const tailFresh = (Array.isArray(st.unread) ? st.unread : [])
+        .filter((m) => m && Number.isSafeInteger(m.seq) && !seenAtStart.has(m.seq));
+      let tailText = '';
+      let tailCount = 0;
+      let tailMax = 0;
+      if (tailFresh.length) {
+        const label = chatLabelForV2(key);
+        const nowMs = Date.now();
+        const rows = tailFresh.map((m) => renderOneMessageLine(compactModelMessage(m, { now: nowMs }), { label }));
+        tailCount = rows.length;
+        if (tailCount) tailText = [`【${tailCount} 条新消息】`, ...rows].join('\n');
+        tailMax = tailFresh.reduce((mx, m) => Math.max(mx, Number(m.seq) || 0), 0);
+        // 记成"已展示过"，避免下一轮重复贴同一批（与正常路径一致）。
+        try { noteModelMessagesV2(st, tailFresh); } catch { /* ignore */ }
+      }
+      st.lastSendCallAt = Date.now();
+      try { saveSocialV2State(); } catch { /* ignore */ }
+      log(`[pace] ${key} noWait 结束 waitedMs=${Date.now() - tailStart} 条数=${tailCount}`);
+      return {
+        arrived: tailCount > 0,
+        waitedMs: Date.now() - tailStart,
+        text: tailText,
+        count: tailCount,
+        suggestedThroughSeq: tailMax || undefined,
+        noWait: true,
+      };
+    }
+
     log(`[pace] ${key} 开始观望 remainingBudget=${remainingBudget} 已有未读=${seenAtStart.size}`);
     // 安静窗：每见到一条新消息就重置，直到 quietMs 内没有新动静才返回。
     const quietMs = Math.max(0, Number(cfg.socialV2?.send?.observeQuietMs ?? 10000));
@@ -10381,6 +10450,31 @@ async function main() {
     return { arrived: !!ob?.arrived, waitedMs: ob?.waitedMs ?? 0, text, count, suggestedThroughSeq: maxSeq || undefined };
   }
 
+  /**
+   * 「句末那一截」的随机间隔 —— 与句间**同一套逻辑**，但**不含长间隔**。
+   *
+   * 2026-11-19 操作者要求：noWait 时空转不是"跳过"，而是"只等最后一句之后
+   * 那一段"，且这一段必须和句与句之间的随机规则一样，否则对方会听出
+   * "前几句之间要等，最后一句之后突然就不用等了"。
+   *
+   * 但**长间隔不套用**（同一天操作者确认）：句间那个 20% 概率的 5~10 秒停顿
+   * 是为了让多句连发听起来像真人打字，而 noWait 的用途恰恰是"我要接着说"，
+   * 在这里塞一个 5~10 秒的停顿与她的意图相反。所以句末只取常规区间
+   * （burstIntervalMinMs ~ burstIntervalMaxMs，默认 1~3 秒）。
+   *
+   * 实现上仍然复用 computeGapsV2：喂它 2 条假消息，取第一个延迟 ——
+   * 这样以后调 burstIntervalMin/Max 时句间与句末自动一起变，不存在两套规则漂移。
+   * 长间隔（longGap*）已整体删除（2026-11-19），这里不必再单独屏蔽。
+   */
+  function computeTailGapV2() {
+    const sendCfg = cfg.socialV2?.send ?? {};
+    // computeGapsV2 对 <=1 条的消息返回空数组，所以这里必须给 2 条。
+    // 2026-11-19：长间隔已整体删除，这里不必再单独屏蔽。
+    const gaps = computeGapsV2(['', ''], 'auto', undefined, undefined, sendCfg);
+    const tail = Array.isArray(gaps) && gaps.length ? Number(gaps[0]) : 0;
+    return Number.isFinite(tail) && tail > 0 ? tail : 0;
+  }
+
   function computeGapsV2(messages, gapMode, gapMs, gaps, sendCfg) {
     const delays = [];
     if (!messages || messages.length <= 1) return delays;
@@ -10400,11 +10494,13 @@ async function main() {
         delays.push(clampGapV2(base + chars * perChar, sendCfg));
       }
     } else {
-      const longProb = Math.min(1, Math.max(0, Number(sendCfg.longGapProbability) || 0));
+      // 2026-11-19 操作者要求：**删掉长间隔**（longGapProbability）。
+      // 理由：那个 20% 概率的 5~10 秒停顿"感觉很蠢" —— 连发几句话时
+      // 突然卡住 8 秒，不像真人，更像网络卡了。现在一律只取常规区间
+      // （burstIntervalMinMs ~ burstIntervalMaxMs，默认 1~3 秒）。
       for (let i = 0; i < messages.length - 1; i++) {
-        const useLong = longProb > 0 && Math.random() < longProb;
-        const min = useLong ? (Number(sendCfg.longGapMinMs) || 5000) : (Number(sendCfg.burstIntervalMinMs) || 1000);
-        const max = useLong ? (Number(sendCfg.longGapMaxMs) || 10000) : (Number(sendCfg.burstIntervalMaxMs) || 3000);
+        const min = Number(sendCfg.burstIntervalMinMs) || 1000;
+        const max = Number(sendCfg.burstIntervalMaxMs) || 3000;
         delays.push(clampGapV2(randInt(Math.max(100, min), Math.max(100, max)), sendCfg));
       }
     }
@@ -14061,6 +14157,16 @@ async function main() {
         ?? [...recentRows].reverse().find((row) => row && row.message && !row.message.isSelf)
         ?? null;
       const sharedNewestAgo = sharedNewest ? String(sharedNewest.message.ago || '') : '';
+      // ── 2026-11-19：partial 不再写死 false ─────────────────────────────
+      //
+      // 原来这里是 `partial: false`，意味着**共用会话下永远不提示「还有消息没显示」**。
+      // 上面两个预算循环（unreadRows / recentRows）确实会截断，被截掉的那些
+      // 她就彻底看不到了 —— 而且一个字提示都没有，静默丢消息。
+      //
+      // 操作者已明确「不需要共用会话了」（config.sessionSharing.enabled = false，
+      // 所以 collectSharedMessagesV2 返回 null，这个分支根本走不到）。
+      // 但这里仍然改成真实计算，避免以后有人打开共用会话时踩同一个坑。
+      const sharedTruncated = unreadRows.length < (shared.unread?.length ?? 0);
       return {
         shared: true,
         messages: unreadRows,
@@ -14069,7 +14175,7 @@ async function main() {
         ...(sharedNewestAgo ? { newestAgo: sharedNewestAgo } : {}),
         unreadCount: unreadRows.length,
         includedUnreadCount: unreadRows.length,
-        partial: false,
+        partial: sharedTruncated,
         // 每个聊天各自的水位：模型收尾时按聊天分别提交，不会把另一个聊天的消息一起标已读。
         perChatThrough: shared.perChatThrough,
       };
@@ -14252,6 +14358,19 @@ async function main() {
       if (past.length) {
         out.push('【之前】');
         for (const row of past) out.push(oneRow(row));
+      }
+      // 2026-11-19：与下面非共用分支保持一致 —— 被预算截掉时必须告诉她。
+      // 共用会话下这条尤其重要：消息混着两个聊天，截掉的那些她连"存在过"都不知道。
+      //
+      // ⚠️ 共用分支的 snapshot 里**没有 `readThroughSeq`**（那是单会话的概念），
+      // 只有 perChatThrough。所以这里取**所有聊天里最小的那个水位** ——
+      // 「从最早未读开始」按 afterSeq 续读才是安全的，取大的会漏掉另一个聊天。
+      if (snapshot.partial) {
+        const throughs = Object.values(snapshot.perChatThrough ?? {})
+          .map((v) => Number(v))
+          .filter((v) => Number.isSafeInteger(v) && v >= 0);
+        const fromSeq = throughs.length ? Math.min(...throughs) : 0;
+        out.push(`（还有消息没显示，用 qq_get_unread_messages(afterSeq=${fromSeq}) 继续看）`);
       }
       return out.join('\n');
     }

@@ -46,7 +46,13 @@ assert.deepEqual(inject, ['systemPrompt', 'webServer'])
 // --- the feature contributed exactly one prompt section ---
 assert.equal(sections.length, 1)
 assert.equal(sections[0].name, 'thinking-language-zh')
-assert.equal(sections[0].order, 10250)
+// 2026-11-19：order 从 10250 改到 100，与 qq:session-context 同位置。
+// 原因见 features/thinking-zh.js 里的长注释：排到 97.6% 处时 17 条 reasoning 全是英文，
+// 指令形同虚设；现在要紧贴 persona、在所有工具段之前。
+// 这里钉住的是「必须早于 FILE_REFERENCE(900)/TOOL_*(1000+)」这个语义，而不是魔数：
+assert.ok(sections[0].order < 900,
+  `思考语言段必须排在工具段之前（实际 order=${sections[0].order}）`)
+assert.equal(sections[0].order, 100)
 assert.match(sections[0].text({}), /简体中文/)
 assert.match(sections[0].text({}), /代码、命令、报错信息/)
 
