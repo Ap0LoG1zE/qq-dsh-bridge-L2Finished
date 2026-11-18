@@ -758,19 +758,19 @@ window.__ModuleLoader__.load({
   // 2026-11-19 操作者要求：时间类字段一律显示秒。填 "30" 就是 30 秒，
   // 比填 30000 直观得多。字段名里带 Ms 的那些都要加 'sec'。
   var RHYTHM_FIELDS = [
-    ['autoReplyCheckMs', '唤醒检查间隔', '秒。越小越「秒回」，但轮询更频繁', 'sec'],
+    ['autoReplyCheckMs', '唤醒检查间隔', '秒。「秒回」取决于它：越小越快，但检查更频繁', 'sec'],
     ['send.burstMaxMessages', '单次最多几条', '一轮回复最多拆成几条消息'],
-    ['send.burstIntervalMinMs', '条间最短间隔', '秒', 'sec'],
-    ['send.burstIntervalMaxMs', '条间最长间隔', '秒', 'sec'],
+    ['send.burstIntervalMinMs', '条间最短间隔', '秒。几句之间随机停顿的下限', 'sec'],
+    ['send.burstIntervalMaxMs', '条间最长间隔', '秒。几句之间随机停顿的上限', 'sec'],
     // 2026-11-19 新增：操作者要在面板上调「发完空转多久」。
     // 语义（2026-11-17 定）：总预算 = 发送那几秒 + 这个值；
-    // 期间对方发消息就重置下面的「静默判定窗口」，直到安静满才一次贴给她。
-    ['send.observeAfterSendMs', '发送后空转', '秒。总预算 = 发送耗时 + 这个值', 'sec'],
+    // 期间对方发消息就重新开始倒计时「多久没动静算说完」，直到安静满才一次贴给她。
+    ['send.observeAfterSendMs', '发完后等多久', '秒。发完消息后停留这么久，方便接住对方的话。听到动静只延长「多久没动静算说完」，不再加这个', 'sec'],
     ['send.maxSendPerMinute', '每分钟峰值', '超过会被桥接限流（防 QQ 风控）'],
     ['send.maxSendPerHour', '每小时峰值', '同上'],
     ['send.maxMessageChars', '单条最大字数', '超出自动按句读切分'],
-    ['wait.defaultMs', '等待消息默认时长', '秒。AI 调 qq_wait_for_messages 的默认值', 'sec'],
-    ['wait.defaultQuietMs', '静默判定窗口', '秒。连续安静这么久才算对方说完；发送后空转期间也用它', 'sec'],
+    ['wait.defaultMs', '等待消息默认时长', '秒。她主动等对方时最长挂多久（qq_wait_for_messages 默认）', 'sec'],
+    ['wait.defaultQuietMs', '多久没动静算说完', '秒。对方发一句后要安静这么久，才认为他说完了；期间又来一句就重新计时（所以连发几句会被合成一次回）', 'sec'],
     ['wake.batchWindowMs', '唤醒合并窗口', '秒。多条消息合并成一次唤醒', 'sec'],
     ['wake.maxWakePerHour', '每小时最多唤醒', '防止反复自我唤醒'],
     ['context.recentLimit', '历史消息保留条数', '每个会话最多存多少条历史（只是缓存上限）。真正每轮注入几条由下面的唤醒包参数决定，不受这个影响'],

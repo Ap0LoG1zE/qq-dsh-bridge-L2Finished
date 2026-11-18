@@ -36,10 +36,11 @@ test('所有 *Ms 时间字段都标注了 sec 单位', () => {
   }
 });
 
-// ── ② 新增的「发送后空转」字段存在 ──────────────────────────────────
-test('新增 send.observeAfterSendMs（发送后空转）', () => {
+// ── ② 新增的「发完后等多久」字段存在 ────────────────────────────────
+test('新增 send.observeAfterSendMs（发完后等多久）', () => {
   assert.ok(src.includes("'send.observeAfterSendMs'"), '字段不存在');
-  assert.ok(/发送后空转/.test(src), '显示名不存在');
+  // 2026-11-19 改名：原显示名「发送后空转」不直观，操作者要求改成白话。
+  assert.ok(/发完后等多久/.test(src), '显示名不存在');
   // 它必须带 sec 标记，否则用户还是得填毫秒
   assert.ok(/send\.observeAfterSendMs'[^\]]*'sec'/.test(src), '没标 sec');
 });
