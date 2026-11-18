@@ -82,6 +82,11 @@ const tests = [
   'test-observe-continuous.mjs',
   // noWait（2026-11-19）：急着连发时只等"句末那一截"，与句间同一套随机逻辑。
   'test-send-nowait.mjs',
+  // 面板改值 → 桥接配置 → 实际行为 的端到端连通性（2026-11-19）。
+  // 操作者要求「验证小面板里改的数据能确实影响到实际的设置」。
+  // 走真实路由（harness 隔离实例），不 mock，覆盖：内存更新、影响等待时长、
+  // 可反复修改、条数上限随之变化、前端秒↔毫秒换算。
+  'test-panel-settings-e2e.mjs',
   // 令牌账本 / 价目表 与 体检修复回归（纯函数，无外部依赖）
   'test-token-usage.mjs', 'test-hardening.mjs',
   // 控制台静态契约（跑不了 Playwright 的环境下的替代回归）
