@@ -168,7 +168,7 @@ DSH 的插件列表里应该能看到它；启动日志里也可能出现 `qq-ag
 
 | 文件 | 作用 |
 |---|---|
-| `plugins/qq-agent-context/index.js` | 插件实现（约 176 行） |
+| `plugins/qq-agent-context/index.js` | 插件实现 |
 | `plugins/qq-agent-context/cordis.patch.yml` | 插件自带的默认配置（`bridgeUrl`） |
 | `src/bridge.js` 的 `/api/socialV2/agent-context` | 数据源端点，插件定时来拉 |
 | `src/bridge.js` 的 `sessionTokenLineV2` / `selfIdentityTextV2` | 这两段文本的生成处 |

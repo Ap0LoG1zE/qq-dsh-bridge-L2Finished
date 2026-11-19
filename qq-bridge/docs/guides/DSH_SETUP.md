@@ -17,7 +17,7 @@
    cd qq-dsh-bridge-L2Finished/qq-bridge
    ```
 
-   > 默认分支 `main` 即当前版本 **v0.1.5**（适配 DSH 0.1.5-rc.1），clone 下来无需切换分支。
+   > 默认分支 `main` 即当前版本（`package.json` 的 `version` 为准）。
 
 2. **安装依赖**：
 

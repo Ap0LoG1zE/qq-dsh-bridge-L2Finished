@@ -304,7 +304,7 @@ function runFfmpeg(ffmpeg, args, { timeoutMs = MEDIA_DEFAULTS.timeoutMs } = {}) 
     child.on('error', (error) => settle({
       ok: false,
       error: error?.code === 'ENOENT'
-        ? '找不到 ffmpeg（设置 FFMPEG_PATH 或 config.json 的 socialV2.voice.ffmpegPath）'
+        ? '找不到 ffmpeg（设置 FFMPEG_PATH 或 config.json 的 socialV2.ffmpegPath）'
         : `ffmpeg 不可用：${error?.message ?? error}`
     }));
     child.on('close', (code) => settle(code === 0 ? { ok: true } : { ok: false, error: `ffmpeg 退出码 ${code}` }));
