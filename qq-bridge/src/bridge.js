@@ -14301,21 +14301,21 @@ async function main() {
     }
     const tail = refs.length ? `（${refs.join(' ')}）` : '';
     const selfMark = m?.quoteTargetIsSelf ? '↩你 ' : '';
-    // 2026-11-20（操作者要求）：**群聊标主人，私聊完全不标**。
+    // 2026-11-20：**群聊里 owner 发的消息在行尾标「（管理员）」，私聊不标**。
     //
-    // 为什么群聊要标：群里人多，「这个人是管理员、说的话权重更高」是需要区分的。
-    // 为什么私聊不标：私聊里对方只有一个人，每条都挂一个身份标记纯属白烧；
-    // 而且她跟对方说话不该整天强调"你是管理员"。
+    // 为什么是固定文字而不是昵称：sender 那一位已经是昵称了，标记再用昵称会变成
+    // `[群] #2 Ap0LoG1zE：…（Ap0LoG1zE）` —— 同一个名字写两遍，纯粹浪费字符。
+    // 标记要提供的是**昵称之外的信息**，也就是"这条消息来自有管理权限的账号"。
     //
-    // 标记文字来自 config.ownerLabel：
-    //   · 默认「主人」—— 仓库对外就是这个通用默认，不假设任何人的昵称。
-    //   · 想换成别的称呼（比如某个群的通用叫法）就在自己机器的 config.json 里
-    //     写 `"ownerLabel": "..."`，不用改代码。
+    // 为什么不用另配一个 ownerLabel：`isOwner` 本身就是桥接按
+    // `event.user_id === cfg.ownerQQ` 判出来的，身份已经唯一确定；
+    // 再配一个标签文字只是把同一件事说两遍，还会出现"标记写的名字和实际 owner 对不上"。
+    //
+    // 为什么私聊不标：私聊里对方只有一个人，每条都挂身份标记纯属白烧。
     //
     // 判定依据是 label 是否以「私聊」开头 —— chatLabelForV2 给私聊的标签。
     const isPrivateLabel = String(opts.label ?? '').startsWith('私聊');
-    const ownerLabel = String(cfg.ownerLabel ?? '主人').trim() || '主人';
-    const ownerMark = (m?.isOwner && !isPrivateLabel) ? `（${ownerLabel}）` : '';
+    const ownerMark = (m?.isOwner && !isPrivateLabel) ? '（管理员）' : '';
     // 2026-11-12（操作者方案）：**消息行不再带 QQ 号**。
     // 以前每条都挂 `userId:123456789`（18 字符），唤醒词 2113 行加起来是白烧。
     // 现在只显示人名；需要号时用 qq_get_userid（query=人名）反查 ——

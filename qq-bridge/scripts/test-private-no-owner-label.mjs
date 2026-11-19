@@ -90,23 +90,32 @@ try {
   const line2 = pText2.split('\n').find((l) => l.includes('今天吃白饭')) || '';
   console.log('  消息行:', line2.trim());
   ok('sender 为空时不写「主人」', !line2.includes('主人'));
-  // ── ⑤ ownerLabel 可配置：改 config 就换标记文字（本机用这个机制改叫法）
-  console.log('\n=== ownerLabel 可配置 ===');
-  h.cfg.ownerLabel = '自定义名';
+  // ── ⑤ 群聊标记是固定文字「管理员」，不用昵称（否则和 sender 重复）
+  console.log('\n=== 群聊标记内容 ===');
   const gSt3 = h.getSocialV2State(G);
   gSt3.unread = [mkMsg(4, true)];
   const gText3 = h.renderWakeSnapshotV2(h.buildWakeSnapshotV2(G), G);
   const line3 = gText3.split('\n').find((l) => l.includes('今天吃白饭')) || '';
   console.log('  消息行:', line3.trim());
-  ok('改 ownerLabel 后标记跟着变', line3.includes('（自定义名）'));
+  ok('群聊标记固定写「（管理员）」', line3.includes('（管理员）'));
+  ok('标记不重复 sender 的昵称', !line3.includes('（Ap0LoG1zE）'));
 
-  // 私聊仍然不标（配置只影响群聊）
+  // 昵称变了标记也不变（它不读昵称）
+  h.socialV2.aliases[OWNER].primary = '新昵称';
+  const gSt4 = h.getSocialV2State(G);
+  gSt4.unread = [mkMsg(5, true)];
+  const gText4 = h.renderWakeSnapshotV2(h.buildWakeSnapshotV2(G), G);
+  const line4 = gText4.split('\n').find((l) => l.includes('今天吃白饭')) || '';
+  console.log('  改昵称后:', line4.trim());
+  ok('标记不受昵称影响', line4.includes('（管理员）'));
+
+  // 私聊仍然不标
   const pSt3 = h.getSocialV2State(P);
-  pSt3.unread = [mkMsg(5, true)];
+  pSt3.unread = [mkMsg(6, true)];
   const pText3 = h.renderWakeSnapshotV2(h.buildWakeSnapshotV2(P), P);
   const pline3 = pText3.split('\n').find((l) => l.includes('今天吃白饭')) || '';
   console.log('  私聊消息行:', pline3.trim());
-  ok('私聊仍无标记', !pline3.includes('（自定义名）'));
+  ok('私聊仍无标记', !pline3.includes('（管理员）'));
 } catch (e) {
   console.log('❌ 异常:', e.message, (e.stack || '').split('\n')[1] || '');
   fails += 1;
