@@ -1,4 +1,4 @@
-﻿// QQ ↔ DeepSeek Harness 桥接主程序。
+// QQ ↔ DeepSeek Harness 桥接主程序。
 //
 // 链路：
 //   QQ 消息 → SnowLuma (OneBot v11 WS) → 本进程 → DSH Web API session.prompt
@@ -8260,11 +8260,11 @@ async function main() {
                 aliasesOf.get(uid).add(nm);
               }
             }
-            // 展示名：主人优先叫"主人"，其次群名片/昵称，最后才退回 QQ 号。
-            const displayNameOf = (uid) => {
-              if (uid === String(cfg.ownerQQ ?? '')) return '主人';
-              return nameOf.get(uid) || uid;
-            };
+            // 展示名：群名片/昵称优先，最后才退回 QQ 号。
+            // 2026-11-20：**不再给主人特殊叫「主人」**（操作者要求）——
+            // 这个端点同时喂给 qq_affinity 工具，返回里出现「主人」会让她
+            // 在私聊里也照着这个称呼说话。真实昵称由 nameOf 提供。
+            const displayNameOf = (uid) => nameOf.get(uid) || uid;
             // 兜底：recentMessages 只留最近 200 条，久没说话的人名字会被轮转掉。
             // 这时才去问网关要（有 10 分钟缓存，且有并发上限），别为 12 个人打 12 个请求。
             const missing = [...merged.keys()].filter((uid) => !nameOf.has(uid) && uid !== String(cfg.ownerQQ ?? ''));
@@ -14030,10 +14030,19 @@ async function main() {
     const nick = event?.sender?.card || event?.sender?.nickname || '';
     const uid = String(event?.user_id ?? event?.sender?.user_id ?? '');
     if (kind === 'group') return nick || uid || '群友';
-    // 私聊：昵称优先，其次是「主人」/QQ 号。
-    const isOwnerUid = uid && String(cfg.ownerQQ ?? '') === uid;
+    // 2026-11-20（操作者要求）：**私聊里不要出现「主人」这个称呼**。
+    //
+    // 原来私聊没昵称时兜底写「主人」，于是唤醒词每条消息都显示"主人·15:23：…"。
+    // 她现在被要求用真实昵称称呼对方，那个兜底既重复又抢戏。
+    // 现在三级回退：本条消息的昵称 → 别名表里记过的名字 → QQ 号。
+    // 别名表通常早就有记录（同一个人说过话就会写进去），所以基本轮不到号码。
     if (nick) return nick;
-    if (isOwnerUid) return '主人';
+    if (uid) {
+      try {
+        const known = displayNameOfV2(uid, '');
+        if (known && known !== uid) return known;
+      } catch { /* 别名表坏了不阻塞收消息 */ }
+    }
     return uid || '私聊';
   }
 
@@ -14312,7 +14321,15 @@ async function main() {
     if (!snapshot || typeof snapshot !== 'object') return '';
     const unread = Array.isArray(snapshot.messages) ? snapshot.messages : [];
     const recent = Array.isArray(snapshot.recent) ? snapshot.recent : [];
-    const one = (m) => renderOneMessageLine(m);
+    // 2026-11-20（操作者要求）：**私聊里不出现「（主人）」**。
+    //
+    // renderOneMessageLine 靠 opts.label 判断是不是私聊（它拿不到 key），
+    // 而这里原来调 `one(m)` 时不传 label → isPrivateLabel 恒为 false
+    // → 私聊也每条都挂「（主人）」。2026-11-18 加的那条规则因此一直没生效。
+    //
+    // 现在按 wakeKey 算出标签再传下去：私聊标签以「私聊」开头，群聊是「群…」。
+    const wakeLabel = wakeKey ? chatLabelForV2(wakeKey) : '';
+    const one = (m) => renderOneMessageLine(m, wakeLabel ? { label: wakeLabel } : undefined);
     // ── 共用会话：组内多条聊天混排，每条标来源 ────────────────────────────
     // 格式：`[群] 阿三·16:34（2分钟前）：…` / `[私聊10001] 主人·…：…`
     // 标签写的就是发言时要传的 key 的"人话版"，模型照着标签就知道回哪儿。
@@ -14535,7 +14552,9 @@ async function main() {
           if (s && s !== uid && !['私聊', '我', '未知', '群友', '管理员'].includes(s)) return s;
         }
       } catch {}
-      return uid === String(cfg.ownerQQ ?? '') ? '主人' : uid;
+      // 2026-11-20：兜底不再写「主人」（操作者要求），退回 QQ 号。
+      // 正常路径几乎走不到这里 —— 会话里最近消息都带 sender 昵称。
+      return uid;
     };
 
     // 一次最多提 3 个人：再多就不是"提醒"，是一张待办清单了。

@@ -187,6 +187,10 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     // 落盘路径：测试要读临时目录里的 social-v2.json 检查字段。
     paths: { socialV2File: SOCIAL_V2_FILE, stateDir: STATE_DIR },
     buildWakePromptV2, buildWakeSnapshotV2, sendWakePromptV2, socialV2,
+    // 快照渲染与发送者标签：唤醒词（buildWakePromptV2）**不含**消息快照，
+    // 快照是在投递时由 renderWakeSnapshotV2 拼上去的。要断言"消息行长什么样"
+    // 必须单独测这两个，否则测出来的永远是空的。
+    renderWakeSnapshotV2, v2SenderLabelFor, chatLabelForV2,
     // 唤醒调度：给「观望期间必须压住唤醒」这条回归用（test-observe-before-sleep.mjs）。
     // 不导出的话那条断言只能靠等定时器真的触发，慢 8 秒还测不稳定。
     scheduleWakeV2,
