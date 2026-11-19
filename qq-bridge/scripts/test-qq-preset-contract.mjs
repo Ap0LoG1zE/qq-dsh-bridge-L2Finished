@@ -235,7 +235,8 @@ test('autonomy limits and the observation escape hatch stay described', () => {
     // 删掉了一条纯劝说的（原「这两类写下来是有回报的」）—— 它只是把
     // activeTopic/pendingThought 的说明又复述一遍，没有新信息。
     '按「多久之后还成立」分五类',
-    '**selfNote** 只有你能写', '**memberImpression** 记具体小事',
+    '**selfNote** 只有你能写',
+    // memberImpression 的断言已经移到下面（2026-11-17 精简后只剩那句"记具体小事，不记空泛评价"）
     '**activeTopic** 记这个聊天里还活着的话题', '24 小时没人再提自动消失',
     '**pendingThought** 记你此刻想说还没说出口的那一句', '2 小时后就没了',
     // 2026-11-12：target 从「填群名片」放宽成「填人名」（私聊没有群名片）。

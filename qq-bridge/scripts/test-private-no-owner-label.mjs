@@ -56,7 +56,7 @@ try {
   ok('私聊不出现「（主人）」', !pText.includes('（主人）'));
   ok('私聊消息行正常渲染', pLine.includes('今天吃白饭'));
 
-  // ── ② 群聊快照：仍带标记，但内容是「（Ap0）」不是「（主人）」
+  // ── ② 群聊快照：仍带标记（文字来自 config.ownerLabel，默认「主人」）
   console.log('\n=== 群聊快照 ===');
   const gSt = h.getSocialV2State(G);
   gSt.unread = [mkMsg(2, true)];
@@ -64,8 +64,12 @@ try {
   const gText = h.renderWakeSnapshotV2(gSnap, G);
   const gLine = gText.split('\n').find((l) => l.includes('今天吃白饭')) || '';
   console.log('  消息行:', gLine.trim());
-  ok('群聊仍标主人', gText.includes('（Ap0）'));
-  ok('群聊不再写「（主人）」', !gText.includes('（主人）'));
+  // 标记文字是可配置的：本测试没传 ownerLabel，所以是仓库默认「主人」。
+  // 只断言"群聊有标记"，不断言具体文字 —— 具体文字由 config 决定，不该钉死在测试里。
+  const markMatch = gLine.match(/（([^）]+)）\s*$/);
+  console.log('  抓到的标记:', JSON.stringify(markMatch?.[1] || ''));
+  ok('群聊有主人标记', !!markMatch);
+  ok('标记在行尾且非空', !!markMatch && markMatch[1].length > 0);
 
   // ── ③ v2SenderLabelFor：私聊不再返回「主人」
   console.log('\n=== v2SenderLabelFor ===');
@@ -86,6 +90,23 @@ try {
   const line2 = pText2.split('\n').find((l) => l.includes('今天吃白饭')) || '';
   console.log('  消息行:', line2.trim());
   ok('sender 为空时不写「主人」', !line2.includes('主人'));
+  // ── ⑤ ownerLabel 可配置：改 config 就换标记文字（本机用这个机制改叫法）
+  console.log('\n=== ownerLabel 可配置 ===');
+  h.cfg.ownerLabel = '自定义名';
+  const gSt3 = h.getSocialV2State(G);
+  gSt3.unread = [mkMsg(4, true)];
+  const gText3 = h.renderWakeSnapshotV2(h.buildWakeSnapshotV2(G), G);
+  const line3 = gText3.split('\n').find((l) => l.includes('今天吃白饭')) || '';
+  console.log('  消息行:', line3.trim());
+  ok('改 ownerLabel 后标记跟着变', line3.includes('（自定义名）'));
+
+  // 私聊仍然不标（配置只影响群聊）
+  const pSt3 = h.getSocialV2State(P);
+  pSt3.unread = [mkMsg(5, true)];
+  const pText3 = h.renderWakeSnapshotV2(h.buildWakeSnapshotV2(P), P);
+  const pline3 = pText3.split('\n').find((l) => l.includes('今天吃白饭')) || '';
+  console.log('  私聊消息行:', pline3.trim());
+  ok('私聊仍无标记', !pline3.includes('（自定义名）'));
 } catch (e) {
   console.log('❌ 异常:', e.message, (e.stack || '').split('\n')[1] || '');
   fails += 1;

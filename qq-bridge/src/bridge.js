@@ -4996,7 +4996,9 @@ async function main() {
             // 对齐预设里的「只有主人能开关」——操作者选择严格一致，不接受"谁都能关"。
             // 想恢复"谁都能关"：把条件改回 `if (want && !talkingToOwner)`。
             if (!talkingToOwner) {
-              sendJson({ ok: false, error: '只有主人能开关纯语音', enabled: socialV2.tts?.enabled === true }, 403);
+              // 她说这句时会带出去，所以用账号名而不是身份称呼 ——
+              // 「主人」这类词会影响她对那个人的判断（操作者 2026-11-20 指出）。
+              sendJson({ ok: false, error: '仅 ownerQQ 的私聊可开关纯语音', enabled: socialV2.tts?.enabled === true }, 403);
               return;
             }
             const cur = normalizeTtsConfig(socialV2.tts ?? {});
@@ -8452,7 +8454,9 @@ async function main() {
               }
               return '';
             })();
-            const label = wantUser === String(cfg.ownerQQ ?? '') ? '主人' : (nickOfUser || wantUser);
+            // 2026-11-20：兜底也不再叫「主人」—— 这个端点同时喂给 qq_affinity，
+            // 返回里出现身份称呼会影响她对那个人的判断。用真实昵称/号码。
+            const label = nickOfUser || wantUser;
             const stage = affinityStageOf(score);
             log(`[好感度] 控制台调整 ${label}(${wantUser}) → ${score}（${stage.label}），全局记录已更新`);
             sendJson({
