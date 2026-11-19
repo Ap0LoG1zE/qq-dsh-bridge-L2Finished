@@ -23,6 +23,7 @@
 | [guides/TOKEN_USAGE_CONSOLE.md](guides/TOKEN_USAGE_CONSOLE.md) | 控制台「令牌与花费」看板：数据来源、计价口径（峰谷分时）、API、配置 | ✅ |
 | [guides/CONSOLE-UI-TESTING.md](guides/CONSOLE-UI-TESTING.md) | 控制台离线预览（`npm run preview:console`）与离线浏览器回归（`npm run test:console-ui`）怎么用 | ✅ 2026 整理时自 `scripts/` 移入 |
 | [guides/SECURITY_BASELINE.md](guides/SECURITY_BASELINE.md) | **安全基线与威胁模型**：威胁主体、已实现的边界（准入/工具面/出站/控制台/落盘/网络）、已知残余风险、发布前回归清单、改动检查单 | ✅ **改动安全相关代码前必读**（2026-09-20 新增） |
+| [guides/skills/rewrite-agent-preset-into-session/SKILL.md](guides/skills/rewrite-agent-preset-into-session/SKILL.md) | **改完预设怎么让已有会话生效**：改 `agent.cordis.yml` → `build-agent-preset-patches.mjs` → 重启 DSH。也说明为什么「直接改会话文件里的 system/message」是无效的 | ✅ 2026-11-20 新增（同时是 DSH skill，可复制到 `~/.dsh/skills/`） |
 
 ## design/ —— 设计与规划（读设计意图用）
 
