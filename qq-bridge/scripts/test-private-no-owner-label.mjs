@@ -56,7 +56,7 @@ try {
   ok('私聊不出现「（主人）」', !pText.includes('（主人）'));
   ok('私聊消息行正常渲染', pLine.includes('今天吃白饭'));
 
-  // ── ② 群聊快照：仍带「（主人）」
+  // ── ② 群聊快照：仍带标记，但内容是「（Ap0）」不是「（主人）」
   console.log('\n=== 群聊快照 ===');
   const gSt = h.getSocialV2State(G);
   gSt.unread = [mkMsg(2, true)];
@@ -64,7 +64,8 @@ try {
   const gText = h.renderWakeSnapshotV2(gSnap, G);
   const gLine = gText.split('\n').find((l) => l.includes('今天吃白饭')) || '';
   console.log('  消息行:', gLine.trim());
-  ok('群聊仍标「（主人）」', gText.includes('（主人）'));
+  ok('群聊仍标主人', gText.includes('（Ap0）'));
+  ok('群聊不再写「（主人）」', !gText.includes('（主人）'));
 
   // ── ③ v2SenderLabelFor：私聊不再返回「主人」
   console.log('\n=== v2SenderLabelFor ===');

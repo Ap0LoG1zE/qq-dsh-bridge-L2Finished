@@ -14297,17 +14297,19 @@ async function main() {
     }
     const tail = refs.length ? `（${refs.join(' ')}）` : '';
     const selfMark = m?.quoteTargetIsSelf ? '↩你 ' : '';
-    // 2026-11-18（操作者要求）：**只有私聊才省略「（主人）」**。
+    // 2026-11-20（操作者要求）：**群聊标「（Ap0）」，私聊完全不标**。
     //
-    // 群聊里人多、同一个人可能和一群人混在一起说话，「（主人）」是一个有用的区分
-    // （谁是管理员、谁的话权重更高）—— 保留。
-    // 私聊里对方就是主人，这个标记每条都重复一遍纯属白烧（一个会话几十上百条），
-    // 而且【令牌】行和 preset 已经把「跟主人在私聊」这件事说清楚了。
+    // 为什么群聊要标：群里人多，「这个人是管理员、说的话权重更高」是需要区分的；
+    // 但标成「（主人）」会让她照着那个称呼说话，所以改成名字的简称「Ap0」
+    // （来自 config.ownerLabel，可改）。
     //
-    // 判定依据是 label 是否以「私聊」开头 —— 那正是 chatLabelForV2 给私聊的标签，
-    // 也是唯一在渲染时才拿得到的信息（renderOneMessageLine 不知道 key）。
+    // 为什么私聊不标：私聊里对方只有一个人，每条都挂一个身份标记纯属白烧；
+    // 而且她跟主人说话不该整天强调"你是主人"。
+    //
+    // 判定依据是 label 是否以「私聊」开头 —— chatLabelForV2 给私聊的标签。
     const isPrivateLabel = String(opts.label ?? '').startsWith('私聊');
-    const ownerMark = (m?.isOwner && !isPrivateLabel) ? '（主人）' : '';
+    const ownerLabel = String(cfg.ownerLabel ?? 'Ap0').trim() || 'Ap0';
+    const ownerMark = (m?.isOwner && !isPrivateLabel) ? `（${ownerLabel}）` : '';
     // 2026-11-12（操作者方案）：**消息行不再带 QQ 号**。
     // 以前每条都挂 `userId:123456789`（18 字符），唤醒词 2113 行加起来是白烧。
     // 现在只显示人名；需要号时用 qq_get_userid（query=人名）反查 ——
