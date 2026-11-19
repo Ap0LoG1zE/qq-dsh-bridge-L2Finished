@@ -17,10 +17,13 @@ const prefix = persona?.config?.prefix ?? '';
 
 test('合并预设 YAML resolves to the expected persona and template variables', () => {
   assert.equal(persona?.name, '@deepseek-ai/dsh-persona');
-  assert.match(prefix, /\{\{model\}\}/);
-  // DSH 0.2.1 起 agent loop 只注册 provider / model 两个提示词变量（0.2.0 还有 cwd），
-  // 未知变量会让 system prompt 装配直接抛错 ⇒ 每回合 error、模型一次都不跑。
-  // 这里钉住「只用已注册变量」，而不只是「有 {{model}}」。
+  // 2026-11-20：操作者删掉了 persona 开头那句英文
+  //（`You are a QQ group-chat agent ... powered by the {{model}} model.`），
+  // 所以不再要求出现 {{model}}。但**仍然不能出现未注册变量** —— 那会让
+  // DSH 的 system prompt 装配直接抛错、每回合 error。
+  //
+  // DSH 0.2.1 起 agent loop 只注册 provider / model 两个提示词变量（0.2.0 还有 cwd）。
+  assert.ok(prefix.length > 2000, `persona 正文应有实质内容，实际 ${prefix.length} 字符`);
   const used = [...JSON.stringify(persona.config).matchAll(/\{\{([a-z][a-z0-9_]*)\}\}/g)].map((m) => m[1]);
   assert.deepEqual([...new Set(used)].filter((v) => !['provider', 'model'].includes(v)), []);
   assert.equal(Object.hasOwn(persona.config, 'text'), false);

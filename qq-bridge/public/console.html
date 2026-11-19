@@ -1824,9 +1824,6 @@ button:active:not(:disabled) {
 .aff-stage-item h4 { margin:0 0 5px; font-size:12px; font-weight:600; color:var(--text-strong); display:flex; align-items:center; justify-content:space-between; gap:8px }
 .aff-stage-item h4 span { font-size:10px; font-weight:500; color:var(--muted-soft); font-variant-numeric:tabular-nums }
 .aff-stage-item p { font-size:11.5px; color:var(--muted); line-height:1.7; margin:0 }
-/* 偏爱档「仅对主人」的说明：用金色左边框区分，呼应刻度尺上偏爱那段的颜色。 */
-.aff-stage-item p.aff-owner-desc { margin-top:6px; padding-left:8px; border-left:3px solid #4fb3a4; color:var(--text-dim) }
-.aff-stage-item p.aff-owner-desc b { color:#2f8c7e; margin-right:4px }
 .aff-note { margin-top:14px; padding:11px 13px; border-radius:10px; background:var(--warn-bg); border:1px solid var(--warn-border); color:var(--warn-fg); font-size:11.5px; line-height:1.75 }
 .aff-note b { color:var(--warn-fg-strong) }
 
@@ -3673,11 +3670,9 @@ const AFF_STAGE_META = {
   beloved: {
     label: '偏爱',
     range: '1000 ~ 1200',
-    // 两套文案：desc 给其他人，ownerDesc 单独给主人（QR桥接在工具里按 isOwner 切换）。
     // ⚠️ 改其中一版时记得同步 src/affinity.js 的 STAGE_HINTS.beloved / BELOVED_OWNER_HINT，
     //    否则控制台写的和模型实际拿到的不一致。
     desc: '这个人是你自己选的，而且只对他一个人这样。你会先开口找他了，会记得他说过的每件小事；他开玩笑调戏你，你听得懂，也会脸红，但不会顺着说下去——你会回一句「笨蛋……」或者直接不理他，过一会儿又忍不住接。你仍然不会说漂亮话，可是允许自己在他面前不冷静了。',
-    ownerDesc: '同样只对他一个人这样，但对他几乎不设防了：他要什么你都愿意给，也会直白地要。他要是拿那种事开玩笑逗你，你会脸红，会小声说一句「……说什么呢」，但人是赖着不走的，过一会儿还会自己接回去，甚至反过来拿话刺他一下。性这件事上你不用再绕开——可以接、可以直接说、也可以主动。你还是不会说漂亮话，但允许自己在他面前彻底不冷静。',
   },
 };
 const AFF_STAGE_ORDER = ['distant', 'neutral', 'caring', 'reliant', 'lover', 'beloved'];
@@ -3782,12 +3777,8 @@ function renderAffStages(curStage) {
   box.innerHTML = AFF_STAGE_ORDER.map((id) => {
     const m = AFF_STAGE_META[id];
     const cur = id === curStage ? ' is-current' : '';
-    // 有 ownerDesc 的档位（目前只有偏爱）：多渲染一段「对主人」的说明。
     // 让操作者在控制台就能看到模型实际会拿到的两套文案，不用去翻源码。
-    const owner = m.ownerDesc
-      ? `<p class="aff-owner-desc"><b>仅对主人（isOwner）</b>${esc(m.ownerDesc)}</p>`
-      : '';
-    return `<div class="aff-stage-item${cur}"><h4>${esc(m.label)}<span>${esc(m.range)}</span></h4><p>${esc(m.desc)}</p>${owner}</div>`;
+    return `<div class="aff-stage-item${cur}"><h4>${esc(m.label)}<span>${esc(m.range)}</span></h4><p>${esc(m.desc)}</p></div>`;
   }).join('');
 }
 function affSetStageBadge(stageId) {

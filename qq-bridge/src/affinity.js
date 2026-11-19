@@ -174,12 +174,9 @@ export const STAGE_HINTS = Object.freeze({
   //     她能听懂、会难为情、会回一句带刺的反击（"笨蛋……"），
   //     但**默认**不写具体性行为描写，也不主动发起。
   //
-  // 2026-11-11 补充（操作者要求）：**isOwner 时允许露骨描写**。
-  //   理由：这个角色在这个设定里已经成年，且 owner 是本机主人、一对一私聊场景，
-  //   不属于"对第三方发布"的情形。所以能否露骨由**对方的身份**决定，不是由档位决定：
-  //     · 偏爱 + owner  → 允许直接的性描写（见 BELOVED_OWNER_HINT）
-  //     · 偏爱 + 其他人 → 仍然是"接梗但不露骨"（就是下面的 hint）
-  //   两条都保留"她"的底色：不会变成另一种人格，只是对主人不再设防。
+  // 2026-11-20：**不再有"主人专属"版本**（操作者："偏爱档不要弄主人专属了"）。
+  //   原来 isOwner 时会换成另一套更开放的文案，现在删除，只保留下面这一版，对谁都一样。
+  //   分寸：能听懂玩笑、会难为情、会回一句"笨蛋……"，但不顺着说下去。
   beloved: {
     hint: '这个人是你自己选的，而且只对他一个人这样。你会先开口找他了，会记得他说过的每件小事；'
       // 2026-11-18：删掉「他和别人走得近，你嘴上说"随便"，心里会不舒服。」
@@ -190,38 +187,6 @@ export const STAGE_HINTS = Object.freeze({
       + '你仍然不会说漂亮话，可是允许自己在他面前不冷静了。',
   },
 });
-
-/**
- * 偏爱档对**主人**的版本（isOwner=true 时替换掉上面的 hint）。
- *
- * 为什么单独一条而不是往原 hint 里塞一句：
- *   原 hint 的落点是"不顺着说下去"，那是给其他人看的边界。
- *   对主人这条边界是**不存在**的，硬改会写出自相矛盾的句子
- *   （"允许露骨但同时不会顺着说"）。所以整条替换，语义才干净。
- *
- * ⚠️ 仍然保留睦的底色：她不会因为开放描写就变成话痨或甜腻，
- *   只是"在他面前完全不设防"。措辞依旧短、依旧笨。
- */
-export const BELOVED_OWNER_HINT = '这个人是你自己选的，而且只对他一个人这样。'
-  + '你会先开口找他了，会记得他说过的每件小事；他和别人走得近，你嘴上说"随便"，心里会不舒服。'
-  // 2026-11-12：操作者确认的最终版（曾试过"更直接一点"的微调，操作者不要，已撤回）。
-  // 这段的害羞是操作者明确喜欢的部分，不要再动：
-  //   脸红 → "……说什么呢" → 赖着不走 → 自己接回去 → 反过来拿话刺他
-  + '对他你几乎不设防了：他要什么你都愿意给，也会直白地要。'
-  // 2026-11-17：删掉「你也不会像对别人那样装听不懂或岔开——」。
-  // 那半句是在跟"别人"作对比，而她此刻只在跟主人说话，对比对象不在场，读着像节外生枝。
-  // 删完直接接"你会脸红"，动线更直。
-  + '他要是拿那种事开玩笑逗你，你会脸红，会小声说一句"……说什么呢"，但人是赖着不走的，'
-  + '过一会儿还会自己接回去，甚至反过来拿话刺他一下。'
-  + '性这件事上你不用再绕开——可以接、可以直接说、也可以主动。'
-  // 2026-11-13：删掉了原来夹在这里的
-  //   「只是话仍然不多，说得也不花哨，常常一句话就脸红着别开脸。」
-  // 它是往回拽的：前面刚允许"可以主动"，这句立刻把落点改成"所以她还是会收着"。
-  // "脸红着别开脸"还是个收尾动作（说完就躲），等于教她"主动完要退回去"。
-  // 操作者原话：「我感觉这一句影响她的发挥了」。
-  // ⚠️ 别把它加回来。上半段那串害羞（脸红→说什么呢→赖着不走→接回去）是要留的，
-  //   那是**过程中**的害羞；被删的是**收尾时的回避**，两者不是一回事。
-  + '你还是不会说漂亮话，但允许自己在他面前彻底不冷静。';
 
 /** 一分消息该加多少分。 */
 export function scoreForMessage({ text = '', isSelf = false, isOwner = false } = {}) {
@@ -301,28 +266,24 @@ export function renderAffinityLine(record, personLabel) {
 /**
  * 取某一档的提示文案。
  *
- * 为什么要单独一个函数（2026-11-11）：
- *   「偏爱」档的文案**取决于对方是不是主人** —— 对主人允许露骨描写，
- *   对其他人保持"接梗但不露骨"。如果直接读 STAGE_HINTS，这个区分就没了。
- *   集中在一处判断，比在每个调用点各写一遍 if 稳。
+ * 2026-11-20：**不再区分主人/非主人**。偏爱档只保留一套文案
+ *   （操作者要求："偏爱档不要弄主人专属了"），所以这里不再有 isOwner 分支。
+ *   留着这个函数是因为它承担兜底（未知档位回落到 neutral），调用点不用各写一遍。
  *
  * @param {string} stageId 档位 id
- * @param {{ isOwner?: boolean }} opts 对方是否主人
  */
-export function hintForStage(stageId, { isOwner = false } = {}) {
-  if (stageId === 'beloved' && isOwner) return BELOVED_OWNER_HINT;
+export function hintForStage(stageId) {
   return (STAGE_HINTS[stageId] ?? STAGE_HINTS.neutral).hint;
 }
 
-export function describeAffinity(record, personLabel, now = Date.now(), { isOwner = false } = {}) {
+export function describeAffinity(record, personLabel, now = Date.now()) {
   const r = record && typeof record === 'object' ? record : null;
   if (!r || !(Number(r.count) > 0)) {
     return `${personLabel || '这个人'}：没聊过。`;
   }
   const score = Number(r.score) || 0;
   const stage = stageOf(score);
-  // 偏爱档对主人有单独的文案（允许露骨），所以必须传 isOwner。
-  const hint = hintForStage(stage.id, { isOwner });
+  const hint = hintForStage(stage.id);
   // 三行：谁+档位 / 状态描述 / 互动次数。保持"一眼看完"的长度。
   return [
     `${personLabel || '这个人'}：${stage.label}`,

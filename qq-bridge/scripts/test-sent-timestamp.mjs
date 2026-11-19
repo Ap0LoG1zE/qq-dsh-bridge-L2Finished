@@ -1,4 +1,4 @@
-// 验证：她自己的消息时间戳是**真实发送时刻**，不是伪造的 now + i*1000。
+﻿// 验证：她自己的消息时间戳是**真实发送时刻**，不是伪造的 now + i*1000。
 //
 // 2026-11-19 操作者从消息时间戳看出「间隔巨短」：
 //   03:35:15 / 03:35:16 / 03:35:17  ← 永远正好 1 秒
@@ -43,7 +43,7 @@ async function withBridge(run, gap = GAP_MS) {
 // ── ① 三条消息的时间戳应当反映真实间隔 ──────────────────────────────
 await test('3 条消息的时间戳间隔 ≈ 配置的句间间隔（不是固定 1 秒）', async () => {
   await withBridge(async ({ h, send }) => {
-    const r = await send({ messages: ['甲', '乙', '丙'], gapMode: 'fixed', gapMs: GAP_MS, noWait: true });
+    const r = await send({ messages: ['甲', '乙', '丙'], gapMode: 'fixed', gapMs: GAP_MS });
     if (!r.ok) throw new Error(`发送失败: ${JSON.stringify(r).slice(0, 150)}`);
 
     const st = h.getSocialV2State(KEY);
@@ -67,7 +67,7 @@ await test('3 条消息的时间戳间隔 ≈ 配置的句间间隔（不是固�
 // ── ② 换一个间隔，时间戳跟着变（排除"碰巧也是 1 秒"）───────────────
 await test('间隔改成 800ms，时间戳随之变化', async () => {
   await withBridge(async ({ h, send }) => {
-    await send({ messages: ['一', '二', '三'], gapMode: 'fixed', gapMs: 800, noWait: true });
+    await send({ messages: ['一', '二', '三'], gapMode: 'fixed', gapMs: 800 });
     const st = h.getSocialV2State(KEY);
     const t = (st.recentMessages || []).filter((m) => m.isSelf).slice(-3).map((m) => Number(m.time));
     const gaps = [t[1] - t[0], t[2] - t[1]];
@@ -82,7 +82,7 @@ await test('间隔改成 800ms，时间戳随之变化', async () => {
 await test('单条消息时间戳落在发送窗口内', async () => {
   await withBridge(async ({ h, send }) => {
     const before = Date.now();
-    await send({ messages: ['单条'], noWait: true });
+    await send({ messages: ['单条'] });
     const after = Date.now();
     const st = h.getSocialV2State(KEY);
     const mine = (st.recentMessages || []).filter((m) => m.isSelf).slice(-1);

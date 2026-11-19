@@ -96,7 +96,10 @@ test('抽出的是 YAML 解析后的真实字符串（折叠标量已展开）',
   for (const marker of PRESET_REQUIRED_MARKERS) {
     assert.ok(originalPrefix.includes(marker), `内置提示词应包含安全基线段落：${marker}`);
   }
-  assert.ok(originalPrefix.includes('{{model}}'), '应保留模板变量');
+  // 2026-11-20：操作者删掉了 persona 开头那句英文
+  //（`You are a QQ group-chat agent ... powered by the {{model}} model.`），
+  // 所以这里不再要求 {{model}}。要钉的是「有实质内容 + 安全段落完整」。
+  assert.ok(originalPrefix.length > 2000, '提示词应有实质内容');
 });
 
 test('原样写回是幂等的，且不改变提示词语义', () => {

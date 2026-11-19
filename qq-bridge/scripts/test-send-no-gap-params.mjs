@@ -48,8 +48,9 @@ test('请求体里不再发送 gap 字段', () => {
   }
 });
 
-test('noWait 仍在（连发用，不能误删）', () => {
-  if (!/noWait:\s*z\.boolean\(\)/.test(code)) throw new Error('noWait 被误删');
+// 2026-11-20：noWait 已整体删除，这条断言反过来 —— 确认它真的不在了。
+test('noWait 已删除（2026-11-20 操作者要求）', () => {
+  if (/noWait:\s*z\./.test(code)) throw new Error('noWait 仍然暴露在 schema 里');
 });
 
 test('桥接侧仍然接受 gapMode（兼容手写调用，不该跟着删）', () => {

@@ -110,7 +110,7 @@ await test('上限 3 → 发 4 条被拒；改成 5 → 发 4 条成功', async 
     let cur = await get('/api/socialV2/config');
     await post('/api/socialV2/config', { ...cur.config, send: { ...cur.config.send, burstMaxMessages: 3, observeAfterSendMs: 100 } });
     let r = await sendMsg(`/api/socialV2/send-message?key=${encodeURIComponent(KEY)}`, {
-      key: KEY, messages: ['1', '2', '3', '4'], noWait: true,
+      key: KEY, messages: ['1', '2', '3', '4'],
     });
     if (r.ok) throw new Error('上限 3 却发出了 4 条');
     console.log(`    上限3 发4条 → 拒绝「${r.error}」`);
@@ -119,7 +119,7 @@ await test('上限 3 → 发 4 条被拒；改成 5 → 发 4 条成功', async 
     cur = await get('/api/socialV2/config');
     await post('/api/socialV2/config', { ...cur.config, send: { ...cur.config.send, burstMaxMessages: 5 } });
     r = await sendMsg(`/api/socialV2/send-message?key=${encodeURIComponent(KEY)}`, {
-      key: KEY, messages: ['1', '2', '3', '4'], noWait: true, gapMode: 'fixed', gapMs: 300,
+      key: KEY, messages: ['1', '2', '3', '4'], gapMode: 'fixed', gapMs: 300,
     });
     if (!r.ok || r.sent !== 4) throw new Error(`上限 5 发 4 条失败: ${JSON.stringify(r).slice(0, 150)}`);
     console.log(`    上限5 发4条 → 成功 sent=${r.sent}`);

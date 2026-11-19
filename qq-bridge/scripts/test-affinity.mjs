@@ -9,7 +9,7 @@ import { readFileSync, existsSync } from 'node:fs'
 import {
   STAGES, STAGE_HINTS, INITIAL_SCORE, stageOf, scoreForMessage,
   bumpAffinity, decayAffinity, renderAffinityLine, DECAY_DAYS, DECAY_AMOUNT, PENALTY_KEYWORDS, describeAffinity,
-  SCORE_MIN, SCORE_MAX, BELOVED_OWNER_HINT,
+  SCORE_MIN, SCORE_MAX,
 } from '../src/affinity.js'
 
 let pass = 0
@@ -549,25 +549,28 @@ ok('手工调整好感度也会记录档位变化（拖滑条进新档位能触�
 // 操作者原话：「只是话仍然不多，说得也不花哨，常常一句话就脸红着别开脸」
 //   影响她的发挥 —— 前面刚允许"可以主动"，这句立刻把落点改回"所以她还是会收着"。
 {
+  // 2026-11-20：偏爱档**不再区分主人**，只保留非主人那一版（较保守）。
+  // 所以这里测的是 STAGE_HINTS.beloved，不再有 BELOVED_OWNER_HINT。
   const htmlSrc = readFileSync(new URL('../public/console.html', import.meta.url), 'utf8')
-  const m = htmlSrc.match(/ownerDesc:\s*'([^']*)'/)
-  assert.ok(m, '控制台缺少 ownerDesc（偏爱档"仅对主人"的说明）')
-  const consoleDesc = m[1]
+  const beloved = STAGE_HINTS.beloved.hint
 
-  // ① 限制性文案不许在任一处出现
-  for (const banned of ['话仍然不多', '不花哨', '脸红着别开脸']) {
-    assert.ok(!BELOVED_OWNER_HINT.includes(banned), `affinity.js 里不该再有「${banned}」——它会拉低她的发挥`)
-    assert.ok(!consoleDesc.includes(banned), `控制台里不该再有「${banned}」`)
+  // ① 不该出现的（操作者明确删掉的）
+  for (const banned of ['话仍然不多', '不花哨', '脸红着别开脸', '他和别人走得近']) {
+    assert.ok(!beloved.includes(banned), `偏爱档文案里不该有「${banned}」`)
+    assert.ok(!htmlSrc.includes(banned), `控制台里不该有「${banned}」`)
   }
 
-  // ② 该留的害羞必须在两处都在
-  for (const keep of ['……说什么呢', '赖着不走', '自己接回去']) {
-    assert.ok(BELOVED_OWNER_HINT.includes(keep), `affinity.js 应保留「${keep}」（操作者明确喜欢这段害羞）`)
-    assert.ok(consoleDesc.includes(keep), `控制台应保留「${keep}」，否则和模型实际拿到的不一致`)
+  // ② 该留的（这版的核心）
+  for (const keep of ['听得懂', '不会顺着说下去', '笨蛋', '不冷静']) {
+    assert.ok(beloved.includes(keep), `偏爱档应保留「${keep}」`)
+    assert.ok(htmlSrc.includes(keep), `控制台应保留「${keep}」，否则和模型拿到的不一致`)
   }
 
-  // ③ "可以主动" 这条允许必须还在（删限制句不能连允许一起删了）
-  assert.ok(BELOVED_OWNER_HINT.includes('可以主动'), '应保留"也可以主动"这条允许')
+  // ③ 主人专属机制必须彻底删掉
+  const affinitySrc = readFileSync(new URL('../src/affinity.js', import.meta.url), 'utf8')
+  assert.ok(!affinitySrc.includes('BELOVED_OWNER_HINT'), 'affinity.js 不该再有 BELOVED_OWNER_HINT（主人专属版已删）')
+  assert.ok(!/hintForStage\([^)]*isOwner/.test(affinitySrc), 'hintForStage 不该再接受 isOwner')
+  assert.ok(!htmlSrc.includes('ownerDesc'), '控制台不该再有 ownerDesc')
 }
 // 回归（2026-11-13）：qq_set_voice 的权限口径必须与预设文案一致。
 // 事件经过：预设写的是「只有主人能开关」，但桥接最初只校验开、关谁都可以。

@@ -910,10 +910,9 @@ server.tool(
   {
     groupId: z.union([z.number(), z.string()]).describe('群号（必须在白名单内）'),
     token: z.string().describe('会话令牌（见唤醒提示中的【令牌】）'),
-    messages: z.union([z.array(z.string()).min(1), z.string()]).describe('要发送的消息数组，每条为纯文本；也兼容传入 JSON 数组字符串'),
-    noWait: z.boolean().optional().describe('true=发完只等句末那一小段就返回，方便紧接着再发一次')
+    messages: z.union([z.array(z.string()).min(1), z.string()]).describe('要发送的消息数组，每条为纯文本；也兼容传入 JSON 数组字符串')
   },
-  async ({ groupId, token, messages, noWait }) => {
+  async ({ groupId, token, messages }) => {
     try {
       const key = `group:${groupId}`;
       let finalMessages = messages;
@@ -936,7 +935,7 @@ server.tool(
       }
       const data = await agentApi('/api/socialV2/send-burst', {
         method: 'POST',
-        body: JSON.stringify({ key, messages: finalMessages, noWait: noWait === true }),
+        body: JSON.stringify({ key, messages: finalMessages }),
         headers: { 'x-agent-token': token },
         timeoutMs: 300000
       });
@@ -963,11 +962,11 @@ server.tool(
 
 server.tool(
   'qq_send_message',
-  '统一发送工具：可发一条或多条，可引用某条消息，可自定义/按字数计算条间时间差。二代仿真模式专用。注意：字符串=一条消息，数组=多条消息；**单次能带的条数由面板「单次最多几条」控制**（默认 3；超了整次被拒、一条都发不出去）——想发更多就再调一次本工具并传 noWait:true；每个字符串内部不要用空格分隔中文短句，需要多条请用数组元素；每条消息要读起来完整，不要把同一句话拆到两条里。只有以下情况才需要传 replyToMessageId 引用：① 你这条消息指向的人或消息并非最新一条别人的消息（也就是你在回更早的某条）；② 你连续几句话里不同消息指代的是不同的消息或不同的人。其他情况（上下文唯一、刚在接同一条最新消息）不要引用，别让对方猜，也别为了用工具而用。',
+  '统一发送工具：可发一条或多条，可引用某条消息。二代仿真模式专用。注意：字符串=一条消息，数组=多条消息；**单次能带的条数由面板「单次最多几条」控制**（默认 3；超了整次被拒、一条都发不出去）——想发更多就分几次调用；每个字符串内部不要用空格分隔中文短句，需要多条请用数组元素；每条消息要读起来完整，不要把同一句话拆到两条里。只有以下情况才需要传 replyToMessageId 引用：① 你这条消息指向的人或消息并非最新一条别人的消息（也就是你在回更早的某条）；② 你连续几句话里不同消息指代的是不同的消息或不同的人。其他情况（上下文唯一、刚在接同一条最新消息）不要引用，别让对方猜，也别为了用工具而用。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【令牌】）'),
-    messages: z.union([z.string(), z.array(z.string()).min(1)]).describe('要发送的内容：字符串=一条；数组=分多条。**单次条数有上限**（面板「单次最多几条」，默认 3），超了整次调用会被拒绝（一条都发不出去）；要发更多请再调一次并传 noWait:true'),
+    messages: z.union([z.string(), z.array(z.string()).min(1)]).describe('要发送的内容：字符串=一条；数组=分多条。**单次条数有上限**（面板「单次最多几条」，默认 3），超了整次调用会被拒绝（一条都发不出去）；要发更多请分几次调用'),
     replyToMessageId: z.union([z.number(), z.string()]).optional().describe('要引用/回复的消息 id（非零整数，可为负数，可选）'),
     atUserId: z.union([z.number(), z.string()]).optional().describe('要 @ 的群成员 QQ 号（群聊中用于点名某个人；与引用二选一即可，不要滥用）'),
     // 2026-11-19 删掉 gapMode / gapMs / gaps 三个参数。
@@ -980,12 +979,8 @@ server.tool(
     //
     // 桥接端点仍然接受这三个字段（手写 HTTP 调用或旧客户端可能用），
     // 只是不再暴露给模型。
-    // 2026-11-19：连发用。默认发完要停下来等一会儿（观察对方有没有接话），
-    // 急着接着发第二段时传 true —— 只等"最后一句之后那一截"（和句与句之间
-    // 同一套随机间隔），然后立刻返回，因此可以马上再调一次本工具。
-    noWait: z.boolean().optional().describe('true=发完只等句末那一小段就返回，方便紧接着再发一次')
   },
-  async ({ key, token, messages, replyToMessageId, atUserId, noWait }) => {
+  async ({ key, token, messages, replyToMessageId, atUserId }) => {
     try {
       let finalMessages = messages;
       if (typeof finalMessages === 'string') {
@@ -1007,9 +1002,8 @@ server.tool(
       }
       const data = await agentApi('/api/socialV2/send-message', {
         method: 'POST',
-        // 2026-11-19：不再传 gapMode/gapMs/gaps —— 桥接不传就是 auto，
-        // 句间节奏由面板的「条间最短/最长间隔」决定。
-        body: JSON.stringify({ key, messages: finalMessages, replyToMessageId, atUserId: atUserId ?? null, noWait: noWait === true }),
+        // 2026-11-20：不再传 noWait —— 该参数已整体删除。
+        body: JSON.stringify({ key, messages: finalMessages, replyToMessageId, atUserId: atUserId ?? null }),
         headers: { 'x-agent-token': token },
         timeoutMs: 300000
       });

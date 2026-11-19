@@ -1,4 +1,4 @@
-// QQ ↔ DeepSeek Harness 桥接主程序。
+﻿// QQ ↔ DeepSeek Harness 桥接主程序。
 //
 // 链路：
 //   QQ 消息 → SnowLuma (OneBot v11 WS) → 本进程 → DSH Web API session.prompt
@@ -6131,9 +6131,6 @@ async function main() {
           const messages = Array.isArray(rawMessages)
             ? rawMessages.map((m) => String(m ?? '').trim()).filter(Boolean)
             : (typeof rawMessages === 'string' ? [String(rawMessages).trim()].filter(Boolean) : []);
-          // 2026-11-19：noWait 让她连着调两次发送时不必等完整空转，
-          // 只等"句末那一截"（与句间同区间）。语义见 paceAfterSendV2。
-          const noWait = body.noWait === true;
           const replyToMessageId = body.replyToMessageId;
           if (replyToMessageId !== undefined && replyToMessageId !== null && String(replyToMessageId).trim() !== '') {
             sendJson({ ok: false, error: 'qq_send_burst 暂不支持引用，请使用 qq_reply' }, 400);
@@ -6223,7 +6220,7 @@ async function main() {
             let postSendObserve = null;
             if (sentMessages.length > 0) {
               // 用发送前的快照当基线：覆盖"逐条发送那几秒"的盲区。
-              postSendObserve = await paceAfterSendV2(st, key, Date.now(), { snapshotBeforeSend: preSendSnapshot, sendStartedAt, noWait });
+              postSendObserve = await paceAfterSendV2(st, key, Date.now(), { snapshotBeforeSend: preSendSnapshot, sendStartedAt });
             }
             log(`[reserved2] 工具分条发送 ${key}: 成功 ${sentMessages.length}/${messages.length} 条`);
             appendActivity(`${key} [reserved2] 工具分条发送：成功 ${sentMessages.length}/${messages.length} 条`);
@@ -6279,9 +6276,6 @@ async function main() {
             : (isRawString ? [String(rawMessages).trim()].filter(Boolean) : []);
           const replyToMessageId = body.replyToMessageId;
           const atUserId = body.atUserId ?? null;
-          // 2026-11-19：noWait 让她连着调两次发送时不必等完整空转，
-          // 只等"句末那一截"（与句间同区间）。语义见 paceAfterSendV2。
-          const noWait = body.noWait === true;
           // 二代不再按空格自动分条：字符串就是一条消息，数组模式原样使用调用方间隔。
           // 旧写法是 `(isRawString && messages.length > 1) ? 'auto' : ...` —— 上面 messages 的构造
           // 保证 isRawString 为真时 length 恒为 1，这个分支永远不可达，留着只会让人以为
@@ -6393,7 +6387,7 @@ async function main() {
             let postSendObserve = null;
             if (sentMessages.length > 0) {
               // 用发送前的快照当基线：覆盖"逐条发送那几秒"的盲区。
-              postSendObserve = await paceAfterSendV2(st, key, Date.now(), { snapshotBeforeSend: preSendSnapshot, sendStartedAt, noWait });
+              postSendObserve = await paceAfterSendV2(st, key, Date.now(), { snapshotBeforeSend: preSendSnapshot, sendStartedAt });
             }
             log(`[reserved2] 工具统一发送 ${key}: 成功 ${sentMessages.length}/${messages.length} 条`);
             appendActivity(`${key} [reserved2] 工具统一发送：成功 ${sentMessages.length}/${messages.length} 条`);
@@ -8312,10 +8306,6 @@ async function main() {
               //   stages 尤其明显：5 个对象 × 3 个字段，每查一次就重复一遍。
               //   控制台面板要刻度尺数据，走的是同一个 URI 但由浏览器读，
               //   它有自己的 AFF_STAGE_FALLBACK，不依赖这里（见 console.html）。
-              // ⚠️ isOwner 必须传：偏爱档对主人允许露骨描写，对其他人不。
-              //   这个判断只能在这里做 —— affinity.js 不知道谁是主人（那是桥接的 cfg）。
-              //   用 userId 和 cfg.ownerQQ 比，不依赖请求里的 key（同一个主人在群和私聊都是主人）。
-              const isOwnerUser = wantUserResolved === String(cfg.ownerQQ ?? '');
               sendJson({
                 ok: true,
                 userId: wantUserResolved,
@@ -8323,7 +8313,7 @@ async function main() {
                 stage: rec ? affinityStageOf(rec.score).id : 'new',
                 stageLabel: rec ? affinityStageOf(rec.score).label : '没聊过',
                 count: rec ? Number(rec.count) || 0 : 0,
-                text: describeAffinity(rec || null, label, now, { isOwner: isOwnerUser }),
+                text: describeAffinity(rec || null, label, now),
               });
               return;
             }
@@ -10351,50 +10341,6 @@ async function main() {
       log(`[pace] ${key} 使用发送前快照（覆盖逐条发送期间的盲区）基线=${seenAtStart.size} 条`);
     }
 
-    // ── noWait：只补"句末那一截"，然后立刻返回 ───────────────────────────
-    //
-    // 2026-11-19 操作者要求：她如果想连着调两次 qq_send_message，不该被
-    // 那 20/30 秒的完整空转挡住。传 `noWait: true` 时：
-    //   · **不**等完整的 observeAfterSendMs；
-    //   · 但要等"最后一句之后的那一截"，且这段**用和句间完全相同的随机逻辑**
-    //     （同一个 clampGapV2 / 同一组配置项），这样节奏是一致的：
-    //     对方听到的是"句子之间 1~3 秒"，不是"最后一句之后突然变 0 秒"。
-    //   · 期间来的消息**不刷新**计时（操作者明确要求"直接贴，不用刷新空转"），
-    //     空转结束后一次性带回。
-    if (opts.noWait === true) {
-      const tailMs = computeTailGapV2();
-      const tailStart = Date.now();
-      log(`[pace] ${key} noWait：只等句末一截 ${tailMs}ms（与句间同区间）`);
-      if (tailMs > 0) await new Promise((r) => setTimeout(r, tailMs));
-      // 空转结束后把期间新到的消息一次性带回（不重置计时）。
-      const tailFresh = (Array.isArray(st.unread) ? st.unread : [])
-        .filter((m) => m && Number.isSafeInteger(m.seq) && !seenAtStart.has(m.seq));
-      let tailText = '';
-      let tailCount = 0;
-      let tailMax = 0;
-      if (tailFresh.length) {
-        const label = chatLabelForV2(key);
-        const nowMs = Date.now();
-        const rows = tailFresh.map((m) => renderOneMessageLine(compactModelMessage(m, { now: nowMs }), { label }));
-        tailCount = rows.length;
-        if (tailCount) tailText = [`【${tailCount} 条新消息】`, ...rows].join('\n');
-        tailMax = tailFresh.reduce((mx, m) => Math.max(mx, Number(m.seq) || 0), 0);
-        // 记成"已展示过"，避免下一轮重复贴同一批（与正常路径一致）。
-        try { noteModelMessagesV2(st, tailFresh); } catch { /* ignore */ }
-      }
-      st.lastSendCallAt = Date.now();
-      try { saveSocialV2State(); } catch { /* ignore */ }
-      log(`[pace] ${key} noWait 结束 waitedMs=${Date.now() - tailStart} 条数=${tailCount}`);
-      return {
-        arrived: tailCount > 0,
-        waitedMs: Date.now() - tailStart,
-        text: tailText,
-        count: tailCount,
-        suggestedThroughSeq: tailMax || undefined,
-        noWait: true,
-      };
-    }
-
     log(`[pace] ${key} 开始观望 remainingBudget=${remainingBudget} 已有未读=${seenAtStart.size}`);
     // 安静窗：每见到一条新消息就重置，直到 quietMs 内没有新动静才返回。
     const quietMs = Math.max(0, Number(cfg.socialV2?.send?.observeQuietMs ?? 10000));
@@ -10457,31 +10403,6 @@ async function main() {
       }
     }
     return { arrived: !!ob?.arrived, waitedMs: ob?.waitedMs ?? 0, text, count, suggestedThroughSeq: maxSeq || undefined };
-  }
-
-  /**
-   * 「句末那一截」的随机间隔 —— 与句间**同一套逻辑**，但**不含长间隔**。
-   *
-   * 2026-11-19 操作者要求：noWait 时空转不是"跳过"，而是"只等最后一句之后
-   * 那一段"，且这一段必须和句与句之间的随机规则一样，否则对方会听出
-   * "前几句之间要等，最后一句之后突然就不用等了"。
-   *
-   * 但**长间隔不套用**（同一天操作者确认）：句间那个 20% 概率的 5~10 秒停顿
-   * 是为了让多句连发听起来像真人打字，而 noWait 的用途恰恰是"我要接着说"，
-   * 在这里塞一个 5~10 秒的停顿与她的意图相反。所以句末只取常规区间
-   * （burstIntervalMinMs ~ burstIntervalMaxMs，默认 1~3 秒）。
-   *
-   * 实现上仍然复用 computeGapsV2：喂它 2 条假消息，取第一个延迟 ——
-   * 这样以后调 burstIntervalMin/Max 时句间与句末自动一起变，不存在两套规则漂移。
-   * 长间隔（longGap*）已整体删除（2026-11-19），这里不必再单独屏蔽。
-   */
-  function computeTailGapV2() {
-    const sendCfg = cfg.socialV2?.send ?? {};
-    // computeGapsV2 对 <=1 条的消息返回空数组，所以这里必须给 2 条。
-    // 2026-11-19：长间隔已整体删除，这里不必再单独屏蔽。
-    const gaps = computeGapsV2(['', ''], 'auto', undefined, undefined, sendCfg);
-    const tail = Array.isArray(gaps) && gaps.length ? Number(gaps[0]) : 0;
-    return Number.isFinite(tail) && tail > 0 ? tail : 0;
   }
 
   function computeGapsV2(messages, gapMode, gapMs, gaps, sendCfg) {
