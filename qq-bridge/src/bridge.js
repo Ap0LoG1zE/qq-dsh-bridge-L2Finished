@@ -8326,6 +8326,11 @@ async function main() {
                   userId: uid,
                   label,
                   nickname: nameOf.get(uid) || '',
+                  // 2026-11-20：给控制台用的「是不是 ownerQQ」标记。
+                  // 面板原来靠 `label === '主人'` 判断（label 现在是真实昵称，
+                  // 那个判断永远为 false，导致头像字显示错）。判据放在后端，
+                  // 前端就不必知道 owner 叫什么。
+                  isOwner: String(uid) === String(cfg.ownerQQ ?? ''),
                   aliases: [...(aliasesOf.get(uid) || [])].slice(-6),
                   stage: affinityStageOf(rec.score).id,
                   stageLabel: affinityStageOf(rec.score).label,
@@ -14313,9 +14318,13 @@ async function main() {
     //
     // 为什么私聊不标：私聊里对方只有一个人，每条都挂身份标记纯属白烧。
     //
+    // ⚠️ 必须排除 `isSelf`（她自己发的）：她的消息也带 `isOwner: true`
+    //   （因为她"代表"主人发言），不排除就会出现
+    //   `[群] 我·03:08：……睡了（管理员）` —— 她给自己打了个管理员标，很怪。
+    //
     // 判定依据是 label 是否以「私聊」开头 —— chatLabelForV2 给私聊的标签。
     const isPrivateLabel = String(opts.label ?? '').startsWith('私聊');
-    const ownerMark = (m?.isOwner && !isPrivateLabel) ? '（管理员）' : '';
+    const ownerMark = (m?.isOwner && !m?.isSelf && !isPrivateLabel) ? '（管理员）' : '';
     // 2026-11-12（操作者方案）：**消息行不再带 QQ 号**。
     // 以前每条都挂 `userId:123456789`（18 字符），唤醒词 2113 行加起来是白烧。
     // 现在只显示人名；需要号时用 qq_get_userid（query=人名）反查 ——

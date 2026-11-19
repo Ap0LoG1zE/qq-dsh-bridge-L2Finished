@@ -3814,7 +3814,10 @@ function affRenderPeople() {
   box.innerHTML = people.map((p) => {
     const stage = p.stage || affStageOfScore(p.score);
     const label = String(p.label || p.userId || '?');
-    const isOwner = label === '主人';
+    // 2026-11-20：判据改用后端给的 isOwner —— 原来写 `label === '主人'`，
+    // 而 label 现在是真实昵称，那个判断永远不成立（owner 头像字会显示错）。
+    // 判据放后端，前端不必知道 owner 叫什么。
+    const isOwner = p.isOwner === true;
     // 头像：有昵称就取昵称首字（中文名比数字好认）；纯数字名才取尾两位。
     const initial = isOwner ? '主' : (/^\d+$/.test(label) ? label.slice(-2) : label.slice(0, 1));
     const width = affStageProgress(p.score).toFixed(2);

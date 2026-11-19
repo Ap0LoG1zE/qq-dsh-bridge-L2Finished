@@ -170,12 +170,12 @@
         # 阈值保持 0.95（1M 窗口 ≈ 95 万）只当安全阀，一次正常会话到不了。
         #
         # 实际触发走桥接的**闲置边界**：config.json 里
-        #   socialV2.compaction.thresholdTokens = 500000（50 万）
+        #   socialV2.compaction.thresholdTokens = 400000（40 万）
         #   socialV2.compaction.idleMs        = 1800000（安静 30 分钟）
         # 两个条件都满足时，桥接调 /compact（见 idleCompactV2），此时没人在等回复，
         # 改前缀无所谓。下面两个数字就是那一次压缩的行为：
         #   retainTokens 200000 → **尾部 20 万 token 原样保留**（她还能看到近期对话）
-        #   前面约 30 万 → 压成摘要（maxTokens 2 万）
+        #   前面约 20 万 → 压成摘要（maxTokens 2 万）
         # 约束：retainTokens 必须 < 95 万（否则 compaction-basic 直接抛错）。
         thresholdRatio: 0.95
         retainTokens: 200000

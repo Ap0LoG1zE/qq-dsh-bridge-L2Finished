@@ -1416,8 +1416,9 @@ server.tool(
     } catch (error) {
       const msg = String(error?.message ?? error);
       // 只用来**识别**权限拒绝，不回显给模型（返回的是下面那句固定文案）。
-      // 保留「只有主人」是为了兼容旧版桥接（它还没改成 ownerQQ 说法）。
-      if (/ownerQQ|仅 ownerQQ|只有主人/.test(msg)) {
+      // 判据用「ownerQQ」和新旧两版文案的共同特征，不必逐字匹配旧措辞
+      // —— 旧版桥接那两句都含「开关纯语音」，用这个更稳。
+      if (/ownerQQ|开关纯语音|能开关/.test(msg)) {
         return { content: [{ type: 'text', text: '纯语音：关（仅 ownerQQ 私聊可开）' }] };
       }
       return { content: [{ type: 'text', text: `纯语音：切换失败（${msg}）` }], isError: true };
