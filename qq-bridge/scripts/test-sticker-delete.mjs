@@ -10,9 +10,14 @@
 // 现在要求：① md5/备注/完整 id 都能解析成 emoji_id；
 //          ② 删除后必须**重新拉列表核实**，还在就报 409，绝不谎报成功。
 import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const bridge = fs.readFileSync('D:\\DSH\\qq-dsh-bridge\\qq-bridge\\src\\bridge.js', 'utf8');
-const panel = fs.readFileSync('D:\\DSH\\qq-dsh-bridge\\dsh-plugins\\qq-dsh-panel\\lib\\client.js', 'utf8');
+// 仓库根：从脚本位置推导，换机器/换目录都能跑（别再写死绝对路径）。
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+const bridge = fs.readFileSync(path.join(ROOT, 'src', 'bridge.js'), 'utf8');
+const panel = fs.readFileSync(path.join(ROOT, '..', 'dsh-plugins', 'qq-dsh-panel', 'lib', 'client.js'), 'utf8');
 
 let pass = 0;
 let fail = 0;

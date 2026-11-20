@@ -6,8 +6,13 @@
 // 所以这三个参数对她完全多余 —— 已从 schema 删除，桥接仍然接受（兼容手写调用）。
 import fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const SRC = 'D:\\DSH\\qq-dsh-bridge\\qq-bridge\\src\\mcp-snowluma-safe.js';
+// 仓库根：从脚本位置推导，换机器/换目录都能跑（别再写死绝对路径）。
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+const SRC = path.join(ROOT, 'src', 'mcp-snowluma-safe.js');
 const src = fs.readFileSync(SRC, 'utf8');
 const code = src.split('\n')
   .filter((l) => !l.trim().startsWith('//') && !l.trim().startsWith('*'))
@@ -54,7 +59,7 @@ test('noWait 已删除（2026-11-20 操作者要求）', () => {
 });
 
 test('桥接侧仍然接受 gapMode（兼容手写调用，不该跟着删）', () => {
-  const bridge = fs.readFileSync('D:\\DSH\\qq-dsh-bridge\\qq-bridge\\src\\bridge.js', 'utf8');
+  const bridge = fs.readFileSync(path.join(ROOT, 'src', 'bridge.js'), 'utf8');
   if (!/body\.gapMode === 'fixed'/.test(bridge)) {
     throw new Error('桥接侧的 gapMode 分支被误删 —— 手写 HTTP 调用会失去 fixed 能力');
   }

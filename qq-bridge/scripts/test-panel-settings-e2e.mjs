@@ -11,10 +11,15 @@
 // 因为那才是「小面板」真正做的事。
 import http from 'node:http';
 import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { bridgeHarness } from './audit-bridge-harness.mjs';
 
+// 仓库根：从脚本位置推导，换机器/换目录都能跑（别再写死绝对路径）。
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
 const KEY = 'group:456';
-const PANEL = 'D:\\DSH\\qq-dsh-bridge\\dsh-plugins\\qq-dsh-panel\\lib\\client.js';
+const PANEL = path.join(ROOT, '..', 'dsh-plugins', 'qq-dsh-panel', 'lib', 'client.js');
 
 let pass = 0;
 let fail = 0;

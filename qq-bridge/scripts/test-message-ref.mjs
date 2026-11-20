@@ -9,8 +9,13 @@
 //
 // 现在要求：`#4`、`＃4`（全角）、`消息#4`、`4` 都能指向同一条。
 import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const bridge = fs.readFileSync('D:\\DSH\\qq-dsh-bridge\\qq-bridge\\src\\bridge.js', 'utf8');
+// 仓库根：从脚本位置推导，换机器/换目录都能跑（别再写死绝对路径）。
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+const bridge = fs.readFileSync(path.join(ROOT, 'src', 'bridge.js'), 'utf8');
 
 let pass = 0;
 let fail = 0;

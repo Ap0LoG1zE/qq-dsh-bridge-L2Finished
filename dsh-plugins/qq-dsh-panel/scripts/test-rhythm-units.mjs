@@ -1,4 +1,4 @@
-// 验证面板「回复节奏」里的秒↔毫秒换算（2026-11-19 操作者要求填秒）。
+﻿// 验证面板「回复节奏」里的秒↔毫秒换算（2026-11-19 操作者要求填秒）。
 //
 // 要防的两个错：
 //   ① 显示时没除 1000 —— 界面上出现 30000（用户以为要填毫秒）
@@ -8,8 +8,13 @@
 // 再用一个最小 DOM 桩跑 renderRhythmTab / saveRhythm 的关键分支。
 import fs from 'node:fs';
 import assert from 'node:assert/strict';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const SRC = 'D:\\DSH\\qq-dsh-bridge\\dsh-plugins\\qq-dsh-panel\\lib\\client.js';
+// 仓库根：从脚本位置推导，换机器/换目录都能跑（别再写死绝对路径）。
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+
+const SRC = path.join(ROOT, 'dsh-plugins', 'qq-dsh-panel', 'lib', 'client.js');
 const src = fs.readFileSync(SRC, 'utf8');
 
 let pass = 0;
@@ -36,11 +41,11 @@ test('所有 *Ms 时间字段都标注了 sec 单位', () => {
   }
 });
 
-// ── ② 新增的「发完后等多久」字段存在 ────────────────────────────────
-test('新增 send.observeAfterSendMs（发完后等多久）', () => {
+// ── ② 新增的「发完后额外再等多久」字段存在 ────────────────────────────────
+test('新增 send.observeAfterSendMs（发完后额外再等多久）', () => {
   assert.ok(src.includes("'send.observeAfterSendMs'"), '字段不存在');
   // 2026-11-19 改名：原显示名「发送后空转」不直观，操作者要求改成白话。
-  assert.ok(/发完后等多久/.test(src), '显示名不存在');
+  assert.ok(/发完后额外再等多久/.test(src), '显示名不存在');
   // 它必须带 sec 标记，否则用户还是得填毫秒
   assert.ok(/send\.observeAfterSendMs'[^\]]*'sec'/.test(src), '没标 sec');
 });
