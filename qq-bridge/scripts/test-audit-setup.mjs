@@ -114,7 +114,24 @@ try {
     const capture = path.join(bin, 'called.json');
     const cli = path.join(bin, 'fake-dsh.mjs');
     fs.writeFileSync(cli, `import fs from 'node:fs'; fs.writeFileSync(process.env.QQ_TEST_CAPTURE, JSON.stringify({args: process.argv.slice(2), home: process.env.DSH_HOME}));\n`);
-    fs.writeFileSync(path.join(bin, 'dsh.cmd'), `@echo off\r\n"${process.execPath}" "${cli}" %*\r\n`);
+    // ⚠️ .cmd 的内容必须是**纯 ASCII**，路径只能在运行时展开。
+    //
+    // cmd.exe 按**当前 ANSI 代码页**（中文系统上是 GBK）解析 .cmd 的文件字节，
+    // 而 fs.writeFileSync 写的是 utf8。只要 fixture 的绝对路径里含非 ASCII
+    //（例如 Windows 用户名是中文，%TEMP% 就落在 C:\Users\张栩烯\... 下），
+    // 写进去的 UTF-8 字节就会被当 GBK 解读，路径变乱码 → node 报
+    // MODULE_NOT_FOUND → capture 永远不生成 → 测试报「CLI was not invoked」，
+    // 看着像 setup-dsh 没调用 CLI，其实是夹具自己坏了。
+    //
+    // 用 %~dp0（cmd 运行时展开成脚本所在目录）代替绝对路径：文件内容与路径
+    // 里的字符编码无关，换任何用户名/目录都能跑。
+    // 路径来自协作者实机（他的用户名是中文，本机 Ap0 是纯 ASCII 所以一直没暴露）。
+    const cmdText = `@echo off\r\n"${process.execPath}" "%~dp0fake-dsh.mjs" %*\r\n`;
+    // 断言兜底：万一以后有人改回绝对路径，这里会立刻失败并说清原因。
+    // （process.execPath 本身在非 ASCII 安装目录下也可能带中文，先替换掉再判。）
+    assert.ok(/^[\x00-\x7F]*$/.test(cmdText.replace(process.execPath, 'NODE')),
+      `.cmd 内容必须是纯 ASCII（cmd 按 ANSI 代码页解析它）：${cmdText}`);
+    fs.writeFileSync(path.join(bin, 'dsh.cmd'), cmdText);
     const profile = 'test&name%CD%!';
     const result = f.run(profile, {
       PATH: [bin, path.dirname(process.execPath)].join(path.delimiter),
