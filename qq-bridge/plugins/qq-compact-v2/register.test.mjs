@@ -11,12 +11,20 @@ import { apply, inject, name } from './index.js';
 
 const COMMAND_NAME = /^[a-z][a-z0-9_-]*$/u;
 
-/** 造一个最小 ctx：只实现插件用到的 commands / compaction / tokenMeter。 */
+/** 造一个最小 ctx：只实现插件用到的 commands / compaction / tokenMeter / effect。 */
 function makeCtx({ nodes = [], totalTokens = 0 } = {}) {
   const registered = [];
+  const effects = [];
   return {
     registered,
+    effects,
     ctx: {
+      // Cordis 的 ctx.effect(fn, label)：立即执行 fn，把返回值当 dispose。
+      // 命令注册必须包在这里 —— 裸调 register 拿不到生命周期归属，命令不出现。
+      effect(fn, label) {
+        effects.push(label ?? '(no label)');
+        return fn();
+      },
       commands: {
         register(def) {
           // 复刻 DSH 的校验（@deepseek-ai/dsh-commands 里的 normalizeDefinition）
@@ -33,6 +41,7 @@ function makeCtx({ nodes = [], totalTokens = 0 } = {}) {
             throw new TypeError(`command "${def.name}" handler must be a function`);
           }
           registered.push(def);
+          return () => { /* dispose */ };
         },
       },
       tokenMeter: {
@@ -49,13 +58,15 @@ function makeCtx({ nodes = [], totalTokens = 0 } = {}) {
 const makeNodes = (tokenList) => tokenList.map((tokens, i) => ({ seq: i * 10 + 1, tokens }));
 
 test('apply() 能注册命令，且命令名合法', () => {
-  const { ctx, registered } = makeCtx();
+  const { ctx, registered, effects } = makeCtx();
   apply(ctx, { retainTokens: 200000 });
   assert.equal(registered.length, 1, '应注册 1 个命令');
   const def = registered[0];
   assert.equal(def.name, 'compact-v2');
   assert.ok(COMMAND_NAME.test(def.name), `命令名必须匹配 ${String(COMMAND_NAME)}：${def.name}`);
   assert.ok(def.description.includes('compact-v2'), '描述里应带用法提示');
+  // 注册必须在 ctx.effect 里（否则 Cordis 拿不到生命周期归属，命令不出现）
+  assert.ok(effects.length >= 1, 'apply 必须用 ctx.effect 包裹注册');
 });
 
 test('inject 声明的三个服务都是真服务名', () => {

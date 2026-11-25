@@ -156,7 +156,17 @@ export function apply(ctx, config) {
     Number(config?.retainTokens) || DEFAULT_RETAIN_TOKENS,
   );
 
-  ctx.commands.register({
+  // ⚠️ 注册必须包在 ctx.effect 里（2026-11-25 修，这是命令不出现的第三个原因）。
+  //
+  // 对照能正常工作的 dsh-inject：
+  //     ctx.effect(() => registerCommands(ctx, rawConfig));
+  // 而 DSH 自带的 command-compact 也是：
+  //     ctx.effect(function* () { ... yield ctx.commands.register({...}) }, '...lifecycle');
+  //
+  // 裸调 ctx.commands.register() 在 Cordis 里拿不到生命周期归属：注册动作
+  // 不会被插件的作用域追踪，插件重载/作用域销毁时也无法正确 dispose。
+  // 实测症状就是「bundle 列表里 enabled:true、插件确实加载了，但命令不出现」。
+  ctx.effect(() => ctx.commands.register({
     // ⚠️ 必须是 /^[a-z][a-z0-9_-]*$/u 能匹配的名字（见文件头说明）。
     // 之前写成 compactV2，大写 V 让 register 抛 TypeError，命令根本没注册上。
     name: 'compact-v2',
@@ -254,7 +264,7 @@ export function apply(ctx, config) {
         };
       }
     },
-  });
+  }), 'qq-compact-v2: /compact-v2 command');
 }
 
 function fmt(n) {
