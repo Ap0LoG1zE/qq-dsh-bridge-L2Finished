@@ -3181,15 +3181,22 @@ window.__ModuleLoader__.load({
     nodes.push(head, headSub)
 
     // ── 身体两维：两条横条（2026-11-26 删掉饱腹）──
+    // ★ 标签可配（d.labels，来自 config.life.panelLabels）：
+    //   代码里用中性叫法以便公开发布；本机想显示什么由 config.json 决定，
+    //   那个文件在 .gitignore 里不会进仓库。
+    var L = d.labels || {}
+    var labDesire = L.desire || '第三项'
+    var labEnergy = L.energy || '精力'
+    var labBody = L.body || '身体'
     var c = d.circle || {}
-    nodes.push(section('身体', [
-      lifeBar('精力', c.energy, {
+    nodes.push(section(labBody, [
+      lifeBar(labEnergy, c.energy, {
         tone: c.energy < 20 ? '#dc2626' : c.energy < 45 ? '#d97706' : '#16a34a',
         note: (c.energyBase != null && c.energyBase !== c.energy)
           ? ('叠加后 ' + c.energy + '，原始 ' + c.energyBase)
           : ''
       }),
-      lifeBar('第三项', c.desire, {
+      lifeBar(labDesire, c.desire, {
         tone: '#8b5cf6',
         note: c.desire >= 80
           ? (d.cycle && d.cycle.inPeriod ? '（经期中，不显示）' : '（会显示）')

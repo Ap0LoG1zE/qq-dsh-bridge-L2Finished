@@ -4303,6 +4303,21 @@ async function main() {
                   : 0
               },
               mood: mood || '',
+              // ★ 2026-11-26：**面板文案可配**（`life.panelLabels`）。
+              //
+              //   代码里用中性叫法（`第三项`）以便公开发布；
+              //   本机想显示成什么由 `config.json` 决定 —— 那个文件在 .gitignore 里，
+              //   不会进仓库。没配就沿用代码默认。
+              labels: (() => {
+                const p = cfg.life?.panelLabels;
+                const pick = (k, dft) => (p && typeof p === 'object' && typeof p[k] === 'string' && p[k].trim())
+                  ? String(p[k]).trim() : dft;
+                return {
+                  desire: pick('desire', '第三项'),
+                  energy: pick('energy', '精力'),
+                  body: pick('body', '身体')
+                };
+              })(),
               cycle: info ? {
                 phase: info.phase,
                 phaseName: info.phaseName,
@@ -4320,8 +4335,7 @@ async function main() {
               } : null,
               // 活跃的 condition（含恢复尾声）。按 intensity 降序 —— 面板看到的顺序
               // 就是"此刻哪件事最占上风"的顺序。
-              conditions: active
-                .slice()
+              conditions: active                .slice()
                 .sort((a, b) => (b.intensity || 0) - (a.intensity || 0))
                 .map((c) => ({
                   id: c.id,

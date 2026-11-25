@@ -15,6 +15,7 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import fs from 'node:fs';
 import { bridgeHarness } from './audit-bridge-harness.mjs';
 
 const KEY = 'private:10001';
@@ -259,5 +260,48 @@ test('面板端点：醒着时 life.asleep 必须是 false（别把白天当睡�
     assert.equal(row.life.asleep, false);
     assert.equal(row.life.asleepHours, 0);
     assert.ok(Number(row.life.energy) > 0, '醒着要给精力');
+  });
+});
+
+// ══ 面板文案可配（2026-11-26）═══════════════════════════════════════════════
+//
+// 需求背景：仓库要公开，代码里的默认措辞用中性叫法（「第三项」）；
+// 但本机想显示成什么应由 config.json 决定 —— 那个文件在 .gitignore 里，
+// 不会跟着仓库一起发出去。
+//
+// 所以：**默认中性 + 可配覆盖**，两边都要钉住。
+
+test('life.panelLabels 默认是中性叫法（公开仓库的要求）', async () => {
+  await withBridge({}, async (h) => {
+    // 不配 panelLabels 时，bridge 里那段 fallback 应当是「第三项」。
+    // （这里只断言"默认值是中性词"，不去断言"不含某个具体词" ——
+    //  那种断言本身就会把那个词写进公开仓库。）
+    const src = fs.readFileSync(new URL('../src/bridge.js', import.meta.url), 'utf8');
+    assert.ok(src.includes("pick('desire', '第三项')"),
+      '默认标签必须是中性的「第三项」—— 那是要公开的代码');
+  });
+});
+
+test('life.panelLabels 配上就覆盖默认值', async () => {
+  await withBridge({
+    life: {
+      enabled: true, timezone: 'Asia/Shanghai',
+      panelLabels: { desire: '自定义名', energy: '精力值', body: '身体状态' }
+    }
+  }, async (h) => {
+    assert.equal(h.cfg.life.panelLabels.desire, '自定义名');
+    assert.equal(h.cfg.life.panelLabels.energy, '精力值');
+    assert.equal(h.cfg.life.panelLabels.body, '身体状态');
+  });
+});
+
+test('life.statusText.desireHigh 可配（工具返回值里的那句话）', async () => {
+  await withBridge({
+    life: {
+      enabled: true, timezone: 'Asia/Shanghai',
+      statusText: { desireHigh: '自定义档位词' }
+    }
+  }, async (h) => {
+    assert.equal(h.cfg.life.statusText.desireHigh, '自定义档位词');
   });
 });
