@@ -54,6 +54,8 @@
 // 太大、且当前没人等着回复时用它。它的价值是「可控地保留尾部」，
 // 而不是「省那一次 prefill」。
 
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -64,6 +66,27 @@ export const inject = ['commands', 'compaction', 'tokenMeter'];
 
 const DEFAULT_RETAIN_TOKENS = 200_000;
 const MIN_COMPACT_TOKENS = 20_000;
+
+// ── 自检日志 ────────────────────────────────────────────────────────────────
+//
+// 「命令不出现」这类问题最难的地方是**完全没有反馈**：插件加载了、
+// bundle 列表里也 enabled，但命令就是不在。所以这里主动留痕，
+// 排查时直接看 ~/.dsh/qq-compact-v2.log 就知道卡在哪一步：
+//   · 连「模块加载」那行都没有 → 模块根本没被 import（bundle 没生效）
+//   · 有「模块加载」没有「apply」 → inject 的服务没齐，插件在等
+//   · 有「apply」没有「注册成功」 → ctx 里的服务不对，或 register 抛错
+//   · 有「注册成功」但命令还是不出现 → UI 侧或作用域问题
+//
+// 写失败一律静默 —— 诊断日志绝不能影响插件本身。
+const DIAG_LOG = path.join(os.homedir(), '.dsh', 'qq-compact-v2.log');
+
+function trace(step, detail) {
+  try {
+    fs.appendFileSync(DIAG_LOG, `[${new Date().toISOString()}] ${step}${detail ? ` — ${detail}` : ''}\n`, 'utf8');
+  } catch { /* 静默 */ }
+}
+
+trace('模块已加载', `inject=${JSON.stringify(inject)}`);
 
 /** 把用户输入解析成 { dry, retainTokens }。 */
 function parseArgs(rawInput, fallbackRetain) {
@@ -156,7 +179,14 @@ export function apply(ctx, config) {
     Number(config?.retainTokens) || DEFAULT_RETAIN_TOKENS,
   );
 
-  // ⚠️ 注册必须包在 ctx.effect 里（2026-11-25 修，这是命令不出现的第三个原因）。
+  trace('apply() 被调用', `retainTokens=${fallbackRetain}`);
+  for (const svc of ['commands', 'compaction', 'tokenMeter']) {
+    let state = 'ok';
+    try { if (ctx[svc] === undefined) state = 'undefined'; } catch (e) { state = `throw:${e.message}`; }
+    trace(`  服务 ${svc}`, state);
+  }
+
+  // ⚠️ 注册必须包在 ctx.effect 里（2026-11-25 修，这是命令不出现的真因）。
   //
   // 对照能正常工作的 dsh-inject：
   //     ctx.effect(() => registerCommands(ctx, rawConfig));
@@ -265,6 +295,7 @@ export function apply(ctx, config) {
       }
     },
   }), 'qq-compact-v2: /compact-v2 command');
+  trace('注册成功', 'name=compact-v2');
 }
 
 function fmt(n) {
