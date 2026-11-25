@@ -186,12 +186,17 @@
         # provider 的 KV cache 整段失效，那一步要重算全部历史（实测几十秒）。
         # 用户权衡后选择接受这个代价 —— 保留上下文比省那一步更值。
         #
-        # 现在的行为：
-        #   thresholdRatio 0.5 → 50 万 token 开始压（1M 窗口的一半）
+        # 现在的行为（2026-11-25 操作者定为 0.95）：
+        #   thresholdRatio 0.95 → 95 万 token 才开始压（1M 窗口的 95%）
         #   retainTokens 200000 → 尾部 20 万原样保留
-        #   前面约 30 万 → 压成摘要（maxTokens 2 万）
-        # 约束：retainTokens(200000) 必须 < thresholdTokens(500000)，否则直接抛错。
-        thresholdRatio: 0.5
+        #   → 原生压缩基本不触发，实际压缩交给 qq-compact-v2 插件手动跑
+        #     `/compactV2`（它自己算切点、调 compactRegion，保留量可控）
+        #
+        # 为什么回到 0.95：原生压缩只能对话中途触发，会毁 KV cache（那一步
+        # 重算全部历史，实测几十秒）。有了 /compactV2 之后，就没必要靠原生
+        # 压缩兜底了 —— 把它留在 0.95 当"安全阀"即可（正常会话到不了）。
+        # 约束：retainTokens(200000) 必须 < thresholdTokens(950000)，否则直接抛错。
+        thresholdRatio: 0.95
         retainTokens: 200000
         maxTokens: 20000
 

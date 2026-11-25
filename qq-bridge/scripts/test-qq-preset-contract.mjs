@@ -52,31 +52,35 @@ test('压缩边界与工具剪枝保持不变', () => {
   assert.deepEqual(compaction.config.find((row) => row.id === 'tool-result-pruner').config, {
     thresholdChars: 50000, headChars: 45000, tailChars: 2000,
   });
-  // 压缩边界（2026-11-25 第三次重定）：**改回靠 DSH 原生压缩**。
+  // 压缩边界（2026-11-25 最终定稿）：**阈值回到 0.95，当安全阀**。
   //
-  // 历史：
+  // 历史与最终结论：
   //   · 2026-10-28 从 0.15 抬到 0.95 —— 那时压缩由桥接的闲置边界主动触发，
   //     0.95 只当安全阀（对话中压会毁 KV cache，实测 45~55 秒/步）。
-  //   · 2026-11-25 降到 0.5 —— 因为发现 DSH 的 `/compact`（compactNow）
+  //   · 2026-11-25 一度降到 0.5 —— 因为发现 DSH 的 `/compact`（compactNow）
   //     把 retainTokens **硬编码 0**，闲置压缩实际是"除最后一条外全压掉"，
-  //     用户丢了 1000+ 条对话。所以弃用闲置压缩，改回原生：
-  //     阈值 0.5（50 万）触发，retainTokens 20 万原样保留。
-  //     代价是压缩发生在对话中途、那一步缓存失效 —— 操作者权衡后接受。
+  //     用户丢了 1000+ 条对话。所以弃用闲置压缩。
+  //   · 2026-11-25 最终回到 0.95 —— 因为新增了 `qq-compact-v2` 插件
+  //     （`/compactV2` 命令）：它自己用 tokenMeter 算切点、调公开的
+  //     `compactRegion(start,end)`，保留多少完全可控。
+  //     既然有了可控的手动入口，就不需要靠原生压缩兜底了；
+  //     原生压缩只能对话中途触发（会毁缓存），所以留在 0.95 = 基本不触发。
   const compactionBasic = compaction.config.find((row) => row.id === 'compaction-basic').config;
   assert.deepEqual(compactionBasic, {
-    thresholdRatio: 0.5, retainTokens: 200000, maxTokens: 20000,
+    thresholdRatio: 0.95, retainTokens: 200000, maxTokens: 20000,
   });
-  // 护栏一：阈值必须明显高于 retainTokens（DSH 会校验 retainTokens < thresholdTokens，
-  // 违反直接抛 TargetPressureConfigError）。按 1M 窗口算 0.5 × 1M = 50 万 > 20 万。
+  // 护栏一：阈值必须严格大于 retainTokens（DSH 校验 retainTokens < thresholdTokens，
+  // 违反直接抛 TargetPressureConfigError）。0.95 × 1M = 95 万 > 20 万。
   const impliedThreshold = 1_000_000 * Number(compactionBasic.thresholdRatio);
   assert.ok(
     impliedThreshold > Number(compactionBasic.retainTokens),
     `thresholdRatio×1M (${impliedThreshold}) 必须大于 retainTokens (${compactionBasic.retainTokens})，否则 DSH 直接抛错`,
   );
-  // 护栏二：不允许回到"几乎不触发"的 0.9+（那等于不压缩，长聊会爆上下文）。
+  // 护栏二：阈值必须"高到基本不触发"—— 原生压缩只能对话中途跑，会毁 KV cache。
+  // 真正的压缩由 /compactV2 手动触发（保留量可控）。所以这里要求 >= 0.9。
   assert.ok(
-    Number(compactionBasic.thresholdRatio) <= 0.8,
-    `thresholdRatio 不该 >= 0.9（那等于永不压缩）；当前 ${compactionBasic.thresholdRatio}`,
+    Number(compactionBasic.thresholdRatio) >= 0.9,
+    `thresholdRatio 必须 >= 0.9（原生压缩只当安全阀；实际压缩走 /compactV2）；当前 ${compactionBasic.thresholdRatio}`,
   );
 });
 
@@ -120,26 +124,28 @@ test('合并预设的压缩边界：阈值与 retainTokens 自洽', () => {
     const basic = group?.config?.find((row) => row.id === 'compaction-basic')?.config;
     assert.ok(basic, `${name} 缺少 compaction-basic`);
 
-    // 2026-11-25：从"禁止对话中压缩"改成"阈值与保留量自洽"。
+    // 2026-11-25 最终定稿：原生压缩只当**安全阀**，阈值必须高到基本不触发。
     //
-    // 改的原因：DSH 的 `/compact` 把 retainTokens 硬编码成 0，
-    // 桥接的闲置压缩实际会清空历史。所以弃用它、改回原生压缩 ——
-    // 而原生压缩**只能**在对话中途触发（由 agent/pre-step 钩子驱动）。
-    // "对话中绝不压缩"这条约束已经不成立，断言必须跟着改，
-    // 否则它会逼着把阈值调回 0.95（= 永不压缩 = 长聊爆上下文）。
+    // 为什么不再要求"低阈值"：
+    //   DSH 的 `/compact` 把 retainTokens 硬编码成 0（会清空历史），
+    //   所以新增了 `qq-compact-v2` 插件提供 `/compactV2` —— 它自己算切点、
+    //   调公开的 `compactRegion`，保留量完全可控。
+    //   有了可控的手动入口，就不需要靠原生压缩兜底；而原生压缩只能对话
+    //   中途触发、会毁 KV cache，所以留在 0.95（基本不触发）最合适。
     const ratio = Number(basic.thresholdRatio);
     const retain = Number(basic.retainTokens);
     assert.ok(ratio > 0 && ratio < 1, `${name} 的 thresholdRatio 必须在 (0,1)：${ratio}`);
-    // 按 1M 窗口换算，阈值必须严格大于保留量（DSH 会校验，违反直接抛错）。
+    // 阈值必须严格大于保留量（DSH 会校验，违反直接抛 TargetPressureConfigError）。
     const implied = 1_000_000 * ratio;
     assert.ok(
       implied > retain,
       `${name}：thresholdRatio×1M (${implied}) 必须 > retainTokens (${retain})，否则 DSH 抛 TargetPressureConfigError`,
     );
-    // 也不允许"永不触发"：>=0.9 等于不压缩，长聊会爆上下文。
+    // 阈值必须"高到基本不触发"：真正的压缩由 /compactV2 手动触发。
     assert.ok(
-      ratio <= 0.8,
-      `${name} 的 thresholdRatio=${ratio} 太高（>=0.9 等于永不压缩）；当前设计是 0.5`,
+      ratio >= 0.9,
+      `${name} 的 thresholdRatio=${ratio} 太低（原生压缩会在对话中途触发、毁 KV cache）；`
+        + '实际压缩应走 /compactV2，这里保持 >= 0.9 当安全阀',
     );
   }
 });
