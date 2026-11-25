@@ -1,23 +1,18 @@
-# qq-compact-v2 的 DSH bundle patch。
+# qq-compact-v2 bundle patch。
 #
-# 挂上这个插件后，DSH 里会多一个 `/compact-v2` 命令。
+# 挂上后在 DSH 里多一个 `/compact-v2` 命令。
 #
-# ⚠️ 命令名必须匹配 DSH 的 /^[a-z][a-z0-9_-]*$/u —— 只允许小写字母、数字、
-#    下划线、连字符。**大写字母会让 register 直接抛 TypeError**，症状是
-#    "命令根本不存在"且界面上毫无提示。所以是 compact-v2 而不是 compactV2。
+# 与自带 `/compact` 的区别：
+#   /compact       → 走 compactNow()，retainTokens 硬编码 0
+#                    ⇒ 只保留最后一条，其余全压掉
+#   /compact-v2    → 自己用 tokenMeter 算「尾部保留 N token」的切点，
+#                    再调公开接口 compactRegion(start, end)
+#                    ⇒ 真正保留指定量
 #
-# 它和自带的 `/compact` 的区别（重要）：
-#   · `/compact`      → 内部走 compactNow()，retainTokens **硬编码 0**
-#                       ⇒ 只保留最后一个节点，其余全部压成摘要
-#   · `/compact-v2`   → 用 tokenMeter 自己算「尾部保留 N token」的切点，
-#                       再调公开接口 compactRegion(start, end)
-#                       ⇒ 真正保留你指定的量
-#
-# config.retainTokens：默认保留多少 token（不传就 200000，即 20 万）。
-# 也可以在命令里临时指定：/compact-v2 150000
-#
-# 建议第一次先跑 dry-run 看清范围：
-#   /compact-v2 dry
+# 用法：
+#   /compact-v2              按 config.retainTokens（默认 20 万）
+#   /compact-v2 dry          只报告范围，不动
+#   /compact-v2 150000       临时指定保留 15 万
 
 - insert:
     - id: qq-compact-v2
