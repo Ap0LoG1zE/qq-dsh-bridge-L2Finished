@@ -123,23 +123,25 @@ export const MEAL_MOODS = Object.freeze([
 /**
  * 当前落在哪个饭点窗口。不在任何窗口返回 null。
  *
- * ⚠️ 只有**真的饿了**（satiety 低于门槛）才算 —— 刚吃完午饭就"走神"
- *    是假的。甜食窗口例外：`sweet` 那条是馋，随时成立。
+ * ★ 2026-11-26：**饥饿值已删除，这个函数不再看"她有多饿"。**
+ *
+ *   原来是 `mealMoodAt(minute, { satiety })`，刚吃完就压掉"饿了"那几条。
+ *   但连续饥饿值整项移除之后（它 13/h 掉、她 47 小时只加过 2 次、长期贴着 0），
+ *   没有任何东西能说明"她刚吃完"了。
+ *
+ *   现在的口径是**纯时段**：到了午饭窗口就说"想吃东西"。
+ *   这比"先查她饿不饿再说"更接近人 —— 到点会想吃饭，不需要先饿到某个分数。
+ *   而且她真吃过一顿时，`qq_life_circle` 会顺手清掉这些饭点 condition
+ *   （见 bridge.js 里"吃过饭清掉饿了类 condition"那段），所以不会刚吃完就说饿。
  *
  * @param {number} minuteOfDay
- * @param {object} [opts]
- * @param {number} [opts.satiety] 当前饥饿值（0=饿透，100=很饱）
- * @param {number} [opts.hungryBelow] 低于多少才算饿，默认 50
+ * @returns {object|null} MEAL_MOODS 里的一条（副本）
  */
-export function mealMoodAt(minuteOfDay, opts = {}) {
+export function mealMoodAt(minuteOfDay) {
   const m = Number(minuteOfDay);
   if (!Number.isFinite(m)) return null;
-  const satiety = Number(opts.satiety);
-  const hungryBelow = Number.isFinite(Number(opts.hungryBelow)) ? Number(opts.hungryBelow) : 50;
   const hit = MEAL_MOODS.find((w) => m >= w.startMin && m < w.endMin);
   if (!hit) return null;
-  // 甜食窗口不要求饿；其余必须真的饿。
-  if (!hit.sweet && Number.isFinite(satiety) && satiety >= hungryBelow) return null;
   return { ...hit };
 }
 
@@ -300,8 +302,16 @@ export function pickWithDefault(pool, opts = {}) {
 export function sleepVerdict(opts = {}) {
   const hours = Number(opts.sleepHours);
   const rand = typeof opts.rand === 'function' ? opts.rand : Math.random;
-  // 数据不够就不编：返回默认那条（空 label 的"睡得还行"不进提示词）。
-  if (!Number.isFinite(hours) || hours <= 0) return { ...SLEEP_POOL[0] };
+  // ★ 2026-11-26 修：**没有数据就一个字都不说**（label 给空串）。
+  //
+  // 原来这里返回 SLEEP_POOL[0]，而它第一条的 label 正是「睡得还行」——
+  // 于是"她根本没说自己睡过"也会在跨天第一轮冒出一句「醒了，睡得还行」。
+  // 11-26 00:01 那次就是这样：她 23:30 只是收尾了对话，00:02:56 才说"我睡了"，
+  // 可唤醒词里已经先写上了起床语。
+  //
+  // 空 label 是**契约**：调用方（bridge.js 的 sleep 分支）只在 label 非空时
+  // 才写 condition / 塞 pendingSleepQuality，所以空串 = 这一整套都不发生。
+  if (!Number.isFinite(hours) || hours <= 0) return { ...SLEEP_POOL[0], label: '' };
   if (hours < 4) return { ...SLEEP_POOL[4] };
   if (hours < 6) return { ...SLEEP_POOL[2] };
   if (hours < 7) return { ...SLEEP_POOL[3] };

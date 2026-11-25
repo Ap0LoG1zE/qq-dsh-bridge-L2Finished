@@ -1,7 +1,7 @@
 // 词表一致性测试（2026-11-24）。
 //
 // 这个文件的存在原因很具体：改六期时 `isPeriodPhaseV2()` 漏改阶段名，
-// 导致「经期抑制性欲」从那天起失效，而**当时没有任何测试会红**。
+// 导致「经期抑制第三项」从那天起失效，而**当时没有任何测试会红**。
 // 所以这里把几类"改名/换词会静默漂移"的地方全部钉死。
 
 import test from 'node:test';
@@ -34,7 +34,7 @@ test('CYCLE_PHASES 的六期名与 phaseAt 实际返回的名字完全一致', (
 });
 
 test('旧的阶段名 period 不再被当作经期（这条锁住过一次真 bug）', () => {
-  // 改六期时把 menstrual 写成 period 的漏改，让"经期抑制性欲"静默失效。
+  // 改六期时把 menstrual 写成 period 的漏改，让"经期抑制第三项"静默失效。
   // 这个断言的作用是：任何人再想用 'period' 表示经期，都会立刻红。
   assert.ok(!CYCLE_PHASES.includes('period'), '经期阶段名是 menstrual，不是 period');
   assert.equal(phaseAt(ANCHOR, ANCHOR, 28).phase, 'menstrual');

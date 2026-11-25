@@ -28,6 +28,19 @@ import * as lifeSleepMod from '../src/life-sleep.js';
 // 以后 bridge.js 每多一个 life-* / 其它模块 import，这里都要同步加一行。
 import * as lifeWeatherMod from '../src/life-weather.js';
 import * as lifeProactiveMod from '../src/life-proactive.js';
+// ★ 2026-11-26 补：bridge.js 顶部从 life-vitals.js / life-conditions.js / life-cycle.js
+//   也 import 了一大票符号（噩梦池、梦池、健康、饭点、condition 操作、周期相位……），
+//   而 harness 会**删掉所有 import** 改用 context 注入 —— 这里不摊开的话，
+//   VM 里那些名字全是 undefined。
+//
+//   为什么一直没炸：旧测试从来没走过**噩梦/梦/健康/饭点/condition** 这些分支
+//   （它们都要"睡着 → 到点 → 掷骰命中"才进得去），所以这个洞静默了很久。
+//   2026-11-26 加主动唤醒回归测试时第一次踩到：
+//     ReferenceError: pickWithDefault is not defined
+//   以后 bridge.js 每多一个 life-* import，这里都要同步加。
+import * as lifeVitalsMod from '../src/life-vitals.js';
+import * as lifeConditionsMod from '../src/life-conditions.js';
+import * as lifeCycleMod from '../src/life-cycle.js';
 // slang-learner.js 已随黑话功能下线而删除（qq_slang_* 工具一并移除）。
 // 这里不再 import，改成空对象摊入 —— 保持下面 `...slang` 的写法不破，且不会引到不存在的模块。
 const slang = {};
@@ -206,6 +219,11 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     // 不导出的话只能靠等定时器真的触发，既慢又测不稳。
     proactiveTierOf, proactiveQuotaOf, proactiveTodayCount, proactiveUnansweredOf,
     proactiveUnansweredTotal, proactiveState, recordProactiveSentV2, resetUnansweredV2,
+    // 2026-11-26：按会话取主动记账。test-proactive-persist 要验证
+    // 「lastProactiveAt / todayCount 真的存下来了」—— 它挂在
+    // globalMemory.proactive.byKey[key] 上，不在会话对象里，
+    // 没有这个出口就只能断言内存、测不到白名单式 save 漏字段。
+    proactiveStateOf,
     pickProactiveRouteV2, scheduleProactiveCheckV2,
     // 间隔公式与档位表：测试要断言「未回应只会让间隔变大」「封顶真的生效」
     // 「越亲密涨幅越大」这三条，直接算比等定时器快几千倍。
@@ -213,6 +231,10 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     // 2026-11-24 新增：时段权重 / daypart 计数 / 剩余额度压力。
     // 这三块决定"她多久说一次"，调参全靠它们，必须能被直接断言。
     hourActivityFactor, HOUR_ACTIVITY_WEIGHT, quotaPressureFactor,
+    // 2026-11-26：软目标（照原作者 target_ratio）。测试要断言
+    // 「额度 3 条的档软目标是 2 条」这类换算，以及「超过软目标只是拉长间隔，
+    // 不是硬停」—— 硬停会让"软"这个字失去意义。
+    proactiveSoftTarget,
     daypartOfMinute, DAYPARTS, daypartGapOverride, proactiveDaypartCounts,
     bumpProactiveDaypartCount,
     // 额度换算（2026-11-23 四次修订）：额度不再是随机抽样，而是
@@ -226,6 +248,31 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     lifeCircleCacheReset: () => { lifeCircleCache = null; },
     readLifeCircle,
     writeLifeCircle,
+    // ★ 2026-11-26 补：condition 的读写也要能造夹具。
+    //   隐私回归（test-life-owner-only.mjs）要直接塞一条 cycle_discomfort，
+    //   验证它进不了群聊/次要用户私聊的唤醒词。没有这两个出口就只能靠真跑
+    //   「跨天 + 掷中痛经」，概率太低、测不稳。
+    readLifeCond,
+    writeLifeCond,
+    lifeCondCacheReset: () => { lifeCondCache = null; },
+    // ★ 2026-11-26 补：免打扰与「本夜」键。
+    //   夜里静默、「一夜最多一次噩梦」这两条都改了语义，
+    //   必须能直接断言（等定时器真触发太慢、也不确定）。
+    quietHoursOf,
+    inQuietHours,
+    quietEndAt,
+    nightKeyOf,
+    todayKeyOf,
+    // ★ 2026-11-26：面板「主动机会」页的数据组装（含睡眠状态）。
+    //   抽成函数之后可以单测，不用起 HTTP 服务造状态。
+    buildProactiveSessionRow,
+    // ★ 2026-11-26 补：自动醒的三个触发条件（睡满 / 精力满 / 早上定时）。
+    //   要能直接断言"什么时候该醒"，而不是靠等定时器。
+    maybeAutoWakeUpV2,
+    // ★ 2026-11-26：早上叫醒这条路要能单测 ——
+    //   尤其是"关掉主动机会的会话不许被叫醒"那条真 bug。
+    scheduleWakeUpTimerV2,
+    fireMorningWakeV2,
     // 快照渲染与发送者标签：唤醒词（buildWakePromptV2）**不含**消息快照，
     // 快照是在投递时由 renderWakeSnapshotV2 拼上去的。要断言"消息行长什么样"
     // 必须单独测这两个，否则测出来的永远是空的。
@@ -399,6 +446,34 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     createWeatherCache: lifeWeatherMod.createWeatherCache,
     weatherShortText: lifeWeatherMod.weatherShortText,
     buildProactiveCandidates: lifeProactiveMod.buildProactiveCandidates,
+    // ★ 2026-11-26 补：life-vitals.js 的整套词表与工具函数。
+    //   名字必须和 bridge.js 顶部的 import 逐字一致（含别名），否则 VM 里是 undefined。
+    HEALTH_POOL: lifeVitalsMod.HEALTH_POOL,
+    CARE_POOL: lifeVitalsMod.CARE_POOL,
+    NIGHTMARE_POOL: lifeVitalsMod.NIGHTMARE_POOL,
+    DREAM_POOL: lifeVitalsMod.DREAM_POOL,
+    pickWithDefault: lifeVitalsMod.pickWithDefault,
+    pickFromPool: lifeVitalsMod.pickFromPool,
+    MEAL_MOODS: lifeVitalsMod.MEAL_MOODS,
+    SLEEP_AFTERGLOW_SPEC: lifeVitalsMod.SLEEP_AFTERGLOW_SPEC,
+    CYCLE_RECOVERY_SPEC: lifeVitalsMod.CYCLE_RECOVERY_SPEC,
+    mealMoodAt: lifeVitalsMod.mealMoodAt,
+    buildHealthCauses: lifeVitalsMod.buildHealthCauses,
+    healthChance: lifeVitalsMod.healthChance,
+    sleepVerdict: lifeVitalsMod.sleepVerdict,
+    makeAfterglowV2: lifeVitalsMod.makeAfterglow,
+    // life-conditions.js：condition 的增删查改与叠加计算
+    TRANSITIONS: lifeConditionsMod.TRANSITIONS,
+    normalizeConds: lifeConditionsMod.normalizeConditions,
+    activeLife: lifeConditionsMod.activeConditions,
+    composeEnergyDelta: lifeConditionsMod.composeEnergy,
+    composeMoodPick: lifeConditionsMod.composeMood,
+    reapExpiredLife: lifeConditionsMod.reapExpired,
+    makeConditionLife: lifeConditionsMod.makeCondition,
+    upsertCondLife: lifeConditionsMod.upsertCondition,
+    dedupeByKind: lifeConditionsMod.dedupeByKind,
+    // life-cycle.js：生理周期相位
+    ...lifeCycleMod,
     cleanupTemp: () => {},
     ...globals,
   });

@@ -13,7 +13,7 @@ import assert from 'node:assert/strict';
 
 import { circleExtras, STATUS_TEXT } from './life-circle.js';
 
-const base = { satiety: 80, desire: 50 };
+const base = { desire: 50 };
 
 test('无负面条件时，精力 >= 85 照常播报「精神很好」', () => {
   const out = circleExtras({ ...base, energy: 86 }, { includeDesire: true });
@@ -55,11 +55,11 @@ test('压制**不改真实数值**（只影响显示）', () => {
   assert.deepEqual(before, snapshot, 'circleExtras 不该改入参');
 });
 
-test('压制不影响饱腹与第三项', () => {
-  const out = circleExtras({ satiety: 10, energy: 95, desire: 90 },
+test('压制不影响第三项', () => {
+  // ★ 2026-11-26：饥饿项已从 circleExtras 删除，这里只验第三项照常出。
+  const out = circleExtras({ energy: 95, desire: 90 },
     { includeDesire: true, suppressHighEnergy: true });
-  assert.ok(out.some((s) => s.includes('饿')), JSON.stringify(out));
-  assert.ok(out.some((s) => s.includes('性欲')), JSON.stringify(out));
+  assert.ok(out.some((s) => s.includes('欲望')), JSON.stringify(out));
 });
 
 test('阈值：84 是压制的上界（85 起才叫「精神很好」）', () => {
@@ -72,8 +72,10 @@ test('阈值：84 是压制的上界（85 起才叫「精神很好」）', () =>
 });
 
 test('STATUS_TEXT.energyHigh 带「精力：」前缀（这是设计，不是 bug）', () => {
-  // 饥饿不带标签（「不饿」已经够明确），精力带标签 ——
-  // 光一个「还好」说不清是什么还好。两条规则不一样，别顺手"统一"。
+  // ★ 2026-11-26：饥饿值删除后，`satietyOk` 也不再存在 ——
+  // 那条"饥饿不带标签"的断言一并删掉。现在的规则只剩一条：
+  // 精力要带标签，因为光一个「还好」说不清是什么还好。
   assert.match(STATUS_TEXT.energyHigh, /^精力：/);
-  assert.ok(!STATUS_TEXT.satietyOk.includes('：'), '饥饿不该带标签');
+  assert.match(STATUS_TEXT.energyOk, /^精力：/);
+  assert.equal(STATUS_TEXT.satietyOk, undefined, '饥饿文案应当已随饥饿值一起删除');
 });

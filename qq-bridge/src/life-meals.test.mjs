@@ -58,40 +58,44 @@ test('至少有一个正向窗口（想吃甜的是馋，不是饿）', () => {
   assert.equal(positive[0].sweet, true);
 });
 
-// ── ③ 饿了才给 ─────────────────────────────────────────────────────────────
+// ── ③ 纯时段判定（2026-11-26 改：饥饿值已删除）─────────────────────────────
 
-test('mealMoodAt：午饭窗口 + 饿了 → 走神', () => {
-  const r = mealMoodAt(at(12), { satiety: 20 });
+test('mealMoodAt：午饭窗口 → 走神', () => {
+  const r = mealMoodAt(at(12));
   assert.equal(r.mood, '走神');
 });
 
-test('mealMoodAt：午饭窗口但刚吃完 → 不给（不能刚吃完就说走神）', () => {
-  assert.equal(mealMoodAt(at(12), { satiety: 90 }), null);
-  assert.equal(mealMoodAt(at(12), { satiety: 60 }), null);
+test('mealMoodAt：**不再看饥饿值**（那个参数已经没有了）', () => {
+  // ★ 2026-11-26：连续饥饿值整项删除，mealMoodAt 变成纯时段函数。
+  // 原来"刚吃完就不给走神"那条规则随之失效 —— 它依赖一个已经不存在的数值。
+  // 替代机制：她真吃过时调 qq_life_circle(ate=true)，饭点 condition 会被清掉。
+  const r = mealMoodAt(at(12));
+  assert.ok(r, '午饭窗口就该给，不再问"她饿不饿"');
+  // 传了多余参数也不该炸（老调用方的兼容）
+  assert.ok(mealMoodAt(at(12), { satiety: 90 }), '多余的 satiety 参数被忽略，不影响结果');
 });
 
-test('mealMoodAt：甜食窗口不要求饿（那是馋）', () => {
-  const r = mealMoodAt(at(16), { satiety: 95 });
-  assert.ok(r, '下午想吃甜的应当随时成立');
+test('mealMoodAt：甜食窗口（下午）照常给', () => {
+  const r = mealMoodAt(at(16));
+  assert.ok(r, '下午想吃甜的应当成立');
   assert.equal(r.mood, '柔软');
+  assert.equal(r.sweet, true);
 });
 
 test('mealMoodAt：窗口外返回 null', () => {
-  assert.equal(mealMoodAt(at(3), { satiety: 10 }), null);
-  assert.equal(mealMoodAt(at(14), { satiety: 10 }), null);
+  assert.equal(mealMoodAt(at(3)), null);
+  assert.equal(mealMoodAt(at(14)), null);
 });
 
-test('mealMoodAt：没传 satiety 时不卡饿的门槛', () => {
-  // 拿不到饥饿值时宁可给（信息不全时不要静默吞掉），
-  // 否则一次读取失败就整天没有饭点心情。
+test('mealMoodAt：晚饭窗口给「粘人」', () => {
   const r = mealMoodAt(at(18));
   assert.ok(r);
   assert.equal(r.mood, '粘人');
 });
 
 test('mealMoodAt：边界是左闭右开', () => {
-  assert.ok(mealMoodAt(at(11, 0), { satiety: 10 }), '11:00 算午饭窗口起点');
-  assert.equal(mealMoodAt(at(13, 41), { satiety: 10 }), null, '13:41 出窗口');
+  assert.ok(mealMoodAt(at(11, 0)), '11:00 算午饭窗口起点');
+  assert.equal(mealMoodAt(at(13, 41)), null, '13:41 出窗口');
 });
 
 // ── ④ 正向尾声 ─────────────────────────────────────────────────────────────
@@ -124,34 +128,33 @@ test('心情词里有正向词，不是清一色负面', () => {
   }
 });
 
-// ── 饥饿只出一个来源（2026-11-25 修）──────────────────────────────────────
+// ── 饥饿只由一个来源出（2026-11-25 提出，11-26 彻底解决）─────────────────────
 //
-// 实测：`【状态】饿了，想吃东西　精力：还好　心情：走神　饿了，想吃东西`
+// 实测过：`【状态】饿了，想吃东西　精力：还好　心情：走神　饿了，想吃东西`
 //   前面那个来自 satiety 数值，后面那个来自 meal 的 label —— 同一件事说两遍。
-// 按原作者：有饭点判断就用它（更具体），没有才回落到数值档位。
+//
+// ★ 2026-11-26：**直接删掉数值那一路**，问题从根上没了。
+//   现在 circleExtras 里根本没有饥饿项，饥饿只有 meal label 一个来源。
 
 import { circleExtras } from './life-circle.js';
 
-test('有 meal condition 时，不再由 satiety 数值出饥饿词', () => {
-  const c = { satiety: 33, energy: 82, desire: 40 };
-  const withMeal = circleExtras(c, { includeDesire: true, hasMealCondition: true });
-  assert.ok(!withMeal.some((s) => s.includes('饿')), `不该出现饥饿词：${JSON.stringify(withMeal)}`);
-  assert.equal(withMeal[0], '精力：还好');
+test('circleExtras **永远不出饥饿词**（那件事已经完全交给饭点 condition）', () => {
+  const c = { energy: 82, desire: 40 };
+  const out = circleExtras(c, { includeDesire: true });
+  assert.ok(!out.some((s) => s.includes('饿')), `不该出现饥饿词：${JSON.stringify(out)}`);
+  assert.equal(out[0], '精力：还好');
 });
 
-test('没有 meal condition 时，回落用数值档位', () => {
-  const c = { satiety: 33, energy: 82, desire: 40 };
-  const noMeal = circleExtras(c, { includeDesire: true });
-  assert.equal(noMeal[0], '有点饿');
+test('就算传了旧的 hasMealCondition 参数也不炸（向后兼容）', () => {
+  // 老调用方可能还在传；参数被忽略即可，不该抛错、也不该改变输出。
+  const c = { energy: 82, desire: 40 };
+  const withFlag = circleExtras(c, { includeDesire: true, hasMealCondition: true });
+  const without = circleExtras(c, { includeDesire: true });
+  assert.deepEqual(withFlag, without, '这个参数已经没有意义了');
 });
 
-test('数值更低时同样是「有 meal 就不出」', () => {
-  // satiety 10 本来会出「饿了，想吃东西」，有 meal 时也压掉，
-  // 因为 meal 的 label 已经在说同一件事。
-  const c = { satiety: 10, energy: 82, desire: 40 };
-  const withMeal = circleExtras(c, { includeDesire: true, hasMealCondition: true });
-  assert.ok(!withMeal.some((s) => s.includes('饿')), JSON.stringify(withMeal));
-  // 没 meal 时它照常出
-  const noMeal = circleExtras(c, { includeDesire: true });
-  assert.equal(noMeal[0], '饿了，想吃东西');
+test('饥饿只由 meal 的 label 表达（端到端语义）', () => {
+  // 午饭窗口 → mealMoodAt 给出「饿了，想吃东西」，这才是唤醒词里唯一那句"饿"。
+  const spec = mealMoodAt(at(12));
+  assert.match(spec.label, /饿/, `午饭窗口的 label 应当提到饿：${spec.label}`);
 });

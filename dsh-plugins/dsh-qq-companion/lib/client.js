@@ -2021,6 +2021,45 @@ window.__ModuleLoader__.load({
     }
     box.appendChild(facts)
 
+    // ③.5 ★ 2026-11-26：**身体 / 睡眠状态**（这一块以前完全没有）
+    //
+    // 为什么必须有：面板原来只写"下次检查 05:56（还有 3 小时）"，
+    // 但看不出来那 3 小时是「间隔就这么长」还是「她在睡觉、根本不会叫醒她」——
+    // 这两件事对她的实际行为差得很远，排查时也完全分不清。
+    var life = item.life
+    if (life) {
+      var lifeRow = h('div')
+      lifeRow.style.cssText = 'display:flex;gap:7px;flex-wrap:wrap;align-items:center'
+      if (life.asleep) {
+        lifeRow.appendChild(pill('💤 睡着 · 不会主动开口', true))
+        if (Number(life.asleepHours) > 0) {
+          lifeRow.appendChild(pill('已睡 ' + (Math.round(Number(life.asleepHours) * 10) / 10) + ' 小时', false))
+        }
+        // 醒来时刻：wakeUpAt 有就显示，没有就按 8 点说明
+        var wakeAt = Number(life.wakeUpAt)
+        if (isFinite(wakeAt) && wakeAt > 0) {
+          var wd = new Date(wakeAt)
+          lifeRow.appendChild(pill('预计 ' + String(wd.getHours()).padStart(2, '0') + ':'
+            + String(wd.getMinutes()).padStart(2, '0') + ' 起床', false))
+        } else if (isFinite(Number(life.morningWakeHour))) {
+          lifeRow.appendChild(pill('每天 ' + Math.round(Number(life.morningWakeHour)) + ' 点起床', false))
+        }
+      } else {
+        lifeRow.appendChild(pill('☀️ 醒着', false))
+        var en = Number(life.energy)
+        var th = Number(life.energyThreshold)
+        if (isFinite(en)) {
+          lifeRow.appendChild(pill('精力 ' + en + (isFinite(th) ? ' / ' + th : ''), false))
+        }
+        var qh = life.quietHours
+        if (qh) {
+          lifeRow.appendChild(pill('免打扰 ' + Math.round(Number(qh.startHour)) + '–'
+            + Math.round(Number(qh.endHour)) + ' 点', false))
+        }
+      }
+      box.appendChild(lifeRow)
+    }
+
     // ④ 今天各时段发了几条（小柱状）
     var dp = t.dayparts || {}
     var hasAny = false
@@ -2109,13 +2148,29 @@ window.__ModuleLoader__.load({
     }
     var idleMin = Math.round((Number(g.idleThresholdMs) || 900000) / 60000)
     var probPct = Math.round((Number(g.probability) || 0) * 100)
+    // ★ 2026-11-26：把「睡着 = 不排主动唤醒」讲清楚 —— 这是最容易被误解的一条。
+    var gl = g.life || {}
+    var morningH = isFinite(Number(gl.morningWakeHour)) ? Math.round(Number(gl.morningWakeHour)) : 8
+    var enTh = isFinite(Number(gl.energyWakeThreshold)) ? Math.round(Number(gl.energyWakeThreshold)) : 100
+    var nightPct = (function () {
+      var raw = Number(gl.nightmareSpecialChance)
+      var inten = Number(gl.intensity) / 100
+      if (!isFinite(raw)) raw = 0.35
+      if (!isFinite(inten)) inten = 0.5
+      var threshold = raw * Math.max(0.2, inten)
+      // 一觉 8 小时、每 40 分钟掷一次 ≈ 10 次机会
+      return Math.round((1 - Math.pow(1 - threshold, 10)) * 100)
+    })()
     var subText
     if (globalOff) {
       subText = '在「回复节奏」里把主动机会打开，下面这些开关才会真正起作用。'
     } else if (hasPrivate) {
       subText = '私聊按额度走：好感度档位决定每天最多几条，档内按分数切分；'
-        + '间隔还会被时段、剩余额度、未回应次数调整。群聊仍是概率制（安静满 '
-        + idleMin + ' 分钟 + ' + probPct + '% 命中，每 '
+        + '间隔还会被时段、剩余额度、未回应次数调整。'
+        + '她睡着时完全不排主动唤醒 —— 只有 ' + morningH + ' 点会检查一次精力'
+        + '（满了就叫起床，没满继续睡），之后精力回满才起；'
+        + '夜里约 ' + nightPct + '% 的概率会做噩梦惊醒（一夜最多一次）。'
+        + '群聊仍是概率制（安静满 ' + idleMin + ' 分钟 + ' + probPct + '% 命中，每 '
         + Math.round((Number(g.checkIntervalMinMs) || 1800000) / 60000) + '~'
         + Math.round((Number(g.checkIntervalMaxMs) || 5400000) / 60000) + ' 分钟检查一次）。'
     } else {
@@ -2128,6 +2183,16 @@ window.__ModuleLoader__.load({
     var stat = h('div', 'dsh-fb-proact-stats')
     stat.appendChild(h('span', 'dsh-fb-proact-stat', onCount + ' 个会话允许'))
     stat.appendChild(h('span', 'dsh-fb-proact-stat', (list.length - onCount) + ' 个已关闭'))
+    // ★ 2026-11-26：再加一个"几个正在睡" —— 这是现在最常见的不开口原因
+    var asleepCount = 0
+    for (var sc = 0; sc < list.length; sc++) {
+      if (list[sc].life && list[sc].life.asleep) asleepCount += 1
+    }
+    if (asleepCount > 0) {
+      var sleepChip = h('span', 'dsh-fb-proact-stat', asleepCount + ' 个在睡')
+      sleepChip.style.color = '#d97706'
+      stat.appendChild(sleepChip)
+    }
     head.appendChild(stat)
 
     var nodes = [head]
@@ -2147,7 +2212,22 @@ window.__ModuleLoader__.load({
         // ⚠️ 2026-11-24 修：原来显示 `nextCheckInMs`（**倒计时**），
         //    面板每刷新一次数字就变（时间在流逝），看着像"点刷新间隔就变"。
         //    现在优先显示**绝对时刻**（一次调度内恒定），没有才退回倒计时。
-        if (item.enabled && item.nextCheckAt) {
+        //
+        // ★ 2026-11-26：**睡着时不能说"下次检查 XX 点"**。
+        //   睡着时那个定时器只是"掷噩梦"用的（40 分钟一次），
+        //   和她会不会开口完全无关 —— 写成"下次检查 03:14"会让人以为
+        //   "她 03:14 可能主动说话"，那是假的。
+        var asleepNow = !!(item.life && item.life.asleep)
+        if (asleepNow) {
+          var wk = Number(item.life.wakeUpAt)
+          if (isFinite(wk) && wk > 0) {
+            var wkd = new Date(wk)
+            bits.push('睡着 · ' + String(wkd.getHours()).padStart(2, '0') + ':'
+              + String(wkd.getMinutes()).padStart(2, '0') + ' 起床前不会主动开口')
+          } else {
+            bits.push('睡着 · 不会主动开口')
+          }
+        } else if (item.enabled && item.nextCheckAt) {
           var at = new Date(Number(item.nextCheckAt))
           if (!isNaN(at.getTime())) {
             var hh = String(at.getHours()).padStart(2, '0')
@@ -3100,28 +3180,27 @@ window.__ModuleLoader__.load({
     headSub.style.cssText = 'font-size:11px;opacity:.55;margin-bottom:12px'
     nodes.push(head, headSub)
 
-    // ── 身体三维：三条横条 ──
+    // ── 身体两维：两条横条（2026-11-26 删掉饱腹）──
     var c = d.circle || {}
     nodes.push(section('身体', [
-      lifeBar('饱腹', c.satiety, {
-        // 饥饿侧：越低越该吃。颜色按"需要关注"来配，不按数值高低。
-        tone: c.satiety < 20 ? '#dc2626' : c.satiety < 50 ? '#d97706' : '#16a34a',
-        note: c.satiety < 20 ? '饿了' : c.satiety < 50 ? '有点饿' : '不饿'
-      }),
       lifeBar('精力', c.energy, {
         tone: c.energy < 20 ? '#dc2626' : c.energy < 45 ? '#d97706' : '#16a34a',
         note: (c.energyBase != null && c.energyBase !== c.energy)
           ? ('叠加后 ' + c.energy + '，原始 ' + c.energyBase)
           : ''
       }),
-      lifeBar('性欲', c.desire, {
+      lifeBar('第三项', c.desire, {
         tone: '#8b5cf6',
         note: c.desire >= 80
           ? (d.cycle && d.cycle.inPeriod ? '（经期中，不显示）' : '（会显示）')
           : '（低于 80 不显示）'
       }),
       (function () {
-        var row = h('div', null, c.asleep === true ? '💤 正在睡' : '☀️ 醒着')
+        // ★ 2026-11-26：饥饿值已删除，这里改成显示"睡多久了"——
+        //   那个数字现在是排查「自动醒为什么没触发」的第一手材料。
+        var txt = c.asleep === true ? '💤 正在睡' : '☀️ 醒着'
+        if (c.asleep === true && c.asleepHours > 0) txt += '（已睡 ' + c.asleepHours + ' 小时）'
+        var row = h('div', null, txt)
         row.style.cssText = 'font-size:11.5px;opacity:.7;padding-top:4px'
         return row
       })()

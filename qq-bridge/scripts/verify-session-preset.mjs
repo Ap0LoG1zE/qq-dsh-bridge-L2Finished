@@ -16,7 +16,12 @@
 //   ④ DSH 段落还在（harness 头）
 import fs from 'node:fs';
 import zlib from 'node:zlib';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import yaml from 'js-yaml';
+
+// qq-bridge 根（本脚本在 scripts/ 下）。
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 const ROOT = 'C:/Users/Ap0/.dsh/sessions/--D-DSH-qq-dsh-bridge-qq-bridge-state-agents--';
 const MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd]);
@@ -63,7 +68,13 @@ let bad = 0;
 // ── 先看装配源：patch 文件（DSH 每轮从它重新装配）──────────────────────────
 // 这一项比"会话里最新那条"更重要：会话里的是**上一次装配的结果**，
 // 而 patch 才是"下一轮会用到的"。
-const PATCH = 'dsh-plugins/dsh-qq-companion/presets/qq-chat-agent.patch.yml';
+// ★ 2026-11-26 修：路径过去一年是 `dsh-plugins/...`（插件目录还在 qq-bridge 下面时）。
+//   2026-11-25 四个插件合并成 dsh-qq-companion 之后，它搬到了**仓库根**的
+//   `dsh-plugins/`（和 build-agent-preset-patches.mjs 的 BUNDLE_DIR 一致：
+//   REPO_ROOT = qq-bridge，再退一级）。这里原来没跟着改，于是永远报
+//   「读不到 patch」—— 而那不是文件不存在，是路径写错了，很容易被当成"没 build"。
+const PATCH = path.join(REPO_ROOT, '..', 'dsh-plugins', 'dsh-qq-companion',
+  'presets', 'qq-chat-agent.patch.yml');
 let patchText = '';
 try {
   patchText = fs.readFileSync(PATCH, 'utf8');

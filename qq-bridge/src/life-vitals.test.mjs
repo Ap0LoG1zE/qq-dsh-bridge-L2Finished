@@ -66,10 +66,19 @@ test('sleepVerdict：睡得太少 → 落到差的那几条', () => {
   assert.equal(sleepVerdict({ sleepHours: 9, rand: () => 0.9 }).label, '睡得还行');
 });
 
-test('sleepVerdict：没有数据 → 返回默认那条，不编', () => {
-  assert.equal(sleepVerdict({}).label, SLEEP_POOL[0].label);
-  assert.equal(sleepVerdict({ sleepHours: 0 }).label, SLEEP_POOL[0].label);
-  assert.equal(sleepVerdict({ sleepHours: NaN }).label, SLEEP_POOL[0].label);
+test('sleepVerdict：没有数据 → 空 label，一个字都不编', () => {
+  // ★ 2026-11-26 改：原来是"返回默认那条"，但默认那条的 label 就是
+  //   「睡得还行」—— 等于没数据也照样说一句起床语。11-26 00:01 那次
+  //   她根本没说自己睡过，唤醒词里却有「（醒了，睡得还行）」。
+  //   现在契约是**空 label**（调用方见空串就什么都不写）。
+  assert.equal(sleepVerdict({}).label, '');
+  assert.equal(sleepVerdict({ sleepHours: 0 }).label, '');
+  assert.equal(sleepVerdict({ sleepHours: NaN }).label, '');
+  // 数值照旧是平淡项：不编文字，也不该顺手扣/加精力。
+  assert.equal(sleepVerdict({}).energyDelta, 0);
+  assert.equal(sleepVerdict({}).mood, '');
+  // 有数据时必须给得出话（别把整条路径改死了）。
+  assert.equal(sleepVerdict({ sleepHours: 8, rand: () => 0.9 }).label, '睡得还行');
 });
 
 test('词表：第一条是平淡项（默认策略：默认无聊、偶尔有事）', () => {

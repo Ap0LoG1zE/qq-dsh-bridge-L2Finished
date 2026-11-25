@@ -1671,7 +1671,7 @@ async function handleDiagnose(req, res) {
 //
 // 纯转发：面板请求 /life → 这里打桥接的 /api/life → 原样回给客户端。
 //
-// 为什么不在面板侧重新计算：那些数值（condition 叠加、周期推算、赖性欲抑制）
+// 为什么不在面板侧重新计算：那些数值（condition 叠加、周期推算、依赖抑制）
 // 全在桥接里，面板只该显示，不该有第二套算法 —— 否则两边一定会漂。
 async function handleLife(req, res) {
   const env = bridgeEnv()

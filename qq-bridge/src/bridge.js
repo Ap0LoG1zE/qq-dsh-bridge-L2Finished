@@ -3536,6 +3536,8 @@ async function main() {
             setupSleepTimerV2(key);
             scheduleProactiveCheckV2(key);
             setupTodoTimerV2(key);
+            // ★ 2026-11-26：睡眠醒来定时器（重启后必须恢复，否则她只能等主动机会顺带看一眼）
+            scheduleWakeUpTimerV2(key);
           }
           log('桥接模式已确定为 reserved2，恢复有限睡眠定时器');
         }
@@ -3556,6 +3558,8 @@ async function main() {
             setupSleepTimerV2(key);
             scheduleProactiveCheckV2(key);
             setupTodoTimerV2(key);
+            // ★ 2026-11-26：同上 —— 模式切回来时也要恢复醒来定时器
+            scheduleWakeUpTimerV2(key);
           }
           log('桥接模式已进入二代仿真模式，重建有限睡眠定时器');
         }
@@ -4253,7 +4257,7 @@ async function main() {
         //
         // 返回当前的身体/周期/条件全貌，**只读**。
         // 与 /api/status 分开的原因：那个端点被 QQ 侧的智能体也会调用（受限视图），
-        // 而这里包含性欲、生理期这类只该给操作者看的东西 —— 混进去容易漏。
+        // 而这里包含第三项、生理期这类只该给操作者看的东西 —— 混进去容易漏。
         if (req.method === 'GET' && url.pathname === '/api/life') {
           if (req.headers['x-agent-token'] || req.headers['x-agent-call'] !== undefined) {
             sendJson({ ok: false, error: '生活状态只对控制台开放' }, 403);
@@ -4286,13 +4290,17 @@ async function main() {
                   return f.format(new Date(now));
                 } catch { return ''; }
               })(),
-              // 身体三维（0~100）。energy 给的是**叠加后**的值，另附原始值便于排查。
+              // 身体两维（0~100）。energy 给的是**叠加后**的值，另附原始值便于排查。
+              // ★ 2026-11-26：satiety 已删除，饥饿只由饭点 condition 表达。
               circle: {
-                satiety: Math.round(circle.satiety),
                 energy: Math.round(composed),
                 energyBase: Math.round(circle.energy),
                 desire: Math.round(circle.desire),
-                asleep: circle.asleep === true
+                asleep: circle.asleep === true,
+                // 已睡多久（小时）：面板显示用，也给排查「自动醒为什么没触发」。
+                asleepHours: circle.asleep === true && circle.asleepSince > 0
+                  ? Math.round(((now - circle.asleepSince) / 3600000) * 100) / 100
+                  : 0
               },
               mood: mood || '',
               cycle: info ? {
@@ -5475,77 +5483,9 @@ async function main() {
         if (req.method === 'GET' && url.pathname === '/api/socialV2/proactive-sessions') {
           const p = cfg.socialV2?.proactive ?? {};
           const rows = [];
-          for (const [key, st] of socialV2.conversations.entries()) {
-            if (!st) continue;
-            if (!isSessionAllowedInCurrentMode(key)) continue;
-            const idleMs = Date.now() - (st.lastIncomingAt || 0);
-            // ── 2026-11-24：把 tier 额度那套的实时状态一并给面板 ──────────
-            //
-            // 面板原来只能显示"概率 30% / 间隔 30–90 分钟"，
-            // 而私聊早就改成额度制了 —— 那几行数字对私聊是**假的**。
-            // 现在按会话类型分别给：
-            //   私聊 → tier / 今日额度 / 已发几条 / 未回应 / 实际间隔 / 档位
-            //   群聊 → 仍是概率那套（字段名不变，保持兼容）
-            const isPrivate = key.startsWith('private:');
-            let tierInfo = null;
-            if (isPrivate) {
-              try {
-                const { governed, tier, policy, quota, band } = proactiveQuotaOf(key);
-                if (governed) {
-                  const nowTmp = new Date();
-                  // 2026-11-24：**按 key 取**。原来这三个都是全局的，
-                  // 面板于是把「所有会话加起来发了几条」当成「这个会话发了几条」。
-                  const usedToday = proactiveTodayCount(key);
-                  const unansweredCnt = proactiveUnansweredTotal(key);
-                  const ctx = { hour: nowTmp.getHours(), minute: nowTmp.getMinutes(), quota, usedToday };
-                  const ov = daypartGapOverride(policy, ctx);
-                  const gapMs = ov > 0 ? ov : proactiveGapMsOf(policy, unansweredCnt, ctx);
-                  tierInfo = {
-                    tier,
-                    label: String(policy?.label || ''),
-                    quota,
-                    usedToday,
-                    remaining: Math.max(0, quota - usedToday),
-                    unanswered: unansweredCnt,
-                    gapMs,
-                    // 额度区间（面板要显示「本档 8–12 条」这类文案）
-                    rangeLo: band ? Number(band.lo) : null,
-                    rangeHi: band ? Number(band.hi) : null,
-                    // 分数与档位名（面板显示「依赖 · 450 分」）
-                    score: Number(socialV2.affinities?.[key.slice('private:'.length)]?.score) || 0,
-                    stageLabel: (affinityStageOf(Number(socialV2.affinities?.[key.slice('private:'.length)]?.score) || 0) || {}).label || '',
-                    // 今天各时段发了几条（面板画小柱状图）
-                    dayparts: { ...proactiveDaypartCounts() },
-                    // 间隔被哪一层放大了（面板显示"因未回应 ×1.35"这类解释）
-                    gapLayers: { hourFactor: hourActivityFactor(nowTmp.getHours()) }
-                  };
-                }
-              } catch (error) {
-                log(`[proactive] 面板读取 tier 信息失败（已跳过）：${error?.message ?? error}`);
-              }
-            }
-            rows.push({
-              key,
-              enabled: st.proactiveDisabled !== true,
-              lastIncomingAt: Number(st.lastIncomingAt) || 0,
-              idleMs,
-              lastAiReplyAt: Number(st.lastAiReplyAt) || 0,
-              // 「下一次检查什么时候」（没排就是 null —— 关掉了 / 没进过调度）
-              //
-              // ⚠️ 2026-11-24 修：原来只回 `nextCheckInMs`（**倒计时**），
-              //    于是面板每刷新一次数字就变一次（时间在流逝），
-              //    用户看到的是"点一下刷新，间隔就变"，以为有 bug。
-              //
-              //    现在**同时**回绝对时刻 `nextCheckAt`：
-              //      · 绝对时刻在一次调度内是**恒定**的，刷新多少次都一样
-              //      · 倒计时留给"还要多久"的即时显示
-              //    面板优先显示绝对时刻。
-              nextCheckAt: st.proactiveTimer ? (Number(st.proactiveNextCheckAt) || null) : null,
-              nextCheckInMs: st.proactiveTimer ? Math.max(0, Number(st.proactiveNextCheckAt || 0) - Date.now()) : null,
-              unreadCount: Array.isArray(st.unread) ? st.unread.length : 0,
-              // 2026-11-24：私聊的额度制状态（群聊为 null）
-              tier: tierInfo
-            });
+          for (const key of socialV2.conversations.keys()) {
+            const row = buildProactiveSessionRow(key);
+            if (row) rows.push(row);
           }
           // 群在前、私聊在后；同类按最近活跃排（最近说过话的更可能是你在意的）
           rows.sort((a, b) => {
@@ -5560,7 +5500,27 @@ async function main() {
               idleThresholdMs: Number(p.idleThresholdMs) || 900000,
               probability: Number(p.probability) || 0.3,
               checkIntervalMinMs: Number(p.checkIntervalMinMs) || 1800000,
-              checkIntervalMaxMs: Number(p.checkIntervalMaxMs) || 5400000
+              checkIntervalMaxMs: Number(p.checkIntervalMaxMs) || 5400000,
+              // ★ 2026-11-26：面板要能说明"睡着她为什么不开口"
+              life: (() => {
+                try {
+                  const c = readLifeCircle();
+                  return {
+                    asleep: c?.asleep === true,
+                    morningWakeHour: Number.isFinite(Number(cfg.life?.morningWakeHour))
+                      ? Number(cfg.life.morningWakeHour) : 8,
+                    energyWakeThreshold: Number.isFinite(Number(cfg.life?.energyWakeThreshold))
+                      ? Number(cfg.life.energyWakeThreshold) : 100,
+                    nightmareSpecialChance: Number.isFinite(Number(p.nightmareSpecialChance))
+                      ? Number(p.nightmareSpecialChance) : 0.35,
+                    intensity: Number(cfg.life?.intensity) || 50,
+                    quietHours: (() => {
+                      const q = quietHoursOf();
+                      return q ? { startHour: q.startHour, endHour: q.endHour } : null;
+                    })()
+                  };
+                } catch { return null; }
+              })()
             },
             sessions: rows
           });
@@ -5585,6 +5545,18 @@ async function main() {
               st.proactiveTimer = null;
             }
             st.proactiveNextCheckAt = 0;
+            // ★ 2026-11-26：**已经排好的早上叫醒定时器也要一起清掉。**
+            //
+            //   原来只清 proactiveTimer，而 wakeUpTimer 是独立的一个 ——
+            //   关掉开关之后那个定时器还躺在那里，到点照样把她叫醒。
+            //   （scheduleWakeUpTimerV2 现在也会自己检查开关，这里是双保险：
+            //     光靠那个检查的话，已经排上的定时器不会被撤，只是到点后
+            //     重新排时才 return —— 中间那一次仍然会走 fireMorningWakeV2。）
+            if (st.wakeUpTimer) {
+              clearTimeout(st.wakeUpTimer);
+              st.wakeUpTimer = null;
+            }
+            st.wakeUpAt = 0;
             saveSocialV2State();
           }
           log(`[proactive] 面板${want ? '开启' : '关闭'}了 ${key} 的主动机会`);
@@ -5832,13 +5804,17 @@ async function main() {
           }
           return;
         }
-        // ── 身体循环（饱腹/精力/yu wang）2026-11-23 ─────────────────────────
+        // ── 身体循环（精力/yu wang）2026-11-23，11-26 删掉饥饿 ──────────────
         // GET  ：读当前值（会先按时间结算，返回的是"此刻"的值）
-        // POST ：{"key","token","add":{satiety?,energy?,desire?}} 增量加值
+        // POST ：{"key","token","add":{energy?,desire?}, "asleep"?, "ate"?, "cared"?}
+        //
+        // ★ 2026-11-26：`satiety` 已整项删除。原来那套连续饥饿值 13/h 掉、
+        //   她一天只加一两次，长期贴着 0 —— 而饭点提醒本来就在说同一件事。
+        //   现在饥饿只由饭点 condition 表达，"我吃过了"用 `ate: true` 说。
         //
         // 边界：会话令牌 + 当前模式白名单，与其它 agent 端点一致。
-        // 身体是**全局一份**（不分私聊群聊）—— 她只有一个身体，群里说"我刚吃完饭"
-        // 私聊里也应该饱。但**yu wang**在群聊里不显示也不许加（见 includeDesire）。
+        // 身体是**全局一份**（不分私聊群聊）—— 她只有一个身体。
+        // 但**yu wang**在群聊里不显示也不许加（见 includeDesire）。
         if (url.pathname === '/api/socialV2/life-circle') {
           const body = req.method === 'POST' ? await readBody() : {};
           const key = String(req.method === 'POST' ? body.key : url.searchParams.get('key') ?? '').trim();
@@ -5848,11 +5824,27 @@ async function main() {
           if (!isSessionAllowedInCurrentMode(key)) { sendJson({ ok: false, error: '当前模式不允许该会话' }, 403); return; }
           if (cfg.life?.circle === false) { sendJson({ ok: false, error: '身体状态已在配置里关闭（life.circle=false）' }, 403); return; }
           try {
+            // ★★ 2026-11-26：**第三项只对管理员开放**（操作者明确要求）。
+            //
+            //   原来只有"群聊不给"这一道闸（`if (!isPrivate) delete add.desire`），
+            //   而私聊里任何白名单用户都算数 —— 也就是说**次要用户私聊**
+            //   （config.allow.private 里非 ownerQQ 的那些）能看到、也能加第三项。
+            //   实测配置里就有这么一个会话（3380569062，tier 3、1186 分）。
+            //
+            //   这一条的口径和周期（生理期）完全一致：都是她私人的事，
+            //   只在**管理员私聊**里出现，群聊和非管理员私聊一律不提、也不许改。
+            //   判定用 sessionTier —— 它要求 private + ownerQQ 精确匹配，
+            //   群里有人 QQ 号等于 ownerQQ 也不会升档（见那个函数的注释）。
+            const isOwnerSession = (() => {
+              try { return sessionTier(key, currentMode, cfg) === 'owner'; } catch { return false; }
+            })();
+            // 非管理员：拒绝改第三项（静默丢弃，不报错 —— 她不知道"第三项"这回事）
+            // 也拒绝在返回值里出现第三项。
             if (req.method === 'POST') {
               const isPrivate = String(key).startsWith('private:');
               const add = body.add && typeof body.add === 'object' ? body.add : {};
-              // 群聊不许加yu wang：她只有一个身体，但"被满足"这种事不该在群里发生。
-              if (!isPrivate) delete add.desire;
+              // 群聊 / 非管理员都不许加第三项
+              if (!isPrivate || !isOwnerSession) delete add.desire;
               // ── 醒来检测必须在 settle **之前**做 ────────────────────────
               //
               // ⚠️ 2026-11-23 踩坑记录：醒来状态句子里全是空的，根因是时序。
@@ -5887,17 +5879,34 @@ async function main() {
               }
               writeLifeCircle(next);
 
-              // ── 吃了饭 → 清掉所有「饿了」类 condition（2026-11-24）──────
+              // ★ 2026-11-26：**她一说睡就排醒来定时器**。
               //
-              // 实测漏了这条：她调 qq_life_circle(satiety=+N) 之后，
-              // 数值上不饿了（satiety 59），但唤醒词里还挂着
-              // 「饿了，想吃点热的」—— 因为**加值只动数字，不动 condition**。
-              // 于是出现「不饿」和「饿了」同时显示的荒谬组合。
+              //   不然醒来只能靠"主动机会检查"顺带看一眼 —— 而那是每 40 分钟
+              //   才一次，于是"第二天 8 点叫醒"实际会变成 8:14 甚至更晚。
+              //   排上之后到点精确触发。
+              try {
+                if (next.asleep === true) {
+                  scheduleWakeUpTimerV2(key);
+                } else {
+                  const wakeSt = getSocialV2State(key);
+                  if (wakeSt.wakeUpTimer) { clearTimeout(wakeSt.wakeUpTimer); wakeSt.wakeUpTimer = null; }
+                  wakeSt.wakeUpAt = 0;
+                }
+              } catch (error) {
+                log(`[life] 醒来定时器排程失败（已跳过）：${error?.message ?? error}`);
+              }
+
+              // ── 吃了饭 → 清掉所有「饿了」类 condition（2026-11-24，11-26 改）─
               //
-              // 规则：只要这次调用抬了 satiety，就认为她吃过/垫过了，
-              // 所有 meal 类 + 任何 label 含"饿"的 condition 全部作废。
-              // 不看具体加了多少 —— 她自己调这个工具就代表"我吃了"这个事实。
-              if (typeof add.satiety === 'number' && add.satiety > 0) {
+              // 实测漏过这条：她说过"我吃过了"，唤醒词里还挂着「饿了，想吃点热的」。
+              //
+              // ★ 2026-11-26：**起判条件从 `add.satiety` 换成 `ate`。**
+              //   饥饿值整项删除之后，不再有 `add.satiety` 可看 —— 改成显式标记
+              //   `qq_life_circle(ate=true)`。语义也更清楚：她调这个工具就是在说
+              //   "我吃了"，不需要再编一个增量数字（那个数字本来就是给人看的假精度）。
+              //
+              // 规则不变：所有 meal 类 + 任何 label 含"饿"的 condition 全部作废。
+              if (body.ate === true) {
                 try {
                   const lc = readLifeCond();
                   const before = lc.list.length;
@@ -5945,20 +5954,30 @@ async function main() {
                   log(`[life] care_warmth 写入失败（已跳过）：${error?.message ?? error}`);
                 }
               }
+              // ★ 2026-11-26：非管理员**不返回第三项**（数值和文案都不给）。
+              //   describeLifeCircle 自己不知道 isOwner，desire>=80 就会播报，
+              //   所以这里必须显式把 desire 归零后再交给它。
+              const shown = isOwnerSession ? next : { ...next, desire: 0 };
               sendJson({
                 ok: true,
                 key,
-                values: { satiety: Math.round(next.satiety), energy: Math.round(next.energy), desire: Math.round(next.desire) },
-                text: describeLifeCircle(next)
+                values: isOwnerSession
+                  ? { energy: Math.round(next.energy), desire: Math.round(next.desire) }
+                  : { energy: Math.round(next.energy) },
+                text: describeLifeCircle(shown)
               });
               return;
             }
             const cur = settleLifeCircle();
+            // 同上：读路径也要挡（否则次要用户私聊一句"你现在怎么样"就能读到）
+            const shownCur = isOwnerSession ? cur : { ...cur, desire: 0 };
             sendJson({
               ok: true,
               key,
-              values: { satiety: Math.round(cur.satiety), energy: Math.round(cur.energy), desire: Math.round(cur.desire) },
-              text: describeLifeCircle(cur)
+              values: isOwnerSession
+                ? { energy: Math.round(cur.energy), desire: Math.round(cur.desire) }
+                : { energy: Math.round(cur.energy) },
+              text: describeLifeCircle(shownCur)
             });
           } catch (error) {
             sendJson({ ok: false, error: `身体状态读写失败：${error?.message ?? error}` }, 500);
@@ -12029,18 +12048,56 @@ async function main() {
           //   `awaitingReplySince` 丢了下一次唤醒会误判"她没在等回复"。
           if (rawGlobal.proactive && typeof rawGlobal.proactive === 'object') {
             const rp = rawGlobal.proactive;
+            // ★★ 2026-11-26 修：**必须把 byKey 读回来**。
+            //
+            // 原来的读写都只覆盖 v1 那套全局单例字段（todayCount / lastProactiveAt
+            // 直接挂在顶层），而 2026-11-24 改成按会话记（`byKey`）之后，
+            // 存的时候整个 byKey 被漏掉、读的时候也不认识它 —— 等于**每次重启
+            // 主动机会的账就清零**。后果很实（11-26 00:01 那次唤醒就是它导致的）：
+            //   · `lastProactiveAt` 读成 0 → 间隔门算不出"最早什么时候能说"，
+            //     排出来的检查时刻永远是 `现在 + 60 秒`，于是**每分钟重试一次**；
+            //   · `todayCount` 同样归零 → 额度看着永远没发过。
+            // 两者叠加，"该不该开口"的判断被清空，只剩静默门槛和"刚回过话"
+            // 两道闸挡着；它们一过就真的叫醒她了。
+            const byKeyRaw = rp.byKey && typeof rp.byKey === 'object' ? rp.byKey : {};
+            const byKey = {};
+            for (const [k, rec] of Object.entries(byKeyRaw)) {
+              if (!k || !rec || typeof rec !== 'object') continue;
+              byKey[k] = {
+                todayKey: String(rec.todayKey || ''),
+                todayCount: Number(rec.todayCount) || 0,
+                lastProactiveAt: Number(rec.lastProactiveAt) || 0,
+                lastRoute: String(rec.lastRoute || ''),
+                unanswered: rec.unanswered && typeof rec.unanswered === 'object' ? rec.unanswered : {},
+                awaitingReplySince: Number(rec.awaitingReplySince) || 0,
+                routeSentCounts: rec.routeSentCounts && typeof rec.routeSentCounts === 'object' ? rec.routeSentCounts : {},
+                quotaOfDay: rec.quotaOfDay ?? null,
+                sentCandidateIds: Array.isArray(rec.sentCandidateIds) ? rec.sentCandidateIds : [],
+                proactiveJitterFor: Number(rec.proactiveJitterFor) || 0,
+                proactiveJitter: Number(rec.proactiveJitter) || 0
+              };
+            }
             globalMemory.proactive = {
-              v: 1,
+              v: 2,
+              byKey,
+              // 时段分桶（"深夜已经发过一条"）是**跨会话**的事实，也按顶层存。
+              daypartCounts: rp.daypartCounts && typeof rp.daypartCounts === 'object'
+                ? { date: String(rp.daypartCounts.date || ''), counts: rp.daypartCounts.counts && typeof rp.daypartCounts.counts === 'object' ? rp.daypartCounts.counts : {} }
+                : null,
+              nightmareNight: String(rp.nightmareNight || ''),
+              // ── 下面几个是 v1 遗留字段，只读不写 ──────────────────────────
+              // 保留是为了让控制台/排查脚本看老文件时不至于一片 undefined；
+              // 真正的记账已经全部搬进 byKey。
               todayKey: String(rp.todayKey || ''),
               todayCount: Number(rp.todayCount) || 0,
-              lastProactiveAt: Number(rp.lastProactiveAt) || 0,
-              lastRoute: String(rp.lastRoute || ''),
-              unanswered: rp.unanswered && typeof rp.unanswered === 'object' ? rp.unanswered : {},
-              awaitingReplySince: Number(rp.awaitingReplySince) || 0,
-              routeSentCounts: rp.routeSentCounts && typeof rp.routeSentCounts === 'object' ? rp.routeSentCounts : {},
-              quotaOfDay: rp.quotaOfDay ?? null,
-              sentCandidateIds: Array.isArray(rp.sentCandidateIds) ? rp.sentCandidateIds : []
+              lastProactiveAt: Number(rp.lastProactiveAt) || 0
             };
+            // 老文件（v1）没有 byKey —— 那时账是全局一份、分不出是谁的。
+            // 按 proactiveState() 里那条迁移说明：**不猜**，byKey 从空开始，
+            // 代价只是"今天已发条数"重算一次，比把 A 的账记到 B 头上好。
+            if (!Object.keys(byKey).length && Number(rp.todayCount) > 0) {
+              log(`[proactive] 旧版记账（全局 ${rp.todayCount} 条）无法判定归属，按 0 重算`);
+            }
           }
           if (migratedImp || migratedNote) {
             log(`[memory] 已把旧数据迁移进全局记忆：印象 ${migratedImp} 条、selfNote ${migratedNote} 条`);
@@ -12239,18 +12296,50 @@ async function main() {
             const d = new Date();
             return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
           })();
+          // ★★ 2026-11-26 修：**按会话的账必须写出去**。
+          //
+          // 原来这里只写 v1 那套顶层单例字段，`byKey` 一个字都没存（虽然内存里
+          // 一直在用）—— 于是每次重启，`lastProactiveAt` / `todayCount` /
+          // `sentCandidateIds` 全部归零。表现出来的就是 11-26 00:01 那次：
+          // 间隔门算不出"最早什么时候能说"，定时器每分钟重试，直到静默门槛
+          // 和"刚回过话"两道闸都刚好放行，她就被叫醒了。
+          //
+          // 现在：byKey 原样落盘，且只留**当天的** `sentCandidateIds`
+          //（理由去重按日期前缀判，跨天的没必要占文件）。
+          const byKey = {};
+          for (const [k, rec] of Object.entries(p.byKey && typeof p.byKey === 'object' ? p.byKey : {})) {
+            if (!k || !rec || typeof rec !== 'object') continue;
+            byKey[k] = {
+              todayKey: String(rec.todayKey || ''),
+              todayCount: Number(rec.todayCount) || 0,
+              lastProactiveAt: Number(rec.lastProactiveAt) || 0,
+              lastRoute: String(rec.lastRoute || ''),
+              unanswered: rec.unanswered && typeof rec.unanswered === 'object' ? rec.unanswered : {},
+              awaitingReplySince: Number(rec.awaitingReplySince) || 0,
+              routeSentCounts: rec.routeSentCounts && typeof rec.routeSentCounts === 'object' ? rec.routeSentCounts : {},
+              quotaOfDay: rec.quotaOfDay ?? null,
+              sentCandidateIds: (Array.isArray(rec.sentCandidateIds) ? rec.sentCandidateIds : [])
+                .filter((id) => String(id).startsWith(today)),
+              // 抖动缓存不落盘：它只是为了"面板刷新时数字别跳"，
+              // 重启后重摇一次不影响任何行为，存了反而会让旧间隔一直粘着。
+            };
+          }
           return {
-            v: 1,
+            v: 2,
+            byKey,
+            // 跨会话的事实：时段分桶 + "今晚做过噩梦"。
+            daypartCounts: p.daypartCounts && typeof p.daypartCounts === 'object'
+              ? {
+                date: String(p.daypartCounts.date || ''),
+                counts: p.daypartCounts.counts && typeof p.daypartCounts.counts === 'object' ? p.daypartCounts.counts : {}
+              }
+              : null,
+            nightmareNight: String(p.nightmareNight || ''),
+            // v1 遗留字段：留着让老版本/排查脚本读到时不是 undefined。
+            // ⚠️ 别再用它们做判断 —— 真正的账在 byKey 里。
             todayKey: String(p.todayKey || ''),
             todayCount: Number(p.todayCount) || 0,
-            lastProactiveAt: Number(p.lastProactiveAt) || 0,
-            lastRoute: String(p.lastRoute || ''),
-            unanswered: p.unanswered && typeof p.unanswered === 'object' ? p.unanswered : {},
-            awaitingReplySince: Number(p.awaitingReplySince) || 0,
-            routeSentCounts: p.routeSentCounts && typeof p.routeSentCounts === 'object' ? p.routeSentCounts : {},
-            quotaOfDay: p.quotaOfDay ?? null,
-            sentCandidateIds: (Array.isArray(p.sentCandidateIds) ? p.sentCandidateIds : [])
-              .filter((id) => String(id).startsWith(today))
+            lastProactiveAt: Number(p.lastProactiveAt) || 0
           };
         })()
       };
@@ -15348,12 +15437,21 @@ async function main() {
     } catch {
       raw = null;
     }
-    if (raw && typeof raw === 'object' && raw.v !== 1) {
+    // ★ 2026-11-26：v1 → v2（饥饿值删除）**不是"看不懂就重建"**。
+    //   v1 的 energy / desire / asleep / lastTickedAt 都还有效，只有 satiety 作废，
+    //   而 normalizeCircle 本身就会把它丢掉、并给 asleepSince 补一个合理兜底。
+    //   所以 v1 直接读、静默升级；只有**比 v2 更新**的版本才备份重建。
+    const ver = Number(raw?.v);
+    if (raw && typeof raw === 'object' && Number.isFinite(ver) && ver > 2) {
       // 未来版本：看不懂就备份 + 重建，别用旧代码解释新数据。
-      try { fs.renameSync(LIFE_CIRCLE_FILE, `${LIFE_CIRCLE_FILE}.v${raw.v}-unsupported-${Date.now()}`); } catch {}
+      try { fs.renameSync(LIFE_CIRCLE_FILE, `${LIFE_CIRCLE_FILE}.v${ver}-unsupported-${Date.now()}`); } catch {}
       raw = null;
     }
     lifeCircleCache = raw ? normalizeLifeCircle(raw) : defaultLifeCircle();
+    // 读过一次就顺手把 v1 落成 v2（下次启动就不用再升级，也让面板看到新字段）。
+    if (raw && Number(raw.v) !== 2) {
+      try { atomicWriteJson(LIFE_CIRCLE_FILE, lifeCircleCache); } catch { /* 写不了不影响本轮 */ }
+    }
     return lifeCircleCache;
   }
 
@@ -15384,7 +15482,8 @@ async function main() {
   function settleLifeCircle() {
     const cur = readLifeCircle();
     const next = settleLifeCircleCore(cur);
-    const changed = ['satiety', 'energy', 'desire']
+    // ★ 2026-11-26：维度从三个变两个（satiety 已删）。
+    const changed = ['energy', 'desire']
       .some((dim) => Math.round(next[dim]) !== Math.round(cur[dim]));
     if (!changed) {
       // 只更新时间戳（内存里），不落盘。
@@ -15412,7 +15511,17 @@ async function main() {
    *   归一成百分比，不参与能量计算本身。
    */
   function computeSleepWakeReport(before, after) {
-    const beforeTs = Number(before?.lastTickedAt) || 0;
+    // ★★ 2026-11-26 修：入睡基准从 `lastTickedAt` 换成 `asleepSince`。
+    //
+    //   原来用 lastTickedAt，可它每次结算都推到现在（面板轮询、每轮唤醒都会结算），
+    //   于是"这一觉睡了多久"永远只算到最后一次结算 —— 睡 8 小时读出来是 0.2 小时。
+    //   现在 asleepSince 只在 addToCircle(asleep=true) 那一下写，结算不动它。
+    //
+    // 兜底：老数据没有 asleepSince（normalizeCircle 会退化成 lastTickedAt），
+    //   或者它比 lastTickedAt 还新（异常）→ 取两者里更早的那个，宁可算长不算短。
+    const since = Number(before?.asleepSince) || 0;
+    const tick = Number(before?.lastTickedAt) || 0;
+    const beforeTs = since > 0 && tick > 0 ? Math.min(since, tick) : (since || tick);
     const nowTs = Number(after?.lastTickedAt) || Date.now();
     const hours = Math.max(0, (nowTs - beforeTs) / 3600000);
     // 与 life-circle.js 保持一致：睡眠最多认 10 小时，每小时 +8。
@@ -15425,8 +15534,46 @@ async function main() {
     const recovered = (Number.isFinite(energyBefore) && Number.isFinite(energyAfter))
       ? Math.max(0, energyAfter - energyBefore)
       : maxRecover;
+
+    // ★★ 2026-11-26 修：**睡前精力本来就满时，别用"回升量"判质量**。
+    //
+    //   实测到的荒谬：睡前精力 100、睡了 7.5 小时，醒来还是 100 ——
+    //   recovered = 0 → ratio 0 → 判成「基本没睡好」。
+    //   一个睡足 7.5 小时的人不会"基本没睡好"，那是**没有回升空间**，不是睡得差。
+    //
+    //   为什么不能简单把 recovered 抬高：那样所有情况都会变成 ratio=1（"睡得踏实"），
+    //   等于把"睡 2 小时"也夸成踏实。
+    //
+    //   做法（最小改动）：只有当**回升空间太小**（headroom < 8，即睡前 ≥ 92）
+    //   时才换成"按时长折算"，其余情况保持原来的回升量口径 ——
+    //   那个口径在正常区间是准的（睡 4h 回 32/80 = 0.4 → 睡得断断续续）。
+    //
+    //     headroom >= 8  → 用 recovered / maxRecover（原口径）
+    //     headroom <  8  → 用 hours / MAX_RECOVER_HOURS（按时长，满血入睡也能判对）
+    const headroom = Number.isFinite(energyBefore) ? Math.max(0, 100 - energyBefore) : maxRecover;
+    const lowHeadroom = headroom < RECOVER_PER_HOUR;      // 睡前 ≥ 92
+    const recoveredForText = lowHeadroom
+      ? Math.round(Math.min(hours, MAX_RECOVER_HOURS) * RECOVER_PER_HOUR)   // 按睡满了算
+      : recovered;
     const sleptAtHour = beforeTs > 0 ? new Date(beforeTs).getHours() : undefined;
-    const text = buildSleepWakeText({ hours, recovered, maxRecover, sleptAtHour });
+    const text = buildSleepWakeText({ hours, recovered: recoveredForText, maxRecover, sleptAtHour });
+    // ★★ 2026-11-26：**把这一觉的时长写进 meta.lastSleepHours。**
+    //
+    //   这是那个「只有读、从来没有写」的字段 —— 跨天第一轮那句起床语
+    //   （sleepVerdict 按时长分档：<4h 熬到很晚 / <6h 睡浅 / <7h 翻来覆去 /
+    //   7~10h 睡得还行 / >10h 睡得挺沉）一直因为读到的恒为 0 而静默失效。
+    //   连带「睡没睡好」这个生病病因、早上「睡浅早安」和睡前「还没困」
+    //   两条主动候选也全都死着。
+    //
+    //   放在这里而不是别处：这是唯一知道"这一觉真睡了几小时"的地方。
+    if (Number.isFinite(hours) && hours > 0) {
+      try {
+        const lc = readLifeCond();
+        writeLifeCond({ list: lc.list, meta: { ...lc.meta, lastSleepHours: Math.round(hours * 100) / 100 } });
+      } catch (error) {
+        log(`[life] 睡眠时长落盘失败（已跳过）：${error?.message ?? error}`);
+      }
+    }
     return text ? { text, hours, recovered, maxRecover, at: nowTs } : null;
   }
 
@@ -15496,7 +15643,9 @@ async function main() {
       // 唤醒即醒来：把 asleep 翻成 false 并落盘，同时生成起床状态。
       // 不这么做的话，下次渲染还会认为她在睡、又生成一遍。
       try {
-        const woken = { ...settled, asleep: false };
+        // ★ 2026-11-26：醒了一定要清 asleepSince，否则下次"睡了多久"会从
+        //   上一次入睡算起 —— 睡 3 小时 + 醒着一天 = 报"睡了 27 小时"。
+        const woken = { ...settled, asleep: false, asleepSince: 0 };
         pendingSleepWake = computeSleepWakeReport(rawBeforeSettle, woken);
         settled = writeLifeCircle(woken);
       } catch (error) {
@@ -15551,22 +15700,18 @@ async function main() {
       // 会自动被覆盖，不用回来改这张表。
       const hasNegative = conditions.some((c) => Number(c.energyDelta) < 0);
 
-      // ── 饥饿只由一个来源出词（2026-11-25 修）─────────────────────────
+      // ── 饥饿（2026-11-26 改）────────────────────────────────────────
       //
-      // 有活跃的 meal condition 时，饥饿那件事**已经由它的 label 说了**
-      // （「饿了，想吃东西」比数值档位的「有点饿」更具体，还自带"午饭/晚饭"语境）。
-      // 这时传 hasMealCondition=true，让 circleExtras 跳过数值那条 ——
-      // 否则同一条唤醒词里会出现两遍"饿了"（实测过）。
-      const hasMealCondition = conditions.some(
-        (c) => c.kind === 'meal' && c.endTs > Date.now() && String(c.label || '').trim()
-      );
+      // ★ 饥饿值整项删除之后，这里**不再由数值出饥饿词** ——
+      //   饥饿那件事完全交给饭点 condition 的 label（「饿了，想吃点热的」）。
+      //   原来的 `hasMealCondition` 开关就是为了压掉数值那条，现在数值那条
+      //   根本不存在了，参数一并去掉。
       const out = lifeCircleExtras(
         { ...settled, energy: composed },
         {
           includeDesire: isOwner && !inPeriod,
           text: textCfg,
-          suppressHighEnergy: hasNegative,
-          hasMealCondition
+          suppressHighEnergy: hasNegative
         }
       );
       // ── 心情（2026-11-24 补上）─────────────────────────────────────
@@ -15583,10 +15728,25 @@ async function main() {
       if (mood) out.push(`心情：${mood}`);
 
       // ── condition 的描述行（不进标签，直接一段文字）──────────────────
-      // 只贴**有 label 的**（默认平淡项 label 为空，不占字符）。
-      // 最多两条：再多会把这一行撑长，而唤醒词每轮都进历史。
+      //
+      // ★★ 2026-11-26 修：**必须按会话过滤**，原来这里漏了 isOwner。
+      //
+      //   同一个函数里其它敏感项都有闸 —— cycleMark（上面）、inPeriod、
+      //   includeDesire、mood、睡眠段 —— 偏偏 condLines 没有。
+      //   于是「今天有点痛经，小腹闷闷的不舒服」会被原样贴进**群聊**的唤醒词。
+      //   `showCircleInGroup === false` 那道闸也兜不住：config 里没写这个键，
+      //   `undefined === false` 是 false，等于默认全开。
+      //
+      //   现在的口径：
+      //     · 管理员私聊 —— 全部照贴（她自己的身体，写全没关系）
+      //     · 群聊/非管理员 —— **只留不敏感的 kind**
+      //       病（health）和梦/作息（sleep）没有隐私问题；
+      //       cycle_discomfort（痛经/腰酸/恶心）和 care_warmth（被谁关心了）
+      //       一律不提 —— 那是她私人的事。
+      const GROUP_SAFE_COND_KINDS = new Set(['health', 'sleep', 'sleep_afterglow', 'meal']);
       const condLines = conditions
         .filter((c) => c.endTs > Date.now())
+        .filter((c) => isOwner || GROUP_SAFE_COND_KINDS.has(String(c.kind || '')))
         .sort((a, b) => b.intensity - a.intensity)
         .map((c) => c.label)
         .filter(Boolean)
@@ -15930,7 +16090,10 @@ async function main() {
     //
     // 按**钟点**给，不按饥饿值：午饭饿是"走神"、晚饭饿是"粘人"、
     // 夜宵是"松散"、下午想吃甜的是"柔软"。同一个"饿"，不同时刻感觉不一样。
-    // 只有真的饿了才给（刚吃完就"走神"是假的），甜食窗口例外。
+    //
+    // ★ 2026-11-26：饥饿值整项删除后，饭点**纯按时段给**，不再有"先查她饿不饿"
+    //   这道前置条件。这是本文件里**唯一**的饥饿表达来源。
+    //   她真吃过一顿时调 qq_life_circle(ate=true)，这些 condition 会被清掉。
     if (cfg.life?.meals !== false) {
       try {
         const tz = String(cfg.life?.timezone || 'Asia/Shanghai');
@@ -15943,7 +16106,8 @@ async function main() {
           } catch { return null; }
         })();
         if (p !== null) {
-          const spec = mealMoodAt(p, { satiety: Number(settled?.satiety) });
+          // ★ 2026-11-26：不再传 satiety —— 饥饿值已删除，饭点纯按时段给。
+          const spec = mealMoodAt(p);
           if (spec) {
             // id 带窗口名+日期：同一个窗口一天只生成一次；过了窗口自然过期。
             const id = `meal-${spec.id}-${todayKey}`;
@@ -16041,7 +16205,7 @@ async function main() {
       const info = phaseAt(st.anchorDay, floorDay(Date.now(), tz), st.cycleDays);
       // ⚠️ 阶段名是 `menstrual` 不是 `period`。改成六期（2026-11-24）时
       //    这里漏改了，于是经期永远返回 false —— 表现为"生理期到了"和
-      //    "性欲高涨"同时出现。这种改名漏改**不会报错**，只能靠实测发现。
+      //    "欲望高涨"同时出现。这种改名漏改**不会报错**，只能靠实测发现。
       return info.phase === 'menstrual';
     } catch {
       return false;
@@ -16553,10 +16717,22 @@ async function main() {
     if (reason === 'proactiveContinuation') {
       return `${head}${base}（你上一句还没等到回应，可以再问一句。）${tail}`;
     }
-    // 做噩梦惊醒（2026-11-24）：睡着时唯一允许的主动唤醒理由。
+    // 做噩梦惊醒（2026-11-24）：睡着时唯一允许的主动唤醒理由之一。
     // 它同时说了"为什么醒"和"为什么来消息"——两个问题一个由头。
     if (reason === 'proactiveNightmare') {
       return `${head}${base}（刚做了个不太好的梦，惊醒了。）${tail}`;
+    }
+    // ★ 2026-11-26：**早上叫醒**（操作者口径）。
+    //
+    // 她说睡下之后，主动唤醒全部关掉 —— 只有两件事能把她弄醒：
+    //   ① 做噩梦（上面那条）
+    //   ② 早上到这个点，**系统主动叫她起床**（这条）
+    // 其余时间（含有人发消息）她要醒也是"被消息叫醒"，不是主动唤醒。
+    //
+    // 文案要说清楚"为什么醒"：她是被**叫起床**的，不是自己睡醒了。
+    // 所以写「该起床了」，不写「天亮了」——后者更像她在描述自己。
+    if (reason === 'morningWake') {
+      return `${head}${base}（到点了，该起床了。）${tail}`;
     }
     if (reason === 'poke') return `${head}${base}（有人拍了一拍。）${tail}`;
     // 待办到点：和「（有人拍了一拍。）」同样的位置和口吻，但要把是哪件事说出来 ——
@@ -17065,7 +17241,8 @@ async function main() {
     'proactiveCheck',        // 私聊：候选动机
     'proactiveGroupCheck',   // 群聊：随机唤醒
     'proactiveContinuation', // 对话延续
-    'proactiveNightmare'     // 睡着时的噩梦惊醒
+    'proactiveNightmare',    // 睡着时的噩梦惊醒
+    'morningWake'            // ★ 2026-11-26：早上叫她起床（睡着时唯一的定时唤醒）
   ]);
   function isTimerWakeReason(reason) {
     return TIMER_WAKE_REASONS.has(String(reason ?? '').split(':')[0]);
@@ -17395,6 +17572,7 @@ async function main() {
       unansweredWeight: 0,
       unansweredSlowdownStart: 2,
       unansweredMaxMultiplier: 1,
+      targetRatio: 0,
     },
     // tier1 = 好感度「在意」档（100–300 分），额度 1–3 条/天
     1: {
@@ -17407,12 +17585,17 @@ async function main() {
       //   实际倍数 = 1 + (线性增长 - 1) × weight
       // weight = 1.0 → 全额生效；0 → 完全不在意。
       //
-      // ★ 我们的取值**和原作者相反**，是有意的：
-      //   原作者 tier1=1.0、tier5=0.0（关系越稳越不拿"没回"当回事）；
-      //   我们的设定是「越亲近越怕你不回」，所以 tier 越高 weight 越大。
+      // ★ 方向（2026-11-26 操作者确认）：**越亲近越介意**。
+      //   关系越近，她越把"你没回"当回事，间隔拉得越长 → weight 随 tier 递增。
+      //   tier1 只给 0.45（刚认识不久，没回不算大事），tier3 才全额 1.0。
       unansweredWeight: 0.45,           // 依赖档：刚认识不久，没回不算大事
       unansweredSlowdownStart: 2,       // 第 2 次没回才开始放大（第一次先不计）
       unansweredMaxMultiplier: 2.2,     // 线性增长的上限
+      // ── 软目标（2026-11-26 补，照原文 target_ratio）─────────────────────
+      // 「今天实际只打算发到额度的百分之多少」——剩下的那部分是留给"真有话想说"
+      // 的余量，不是必须发完。照原文 0.78 / 0.86 / 0.92 三档。
+      // 效果：额度 3 条的档，排满 3 条就没机会了；软目标下到 2 条就收手。
+      targetRatio: 0.78,
     },
     // tier2 = 「依赖」档（300–600 分），额度 4–7 条/天
     2: {
@@ -17423,6 +17606,7 @@ async function main() {
       unansweredWeight: 0.7,            // 喜欢档：开始在意了
       unansweredSlowdownStart: 2,
       unansweredMaxMultiplier: 2.2,
+      targetRatio: 0.86,
     },
     // tier3 = 「喜欢」+「偏爱」（600–1200 分），额度 4→8→12 条/天（连续插值）
     3: {
@@ -17433,6 +17617,7 @@ async function main() {
       unansweredWeight: 1.0,            // 偏爱档：最怕你不回，全额收敛
       unansweredSlowdownStart: 2,
       unansweredMaxMultiplier: 2.2,
+      targetRatio: 0.92,
     }
   });
 
@@ -17698,6 +17883,20 @@ async function main() {
    *
    * 调用点：真正把 'proactiveCheck' 唤醒投递出去之后（**不是**定时器触发时）。
    * 理由：定时器触发了但被繁忙/限频挡下，那不叫"她找过他"。
+   *
+   * ── 未回应计数：照原作者的做法（2026-11-26 核对 `_research_v672`）──────
+   *
+   * 原作者在 `_settle_proactive_route_state` 里，**发送的那一刻就 +1**：
+   *     if settlement["await_reply"]: _record_unanswered_proactive(...)
+   * 然后在**任何一条入站消息**到达时无条件清零（`main.py`，在
+   * `if awaiting_reply_since > 0` 块的**外面**）：
+   *     user["ignored_streak"] = 0
+   *
+   * 没有"等几分钟看看他回不回"这种窗口，也没有"要调工具才算回过"——
+   * 消息从 QQ 进来的那一刻起，桥接自己就清了，跟她读没读、调没调工具无关。
+   *
+   * 所以这里就是：发一次 +1，你说话就归零。两条路都是桥接内部完成，
+   * 不经过模型、不需要她做任何动作。
    */
   function recordProactiveSentV2(key, route) {
     const p = proactiveStateOf(key);
@@ -17715,9 +17914,26 @@ async function main() {
     // ⚠️ 这一项**仍是全局**：判断"深夜已经发过一条"是跨会话的事实，
     // 给 A 发过之后不该再给 B 发（否则整夜两个私聊各刷一条）。
     try { bumpProactiveDaypartCount(now); } catch { /* 计数坏了不影响发送 */ }
-    // ★ 只有 expectation === 'expected' 的路由才开始"等回复"
+    // ★ 只有 expectation === 'expected' 的路由才记账
+    //
+    // ★★ 2026-11-26：**发出去的那一刻就 +1**（照原作者 `_settle_proactive_route_state`）。
+    //
+    // 曾经想过"等 5 分钟看他回不回"，那是多余的：原作者就是立刻加一，
+    // 然后在**任何一条入站消息**到达时无条件清零（`main.py`，在
+    // `awaiting_reply_since` 那个 if 的外面）。两条路都在桥接内部完成，
+    // 不经过模型，也不需要她调任何工具。
+    //
+    // 原来这里压根没有 +1（全库只有清零），于是 `proactiveGapMsOf` 的
+    // "没回就拉长间隔"、"对话延续"这条路由、面板上的 ×1.35 全都恒为假。
     if (PROACTIVE_ROUTES[routeKey].expectation === 'expected') {
       p.awaitingReplySince = now;
+      const rec = p.unanswered[routeKey];
+      const prev = rec && typeof rec === 'object' ? rec : {};
+      p.unanswered[routeKey] = {
+        count: Math.max(0, Number(prev.count) || 0) + 1,
+        since: Number(prev.since) || now,
+        lastAt: now
+      };
     }
     saveSocialV2State();
   }
@@ -17865,26 +18081,52 @@ async function main() {
    *
    * 我们用连续函数而不是查表（避免时段 × 剩余额度两维表格爆炸）：
    *
-   *   剩余比例 r = 剩余额度 / 今日总额度
+   *   剩余比例 r = 剩余额度 / **软目标**
    *     r ≥ 0.75 → 0.8   还有大半空间，多说点
    *     r ≥ 0.50 → 0.9
    *     r ≥ 0.25 → 1.0   正常
    *     r ≥ 0.10 → 1.3   快用完了，省着
-   *     r <  0.10 → 1.8   只剩最后一条，隔久一点再放
+   *     r >  0    → 1.8   只剩最后一条，隔久一点再放
+   *     r ≤  0    → 3.2   软目标已到：明显收敛，但不是硬停
    *
-   * 剩 0 条时由额度闸直接拦下（返回 null），不会走到这里。
+   * ⚠️ 2026-11-26：分母从「额度」改成「**软目标**」。
+   *
+   *   照原作者 `target_ratio`（0.78 / 0.86 / 0.92）：额度是**上限**，
+   *   实际打算发到的是其中一部分。剩下的余量留给"真的有事想说"，
+   *   而不是一到点就把额度烧完 —— 那样她一天前半天很密、后半天彻底安静。
+   *
+   *   注意 r ≤ 0 只把间隔拉长到 3.2 倍，**不是拒绝**：
+   *   "软目标"就是软的 —— 真有话说时照样可以超出，只是别把它当默认节奏。
    */
   function quotaPressureFactor(policy, opts = {}) {
     const quota = Number(opts.quota);
     const used = Number(opts.usedToday);
     if (!Number.isFinite(quota) || quota <= 0) return 1.0;
-    const remaining = Math.max(0, quota - (Number.isFinite(used) ? used : 0));
-    const r = remaining / quota;
+    const soft = proactiveSoftTarget(policy, quota);
+    const remaining = soft - (Number.isFinite(used) ? used : 0);
+    const r = remaining / soft;
     if (r >= 0.75) return 0.8;
     if (r >= 0.50) return 0.9;
     if (r >= 0.25) return 1.0;
     if (r >= 0.10) return 1.3;
-    return 1.8;
+    if (r > 0) return 1.8;
+    return 3.2;
+  }
+
+  /**
+   * 今天的「软目标」条数（照原作者 `target_ratio`）。
+   *
+   * 额度是硬上限，软目标是**打算发到多少**。tier1 0.78、tier2 0.86、tier3 0.92：
+   * 关系越稳，越接近把额度用满（因为那时她真的更想说话）。
+   *
+   * 至少留 1：额度 1 条的档，0.78 会算成 0，那就永远不能说话了。
+   */
+  function proactiveSoftTarget(policy, quota) {
+    const q = Number(quota);
+    if (!Number.isFinite(q) || q <= 0) return 0;
+    const ratio = Number(policy?.targetRatio);
+    const r = Number.isFinite(ratio) && ratio > 0 && ratio <= 1 ? ratio : 1;
+    return Math.max(1, Math.min(q, Math.round(q * r)));
   }
 
   /**
@@ -17921,6 +18163,174 @@ async function main() {
       }
     }
     return 'evening';
+  }
+
+  // ══ 面板数据：单个会话的主动机会行（2026-11-26 抽出）══════════════════════
+  //
+  // 从 `/api/socialV2/proactive-sessions` 的循环体里抽出来，理由：
+  //   · 面板要显示的字段越来越多（tier / 额度 / 间隔 / **睡眠**），
+  //     埋在 HTTP 处理函数里既难读、也没法单测；
+  //   · 睡眠那一块（life）是这轮新加的，必须能直接断言 ——
+  //     等真的起服务器再请求一次成本太高，而且不好造"睡着"的状态。
+  //
+  // 返回 null = 这个会话不该出现在面板上（不在当前模式白名单里）。
+  function buildProactiveSessionRow(key) {
+    const st = socialV2.conversations.get(key);
+    if (!st) return null;
+    if (!isSessionAllowedInCurrentMode(key)) return null;
+    const nowMs = Date.now();
+    const idleMs = nowMs - (st.lastIncomingAt || 0);
+
+    // ── 私聊：额度制那套的实时状态 ──────────────────────────────────────
+    //
+    // 面板原来只能显示"概率 30% / 间隔 30–90 分钟"，而私聊早就改成额度制了
+    // —— 那几行数字对私聊是**假的**。
+    //   私聊 → tier / 今日额度 / 已发几条 / 未回应 / 实际间隔 / 档位
+    //   群聊 → 仍是概率那套（字段名不变，保持兼容）
+    const isPrivate = key.startsWith('private:');
+    let tierInfo = null;
+    if (isPrivate) {
+      try {
+        const { governed, tier, policy, quota, band } = proactiveQuotaOf(key);
+        if (governed) {
+          const nowTmp = new Date();
+          // 2026-11-24：**按 key 取**。原来这三个都是全局的，
+          // 面板于是把「所有会话加起来发了几条」当成「这个会话发了几条」。
+          const usedToday = proactiveTodayCount(key);
+          const unansweredCnt = proactiveUnansweredTotal(key);
+          const ctx = { hour: nowTmp.getHours(), minute: nowTmp.getMinutes(), quota, usedToday };
+          const ov = daypartGapOverride(policy, ctx);
+          const gapMs = ov > 0 ? ov : proactiveGapMsOf(policy, unansweredCnt, ctx);
+          tierInfo = {
+            tier,
+            label: String(policy?.label || ''),
+            quota,
+            usedToday,
+            remaining: Math.max(0, quota - usedToday),
+            unanswered: unansweredCnt,
+            gapMs,
+            rangeLo: band ? Number(band.lo) : null,
+            rangeHi: band ? Number(band.hi) : null,
+            score: Number(socialV2.affinities?.[key.slice('private:'.length)]?.score) || 0,
+            stageLabel: (affinityStageOf(Number(socialV2.affinities?.[key.slice('private:'.length)]?.score) || 0) || {}).label || '',
+            dayparts: { ...proactiveDaypartCounts() },
+            gapLayers: { hourFactor: hourActivityFactor(nowTmp.getHours()) }
+          };
+        }
+      } catch (error) {
+        log(`[proactive] 面板读取 tier 信息失败（已跳过）：${error?.message ?? error}`);
+      }
+    }
+
+    // ── 身体 / 睡眠状态（★★ 2026-11-26 新增）─────────────────────────────
+    //
+    // 面板原来只显示"下次检查 05:56（还有 3 小时）"，
+    // 但**看不出那 3 小时是"间隔就这么长"还是"她在睡觉、根本不会叫醒她"** ——
+    // 这两件事对她的实际行为差得很远，排查时也完全分不清。
+    const life = (() => {
+      try {
+        const c = readLifeCircle();
+        if (!c) return null;
+        const awake = c.asleep !== true;
+        const asleepSince = Number(c.asleepSince) > 0
+          ? Number(c.asleepSince) : (Number(c.lastTickedAt) || nowMs);
+        return {
+          asleep: !awake,
+          energy: Math.round(Number(c.energy) || 0),
+          energyThreshold: Number.isFinite(Number(cfg.life?.energyWakeThreshold))
+            ? Number(cfg.life.energyWakeThreshold) : 100,
+          // 已睡多久（小时，两位小数）
+          asleepHours: awake ? 0 : Math.round(((nowMs - asleepSince) / 3600000) * 100) / 100,
+          // 下一个"醒来检查点"（睡着时才有意义）
+          wakeUpAt: awake ? null : (Number(st.wakeUpAt) > 0 ? Number(st.wakeUpAt) : null),
+          morningWakeHour: Number.isFinite(Number(cfg.life?.morningWakeHour))
+            ? Number(cfg.life.morningWakeHour) : 8,
+          quietHours: (() => {
+            const q = quietHoursOf();
+            return q ? { startHour: q.startHour, endHour: q.endHour } : null;
+          })()
+        };
+      } catch { return null; }
+    })();
+
+    return {
+      key,
+      enabled: st.proactiveDisabled !== true,
+      lastIncomingAt: Number(st.lastIncomingAt) || 0,
+      idleMs,
+      lastAiReplyAt: Number(st.lastAiReplyAt) || 0,
+      // 「下一次检查什么时候」（没排就是 null —— 关掉了 / 没进过调度）
+      //
+      // ⚠️ 2026-11-24 修：原来只回 `nextCheckInMs`（**倒计时**），
+      //    于是面板每刷新一次数字就变一次（时间在流逝），
+      //    用户看到的是"点一下刷新，间隔就变"，以为有 bug。
+      //
+      //    现在**同时**回绝对时刻 `nextCheckAt`：
+      //      · 绝对时刻在一次调度内是**恒定**的，刷新多少次都一样
+      //      · 倒计时留给"还要多久"的即时显示
+      //    面板优先显示绝对时刻。
+      nextCheckAt: st.proactiveTimer ? (Number(st.proactiveNextCheckAt) || null) : null,
+      nextCheckInMs: st.proactiveTimer ? Math.max(0, Number(st.proactiveNextCheckAt || 0) - nowMs) : null,
+      unreadCount: Array.isArray(st.unread) ? st.unread.length : 0,
+      tier: tierInfo,
+      life
+    };
+  }
+
+  // ══ 免打扰时段（2026-11-26）════════════════════════════════════════════════
+  //
+  // 三个纯函数，不读全局、不看时钟，便于测试。
+  // 配置形状：`life.quietHours = { enabled, startHour, endHour }`，默认 23 → 8。
+  //
+  // ⚠️ 时段只对**醒着的她**生效（见 pickProactiveRouteV2 里的调用点）。
+  //    睡着那条路走噩梦机制，不受这里影响 —— 否则噩梦会被整段吃掉。
+
+  /** 读出免打扰配置；关掉或写坏了都返回 null（= 不启用）。 */
+  function quietHoursOf() {
+    const q = cfg.life?.quietHours;
+    if (!q || typeof q !== 'object') return null;
+    if (q.enabled === false) return null;
+    const startHour = Number(q.startHour);
+    const endHour = Number(q.endHour);
+    const s = Number.isFinite(startHour) ? Math.min(23, Math.max(0, Math.round(startHour))) : 23;
+    const e = Number.isFinite(endHour) ? Math.min(24, Math.max(0, Math.round(endHour))) : 8;
+    if (s === e) return null;                  // 起止相同 = 不启用，别把整天都禁了
+    return { startMin: s * 60, endMin: (e === 24 ? 1440 : e * 60), startHour: s, endHour: e };
+  }
+
+  /**
+   * 某分钟是否落在免打扰里。**支持跨午夜**（start > end）。
+   *
+   * 23 → 8 表示 [23:00, 24:00) ∪ [00:00, 08:00)。
+   * 端点是左闭右开：23:00 整就算禁，08:00 整就放行。
+   */
+  function inQuietHours(minuteOfDay, quiet) {
+    if (!quiet) return false;
+    const m = ((Math.round(Number(minuteOfDay)) % 1440) + 1440) % 1440;
+    const { startMin, endMin } = quiet;
+    if (startMin < endMin) return m >= startMin && m < endMin;
+    // 跨午夜：一段在尾、一段在头
+    return m >= startMin || m < endMin;
+  }
+
+  /**
+   * 免打扰结束的绝对时刻（毫秒）。用于 retryAt —— **必须一次排到放行那一刻**，
+   * 否则会拿 gap 兜底、40 分钟后再撞一次同一道闸。
+   *
+   * 例：现在 02:30、禁到 08:00 → 返回今天 08:00；
+   *     现在 23:30、禁到 08:00 → 返回**明天** 08:00。
+   */
+  function quietEndAt(nowMs, quiet) {
+    const t = Number(nowMs) || Date.now();
+    const maxed = quiet.endMin >= 1440 ? 1440 : quiet.endMin;
+    const endMinute = maxed % 1440;             // 1440 → 0（次日零点）
+    const d = new Date(t);
+    const target = new Date(d);
+    target.setHours(0, 0, 0, 0);
+    target.setMinutes(endMinute);
+    // 目标时刻已经过了（比如现在 09:00、禁到 08:00）→ 说明落到明天
+    if (target.getTime() <= t) target.setDate(target.getDate() + 1);
+    return target.getTime();
   }
 
   /**
@@ -17997,17 +18407,44 @@ async function main() {
   }
 
   /**
-   * 睡够了就自动醒（2026-11-24）。
+   * 睡够了就自动醒（2026-11-24 加，2026-11-26 加「精力满」与「早上定时」两条）。
    *
    * 为什么需要：加了"睡觉时不主动唤醒"之后，她就**永远醒不过来**了 ——
-   * 除非有人找她、或她自己说醒了。所以要有个兜底：睡满一定时长自动算醒。
+   * 除非有人找她、或她自己说醒了。所以要有个兜底：睡够了一定要醒。
    *
-   * 时长取 `life.autoWakeHours`（默认 8 小时）。为什么是 8 而不是"精力回满"：
-   *   精力恢复有 `ENERGY_RECOVER_MAX_HOURS = 10` 的封顶，睡到 10 小时就不再涨，
-   *   用"精力回满"作判据会**永远不触发**。
+   * ── 三个触发条件（满足任意一条即可，2026-11-26 定）─────────────────────
    *
-   * 副作用：醒来时把 lastTickedAt 对齐到"睡满那一刻"，超出的时间按醒着算 ——
+   *   ① **睡满 `autoWakeHours`**（默认 8h）—— 兜底，任何情况都成立。
+   *   ② **精力满了 + 不在夜间**（`energy >= energyWakeThreshold`，默认 100）。
+   *      操作者原话：「精力满了就提前起床只在非夜晚的时候用」。
+   *      · 为什么只在非夜晚：凌晨 3 点精力满不代表该起，天还黑着。
+   *        「夜晚」由 `life.quietHours` 的时段判定（默认 23→8），
+   *        所以熬夜的人把 quietHours 关掉，这条就全天可用。
+   *      · 为什么要这条：精力 8/h、从 60 起 5 小时就满 100，
+   *        之后到 8 小时封顶之前那 3 小时是**空烧** —— 她明明睡饱了还在躺。
+   *   ③ **早上定时唤醒**（`morningWakeHour`，默认 8）—— 操作者原话：
+   *      「晚上睡觉一般第二天 8 点唤醒就行了」。
+   *      只要她睡着了、且现在过了 8 点，就醒 —— 不用非等到满 8 小时。
+   *      （22:00 睡 → 08:00 醒 = 10h；01:00 睡 → 08:00 醒 = 7h，都合理。）
+   *      ⚠️ 早上这条**优先于** ①：8 点到了就该起，别因为"还没睡满 8 小时"把她按在床上。
+   *
+   * ── 优先级 ────────────────────────────────────────────────────────────────
+   *
+   *   ③ 晨唤 > ② 精力满（非夜晚）> ① 睡满 8h
+   *   三条都是「醒来」这一个动作，命中哪条就用哪条算时长。
+   *
+   * 副作用：醒来时把 lastTickedAt 对齐到"醒的那一刻"，超出的时间按醒着算 ——
    * 否则她睡了 12 小时还会补算 12 小时的恢复量，显得像睡了个饱觉。
+   *
+   * ★★ 2026-11-26 修：**睡眠时长改用 asleepSince 算，不再用 lastTickedAt。**
+   *
+   *   原来的 `Date.now() - lastTickedAt` 是错的：lastTickedAt 每次结算都推到现在，
+   *   而结算在**每轮唤醒**和**面板轮询**时都会发生。实测她 00:02 说睡了，
+   *   01:34 时 lastTickedAt 已经晚 91 分钟；睡满 8 小时期间被结算十几次之后
+   *   读出来的 sleptMs 是 0 —— 「睡够 8 小时自动醒」永远不触发，她被永久卡在睡眠里，
+   *   只有别人找她才能醒。
+   *
+   *   现在用一个**只在入睡那一刻写入、结算不动它**的字段。
    *
    * @returns {boolean} 这次调用是否把她叫醒了
    */
@@ -18015,25 +18452,309 @@ async function main() {
     try {
       const c = readLifeCircle();
       if (!c || c.asleep !== true) return false;
+      // ★ 2026-11-26 三次改：`autoWakeHours` 不再参与"什么时候醒"的判断
+      //   （睡觉期间只有早上那一个时刻会叫）。保留读数只为日志/面板显示。
       const hours = Math.max(1, Math.min(24, Number(cfg.life?.autoWakeHours) || 8));
-      const sleptMs = Date.now() - (Number(c.lastTickedAt) || 0);
-      if (sleptMs < hours * 3600 * 1000) return false;
-      // 结算到"睡满那一刻"，再翻成醒 —— 超出部分不该算作睡眠收益。
-      const wakeAt = (Number(c.lastTickedAt) || Date.now()) + hours * 3600 * 1000;
+      // ★ 入睡起点：优先 asleepSince（真实入睡时刻）；老数据没有就退回 lastTickedAt。
+      const since = Number(c.asleepSince) > 0 ? Number(c.asleepSince) : (Number(c.lastTickedAt) || Date.now());
+      const now = Date.now();
+
+      // ── 判定该不该醒 ──────────────────────────────────────────────────
+      //
+      // ★★ 2026-11-26 六次改（操作者最终口径，**这就是"八点起床"的完整设计**）：
+      //
+      //   「睡着就关掉主动唤醒」是**原本就有的设计**（只有噩梦能叫醒她，
+      //    还有你发消息 / 手动唤醒），这层不动。
+      //
+      //   要加的是**醒来这一侧的判据**，分两步：
+      //
+      //   ① **早上 morningWakeHour（默认 8 点）先检查一次精力**：
+      //        · 回满了（energy >= energyWakeThreshold）→ 起床
+      //        · 没回满 → **继续睡**，但从此进入"非夜晚"，下面 ② 生效
+      //   ② **非夜晚时段 + 精力回满** → 随时起床
+      //        这个"随时"就是 11 小时睡眠的来源：8 点没满就接着睡，
+      //        精力再涨回来（8/h）就自然醒，最多能睡到 11 点前后。
+      //
+      //   ⚠️ 关键：② 只在**非夜晚**成立。夜里精力满了也不会起 ——
+      //      否则 22:00 睡的人 05:00 就被自己弄醒，那正是操作者要避免的。
+      //      「夜晚」= `life.quietHours`（默认 23→8）。
+      //
+      //   ⚠️ 也**没有**"睡满 autoWakeHours 就起"这条兜底 —— 删掉过两次，
+      //      它会让 22:00 睡的人在 06:00 起，破坏整个设计。
+      //      睡太久的唯一后果是精力早早封顶（10h），之后只是躺着。
+      const quiet = quietHoursOf();
+      const nowDate = new Date(now);
+      const nowMinute = nowDate.getHours() * 60 + nowDate.getMinutes();
+      const inNight = quiet ? inQuietHours(nowMinute, quiet) : false;
+
+      const morningHour = Number(cfg.life?.morningWakeHour);
+      const morningH = Number.isFinite(morningHour) ? Math.min(23, Math.max(0, morningHour)) : 8;
+      const morningAt = (() => {
+        // 入睡那天之后的第一个 morningH。用入睡日算，避免"睡了三天"算出奇怪的值。
+        const base = new Date(since);
+        base.setHours(morningH, 0, 0, 0);
+        // 入睡时就已经过了今天这个点 → 用明天那个
+        if (base.getTime() <= since) base.setDate(base.getDate() + 1);
+        return base.getTime();
+      })();
+
+      // ★★ 2026-11-26 七次改：**晨唤只在"这是一次过夜觉"时成立**。
+      //
+      //   踩到的坑：她 14:00 睡个午觉，morningAt 会算成**明天 08:00** ——
+      //   于是午觉要睡 18 小时才醒。那显然不对。
+      //
+      //   判据：只有**入睡时刻落在夜间段之后的那段"该睡长觉"的窗口**才认晨唤。
+      //   最直观的做法 —— 入睡时如果本来就该睡了（在 `life.quietHours` 里，
+      //   默认 23→8），那就是过夜觉；否则是午觉/小憩，不套晨唤规则。
+      //
+      //   午觉怎么醒？靠"非夜晚 + 精力满"那条（下面 ②），
+      //   而午觉醒来时精力通常还没满 —— 那就继续睡到自然满了再起，
+      //   或者她自己说醒了 / 有人找她。这比"按到明天 8 点"合理得多。
+      const sleepStart = new Date(since);
+      const sleepStartMinute = sleepStart.getHours() * 60 + sleepStart.getMinutes();
+      const isOvernightSleep = quiet ? inQuietHours(sleepStartMinute, quiet) : true;
+      const morningDue = isOvernightSleep && morningAt > 0 && now >= morningAt;
+
+      // 精力是否回满（阈值可配，默认 100）
+      const energyTh = Number.isFinite(Number(cfg.life?.energyWakeThreshold))
+        ? Number(cfg.life.energyWakeThreshold) : 100;
+      const energyFull = Number(c.energy) >= energyTh;
+      const sleptHours = (now - since) / 3600000;
+
+      // ① 8 点检查：过夜觉 + 到了 8 点 + 精力回满 → 起
+      const morningWake = morningDue && energyFull;
+
+      // ② **非夜晚 + 精力回满 → 起**（8 点没满就接着睡，涨回来就走这条）
+      //
+      //    这条是"能睡到 11 小时"的来源。
+      //    `sleptHours >= 1` 只是防止她"刚躺下、精力本来就是满的"立刻被判定该起。
+      //
+      //    ⚠️ 夜里（quietHours，默认 23→8）**不成立** ——
+      //       否则 22:00 睡的人 02:00 精力满了就被自己弄醒。
+      //    ⚠️ 午觉也走这条：14:00 睡、15 点精力满 → 自然醒，
+      //       不会被"按到明天 8 点"（见上面 isOvernightSleep 的说明）。
+      const daytimeEnergyWake = !inNight && energyFull && sleptHours >= 1;
+
+      if (!morningWake && !daytimeEnergyWake) return false;
+
+      // 醒的时刻就是现在（可能是 8 点整，也可能是之后精力涨满的那一刻）
+      const wakeAt = now;
+      const reason = morningWake
+        ? `早上 ${morningH} 点，精力已回满（${Math.round(c.energy)}/${energyTh}）`
+        : `非夜晚时段，精力回满（${Math.round(c.energy)}/${energyTh}）`;
+      // 结算到"醒的那一刻"，超出部分不该算作睡眠收益。
       const settledAtWake = settleLifeCircleFn(
         { ...c, lastTickedAt: c.lastTickedAt },
-        wakeAt,
+        Math.max(wakeAt, Number(c.lastTickedAt) || 0),
         { gapMs: 30 * 60 * 1000, offlineThresholdMs: lifeOfflineThresholdMs(), asleep: true }
       );
-      const woken = { ...settledAtWake, asleep: false, lastTickedAt: wakeAt };
+      // ★ 醒来一定要清 asleepSince，否则下次算时长会从这次入睡算起。
+      const woken = { ...settledAtWake, asleep: false, asleepSince: 0, lastTickedAt: Math.max(wakeAt, Number(c.lastTickedAt) || 0) };
       writeLifeCircle(woken);
+      // ★★ 2026-11-26：自动醒**也要把这一觉的时长记下来**。
+      //
+      //   跨天第一轮那句按时长分的起床语（sleepVerdict）读的就是 meta.lastSleepHours。
+      //   原来只有"她说我醒了"那条路会写（而且其实没写，见 computeSleepWakeReport），
+      //   自动醒这条路更是完全不记 —— 所以她绝大多数日子都是"没睡过"。
+      //   ★ 2026-11-26 二次改：时长用**真实退出的时刻**算（含晨唤早醒的情况），
+      //     不再写死 `hours` —— 22:00 睡、8 点醒是 10 小时，不是 8。
+      const realHours = Math.max(0, (Math.max(wakeAt, Number(c.lastTickedAt) || 0) - since) / 3600000);
+      try {
+        const lc = readLifeCond();
+        writeLifeCond({ list: lc.list, meta: { ...lc.meta, lastSleepHours: Math.round(realHours * 100) / 100 } });
+      } catch (error) {
+        log(`[life] 睡眠时长落盘失败（已跳过）：${error?.message ?? error}`);
+      }
       pendingSleepWake = null;   // 自动醒不产生"起床那句话"（没人看到她醒）
       // 但她可能做了个梦 —— 醒来之后第一次被叫时贴一句（不唤醒，只是给她看）。
       rollDreamOnWakeV2('auto-wake');
-      log(`[life] 睡满 ${hours} 小时，自动醒来（精力 ${Math.round(woken.energy)}）`);
+      log(`[life] 自动醒来（${reason}），实睡 ${realHours.toFixed(1)} 小时，精力 ${Math.round(woken.energy)}`);
       return true;
     } catch (error) {
       log(`[life] 自动醒来失败（已跳过）：${error?.message ?? error}`);
+      return false;
+    }
+  }
+
+  /**
+   * 睡眠醒来定时器（2026-11-26 新增）。
+   *
+   * ── 为什么需要它 ────────────────────────────────────────────────────────
+   *
+   * `maybeAutoWakeUpV2()` 原来**只在 `pickProactiveRouteV2` 里被调用**，
+   * 也就是"主动机会检查"时才顺带看一眼该不该醒。
+   *
+   * 但睡着时主动机会是每 40 分钟才检查一次（噩梦重试），于是：
+   *   07:34 检查 → 还没到 8 点 → 不醒
+   *   → 下一次排到 08:14 → **晚了 14 分钟才醒**
+   * 若那次恰好撞上"已做过噩梦"（60min 重试），最坏能晚到 09:00 以后。
+   *
+   * 这就把「第二天 8 点唤醒」做成了「第二天 8 点到 9 点之间随便哪一刻」。
+   *
+   * ── 做法 ────────────────────────────────────────────────────────────────
+   *
+   * 独立一个 `wakeUpTimer`，直接排到**最早该醒的那一刻**：
+   *   ① 晨唤时刻（morningWakeHour）
+   *   ② 睡满 autoWakeHours
+   *   ③ 精力满的估算时刻（按 8/h 反推 —— 只在非夜间有效，所以还要跳过夜间段）
+   * 三者取最早。到点后调 maybeAutoWakeUpV2()（它自己会再判一次条件）。
+   *
+   * ⚠️ 用 `MAX_TIMEOUT_MS` 分段续期（照 setupSleepTimerV2 的写法），
+   *    Node 的 setTimeout 超过 2^31-1ms 会按 1ms 触发。
+   */
+  function scheduleWakeUpTimerV2(key) {
+    if (cfg.socialV2?.enabled === false) return;
+    if (socialV2.paused || currentMode !== 'reserved2') return;
+    if (!isSessionAllowedInCurrentMode(key)) return;
+    const st = getSocialV2State(key);
+    if (st.wakeUpTimer) {
+      clearTimeout(st.wakeUpTimer);
+      st.wakeUpTimer = null;
+    }
+    // ★★ 2026-11-26：**会话级主动开关关掉时，早上也不许叫。**
+    //
+    //   漏这条是个真 bug：`wakeUpTimer` 是独立于 `proactiveTimer` 的，
+    //   而 `st.proactiveDisabled` 的检查原来只写在 scheduleProactiveCheckV2 里 ——
+    //   于是一个在面板上被关掉主动机会的私聊，**照样会在 8 点被叫醒**。
+    //
+    //   语义：操作者关掉一个聊天的主动机会，意思就是"这个聊天里别自己来找我"。
+    //   早上叫醒她、并且发一轮唤醒让她可能主动说话 —— 那也是"自己来找我"。
+    //   所以必须一起尊重这个开关。
+    //
+    //   关掉之后她会怎样：一直睡着，直到
+    //     · 操作者给她发消息（唤醒词渲染时"唤醒即醒来"）
+    //     · 操作者在面板上手动唤醒
+    //     · 她自己被噩梦惊醒（噩梦走 proactiveTimer，而那条也被这个开关挡住了）
+    //   —— 也就是说关掉之后她是**彻底不主动**的，这正是"睡着就醒不来"的完整含义。
+    if (st.proactiveDisabled === true) {
+      st.wakeUpAt = 0;
+      return;
+    }
+    const c = readLifeCircle();
+    if (!c || c.asleep !== true) return;        // 没在睡就不排
+
+    const since = Number(c.asleepSince) > 0 ? Number(c.asleepSince) : (Number(c.lastTickedAt) || Date.now());
+    const now = Date.now();
+
+    // ★★ 2026-11-26 六次改（操作者最终口径，这就是"八点起床"的完整设计）：
+    //
+    //   ① **睡着时关掉主动唤醒**（原本就有的设计，不动）——
+    //     只有噩梦、你发消息、手动唤醒能弄醒她。
+    //   ② **早上 morningWakeHour（默认 8 点）先检查一次精力**：
+    //        · 回满 → 起床（发 morningWake 唤醒）
+    //        · 没回满 → **继续睡**，进入下面 ③ 的等待
+    //   ③ **非夜晚 + 精力回满 → 随时起床**
+    //        8 点没满就接着睡，精力按 8/h 再涨回来就自然醒 ——
+    //        这就是"能睡到 11 小时"的来源。
+    //
+    //   ⚠️ 夜里精力满了**不会**起（③ 有非夜晚约束），
+    //      否则 22:00 睡的人 05:00 就被自己弄醒，那正是要避免的。
+    const quiet = quietHoursOf();
+    const morningHour = Number(cfg.life?.morningWakeHour);
+    const morningH = Number.isFinite(morningHour) ? Math.min(23, Math.max(0, morningHour)) : 8;
+    const morningAt = (() => {
+      const base = new Date(since);
+      base.setHours(morningH, 0, 0, 0);
+      // 入睡时就已经过了今天这个点 → 用明天那个
+      if (base.getTime() <= since) base.setDate(base.getDate() + 1);
+      return base.getTime();
+    })();
+
+    const energyTh = Number.isFinite(Number(cfg.life?.energyWakeThreshold))
+      ? Number(cfg.life.energyWakeThreshold) : 100;
+    const energyFull = Number(c.energy) >= energyTh;
+
+    // 下一次"该看一眼"的时刻：
+    //   · 还没到 8 点 → 8 点
+    //   · 已过 8 点、精力没满、在夜里 → 免打扰结束那一刻
+    //   · 已过 8 点、精力没满、在白天 → 按 8/h 估算精力涨满的时刻
+    //   · 已过 8 点、精力已满、在白天 → 现在（40 秒后兜一下）
+    const at = (() => {
+      if (now < morningAt) return morningAt;
+      const d = new Date(now);
+      const m = d.getHours() * 60 + d.getMinutes();
+      const inNight = quiet ? inQuietHours(m, quiet) : false;
+      if (energyFull) {
+        // 精力满了：夜里不醒（等天亮），白天立刻醒
+        return inNight ? quietEndAt(now, quiet) : now + 1000;
+      }
+      // 精力没满：估算还差多久（ENERGY_RECOVER_PER_HOUR = 8）
+      const need = Math.max(0, energyTh - Number(c.energy));
+      const estimate = now + (need / 8) * 3600 * 1000;
+      if (!quiet) return estimate;
+      const ed = new Date(estimate);
+      const em = ed.getHours() * 60 + ed.getMinutes();
+      // 估算落在夜里 → 推到天亮；否则按估算
+      return inQuietHours(em, quiet) ? quietEndAt(estimate, quiet) : estimate;
+    })();
+
+    const MAX_TIMEOUT_MS = 100009;
+    const delay = at - Date.now();
+    if (delay <= 0) {
+      // 已经到点（或过了）→ 立刻叫一次
+      fireMorningWakeV2(key);
+      return;
+    }
+    if (delay > MAX_TIMEOUT_MS) {
+      st.wakeUpTimer = setTimeout(() => {
+        st.wakeUpTimer = null;
+        scheduleWakeUpTimerV2(key);
+      }, MAX_TIMEOUT_MS);
+      st.wakeUpTimer.unref?.();
+      return;
+    }
+    st.wakeUpTimer = setTimeout(() => {
+      st.wakeUpTimer = null;
+      st.wakeUpAt = 0;
+      // 到点先试着叫醒（maybeAutoWakeUpV2 自己会再判一次条件；
+      // 精力没回满就返回 false，这里接着排下一枪）。
+      if (!fireMorningWakeV2(key)) {
+        // 没醒 → **必须继续排**，否则她就永远停在睡眠里没人管了。
+        scheduleWakeUpTimerV2(key);
+      }
+    }, delay);
+    st.wakeUpTimer.unref?.();
+    st.wakeUpAt = at;
+    log(`[life] ${key} 睡眠检查定时器：${Math.round(delay / 60000)}min 后`
+      + `（${new Date(at).toLocaleString('zh-CN', { hour: '2-digit', minute: '2-digit', month: '2-digit', day: '2-digit' })}`
+      + `，精力 ${Math.round(c.energy)}/${energyTh}${energyFull ? ' 已满' : ' 未满'}）`);
+  }
+
+  /**
+   * 早上那一下：**真的把她叫起来**（发一轮 morningWake 唤醒）。
+   *
+   * ★ 2026-11-26：这一步原来被我做成"只改 asleep 状态、不发唤醒" —— 那是错的。
+   *   改成状态为醒但没人跟她说话，等于她醒了却不知道自己为什么醒；
+   *   而且那一轮根本不会发生，她实际上还在睡。
+   *
+   * 正确顺序：
+   *   ① 先翻状态（asleep=false，并记下这一觉时长）—— 让唤醒词渲染时
+   *      能带上"（醒了，睡了 X 小时）"那句，也让后面所有闸门按"醒着"判
+   *   ② 再发一轮 `morningWake` 唤醒，preset 里那句「到点了，该起床了」
+   *   ③ 如果恰好有人发过消息，消息会一起进这一轮（快照是现读的）
+   */
+  function fireMorningWakeV2(key) {
+    try {
+      // ★ 2026-11-26：**双保险**。scheduleWakeUpTimerV2 排程前已经判过开关，
+      //   但这里再判一次 —— 因为定时器可能是在开关还开着的时候排好的，
+      //   中间操作者把它关了（那条路径也会清定时器，但万一有遗漏）。
+      //   "关掉主动机会" = 这个聊天里不许自己来找我，早上叫醒也算。
+      const st = getSocialV2State(key);
+      if (st.proactiveDisabled === true) {
+        st.wakeUpAt = 0;
+        log(`[life] ${key} 主动机会已关闭，跳过早上叫醒`);
+        return false;
+      }
+      const c = readLifeCircle();
+      if (!c || c.asleep !== true) return false;      // 她已经被别的途径弄醒了
+      const woke = maybeAutoWakeUpV2();
+      if (!woke) return false;
+      log(`[life] ${key} 到点，叫她起床`);
+      void sendWakePromptV2(key, 'morningWake')
+        .catch((error) => log(`[reserved2] 早上叫醒异常 ${key}:`, error?.message ?? error));
+      return true;
+    } catch (error) {
+      log(`[life] 早上叫醒失败（已跳过）：${error?.message ?? error}`);
       return false;
     }
   }
@@ -18060,10 +18781,12 @@ async function main() {
       //   （醒了，睡得还行　梦见吃到很好吃的东西）
       //   （刚做了个不太好的梦，惊醒了。）
       // 一夜既做好梦又做噩梦还都记得，这不对。
-      // 判据用 `p.nightmareNight`（噩梦那边写的是当天日期键）。
+      // 判据用 `p.nightmareNight`（噩梦那边写的是**夜键**，见 nightKeyOf）。
+      // ★ 2026-11-26 改：从 todayKeyOf（日历日）换成 nightKeyOf（本夜）。
+      //   日历日在跨午夜后会变，于是同一夜能做第二次噩梦。
       const p = proactiveState();
-      const todayKey = todayKeyOf(Date.now());
-      if (String(p.nightmareNight || '') === todayKey) {
+      const nightKey = nightKeyOf(Date.now());
+      if (String(p.nightmareNight || '') === nightKey) {
         log(`[life] 跳过普通梦（${source}）：今晚已经做过噩梦`);
         return;
       }
@@ -18137,17 +18860,42 @@ async function main() {
         //   再叠两道硬闸：
         //     ③ **一夜最多一次**（惊醒再睡，不该被同一机制反复弄醒）
         //     ④ 睡够 1 小时才可能做梦（刚躺下就惊醒说不通）
-        const nightmareNightKey = todayKeyOf(now);
+        const nightmareNightKey = nightKeyOf(now);
         const p = proactiveState();
         const alreadyNightmared = String(p.nightmareNight || '') === nightmareNightKey;
-        const sleptMs = now - (Number(readLifeCircle().lastTickedAt) || now);
-        if (alreadyNightmared || sleptMs < 60 * 60 * 1000) return null;
+        // ★ 2026-11-26：睡多久也改用 asleepSince（和自动醒同一口径）。
+        //   原来用 lastTickedAt，被面板/唤醒结算推到现在 → sleptMs 恒为 0 →
+        //   「睡够 1 小时才做梦」永远不成立，噩梦一次都不会出现。
+        const sleepCircle = readLifeCircle();
+        const sleepSince = Number(sleepCircle.asleepSince) > 0
+          ? Number(sleepCircle.asleepSince)
+          : (Number(sleepCircle.lastTickedAt) || now);
+        const sleptMs = now - sleepSince;
+        // ── 三条"不醒"的出口，全部带 retryAt（2026-11-26 修）─────────────
+        //
+        //   原来这三处是裸 `return null`，调用方拿不到任何信息，只能按
+        //   `lastProactiveAt + gap` 再排一次 —— 而那个时刻早已过去，delay 被
+        //   夹到 60 秒下限，于是**每分钟醒一次**。夜里 00:00–09:00 的兜底候选
+        //   池是空的（实测 48 个半小时采样点里 19 个空），每天夜里必走这条路。
+        //   日志实证：23:44→23:50 连续 7 次「约 1min 后」。
+        //
+        //   现在每条都说出"什么时候再来"，夜里就不会空转了。
+        if (alreadyNightmared) {
+          return { blocked: true, blockedBy: 'asleep-nightmared', retryAt: now + 60 * 60 * 1000 };
+        }
+        if (sleptMs < 60 * 60 * 1000) {
+          // 还没睡够 1 小时：等满 1 小时再看（不是 60 秒后）。
+          return { blocked: true, blockedBy: 'asleep-too-short', retryAt: sleepSince + 60 * 60 * 1000 };
+        }
 
         const picked = pickWithDefault(NIGHTMARE_POOL, {
           specialChance: Number(cfg.socialV2?.proactive?.nightmareSpecialChance),
           intensity: Number(cfg.life?.intensity) / 100
         });
-        if (picked.isDefault || !picked.spec) return null;
+        if (picked.isDefault || !picked.spec) {
+          // 今晚这次没做噩梦 —— 下班车 40 分钟后再掷，不是每分钟。
+          return { blocked: true, blockedBy: 'asleep-no-nightmare', retryAt: now + 40 * 60 * 1000 };
+        }
 
         // 掷中了：生成一条噩梦 condition，她能记住"刚才做了什么梦"，
         // 接下来两三小时 mood 会带一点慌张/不安。
@@ -18183,7 +18931,48 @@ async function main() {
     }
 
     // ① 额度（硬上限，不是概率）
-    if (proactiveTodayCount(key) >= quota) return null;
+    //
+    // ★★ 2026-11-26：被拦下时**必须说出"什么时候再来"**，不能只 return null。
+    //
+    //   原来所有闸都返回 null，调用方拿不到任何信息，只能按"上次开口 + 间隔"
+    //   再排一次 —— 而那个时刻早已过去，`delay` 就被压到 60 秒下限。
+    //   于是：额度用完了、对方刚说完话、她刚回过话、还在宽限期里……
+    //   每一种都会变成**每分钟重试一次**，直到闸门放行。11-26 00:01 那次
+    //   她莫名被叫醒，就是这么熬出来的。
+    //   现在每道闸都给出 `retryAt`，调用方直接排到那一刻，不再空转。
+    if (proactiveTodayCount(key) >= quota) {
+      // 额度按天算 —— 今天说完了就等明天。
+      const midnight = new Date(now);
+      midnight.setHours(24, 0, 0, 0);
+      return { blocked: true, blockedBy: 'quota', retryAt: midnight.getTime() };
+    }
+
+    // ── ① 免打扰闸：**按钟点**，只在「她醒着熬夜」时生效（2026-11-26 二次改）──
+    //
+    // ── 演变（别改回去，每条都是踩过的）────────────────────────────────────
+    //
+    //   ① 最初：夜里没有任何硬拦，只有 `HOUR_ACTIVITY_WEIGHT` 这个软权重
+    //      （凌晨 3 点 = 3.1 倍间隔），"深夜"只是隔久一点，不是不许说。
+    //   ② 上一版：加了 23→8 的免打扰硬闸 —— 但**没区分她睡没睡**，
+    //      于是操作者要熬夜时，23 点一到主动机会全被禁掉。
+    //      操作者原话：「我有可能要熬夜…熬夜主动机会的时长变长是没问题的」。
+    //   ③ 现在（这版）：
+    //      · **她说了睡（asleep=true）** → 不排主动机会。这条由上面 ⓪ 段管，
+    //        它本来就"睡着只允许噩梦"，不需要钟点参与。
+    //      · **她醒着** → 钟点闸只做"别在凌晨打扰"这一件事，
+    //        且**可以被 `life.quietHours` 关掉**（真熬夜就不该被按钟点拦）。
+    //
+    // 所以这道闸的语义从"夜间静默"收窄成"醒着但在凌晨 → 少打扰"，
+    // 而"睡着就别排"是完全独立的另一条（⓪ 段）。
+    const quietNow = new Date(now);
+    const quiet = quietHoursOf();
+    if (quiet && !isLifeAsleepNow()) {
+      const m = quietNow.getHours() * 60 + quietNow.getMinutes();
+      if (inQuietHours(m, quiet)) {
+        // 排到免打扰结束那一刻 —— 别再拿 gap 兜底（那会让它 40 分钟后再撞一次）。
+        return { blocked: true, blockedBy: 'quietHours', retryAt: quietEndAt(now, quiet) };
+      }
+    }
 
     // ② 间隔门（唯一来源：proactiveGapMsOf）
     //
@@ -18201,19 +18990,28 @@ async function main() {
     // 时段硬覆盖优先（深夜说过一次 → 直接拉到 7.5–10.5h）
     const override = daypartGapOverride(policy, gapOpts);
     const gap = override > 0 ? override : proactiveGapMsOf(policy, unanswered, gapOpts);
-    if (p.lastProactiveAt && now - Number(p.lastProactiveAt) < gap) return null;
+    if (p.lastProactiveAt && now - Number(p.lastProactiveAt) < gap) {
+      return { blocked: true, blockedBy: 'interval', retryAt: Number(p.lastProactiveAt) + gap };
+    }
 
     // ③ 静默门槛：对方刚刚才说过话，就别"主动"了（那不是主动，是抢话）
     const idleThreshold = Number(cfg.socialV2?.proactive?.idleThresholdMs) || 15 * 60 * 1000;
-    if (now - (Number(st.lastIncomingAt) || 0) < idleThreshold) return null;
+    const lastIncoming = Number(st.lastIncomingAt) || 0;
+    if (now - lastIncoming < idleThreshold) {
+      return { blocked: true, blockedBy: 'idle', retryAt: lastIncoming + idleThreshold };
+    }
 
     // ④ 刚回过话也不主动（她刚说完，再开口就是刷屏）
-    if (st.lastAiReplyAt && now - Number(st.lastAiReplyAt) < 30 * 60 * 1000) return null;
+    if (st.lastAiReplyAt && now - Number(st.lastAiReplyAt) < 30 * 60 * 1000) {
+      return { blocked: true, blockedBy: 'aiReply', retryAt: Number(st.lastAiReplyAt) + 30 * 60 * 1000 };
+    }
 
     // ⑤ 还没到追的时机
     if (p.awaitingReplySince) {
       const grace = Number(policy.graceMs) || 0;
-      if (now - Number(p.awaitingReplySince) < grace) return null;
+      if (now - Number(p.awaitingReplySince) < grace) {
+        return { blocked: true, blockedBy: 'grace', retryAt: Number(p.awaitingReplySince) + grace };
+      }
     }
 
     // ── 选路由（按优先级取第一条可用的）──
@@ -18245,22 +19043,69 @@ async function main() {
       };
     }
 
-    // 3) 兜底：概率抽样。
-    //    仍然保留，但**概率压得很低** —— 它只是在"没有任何具体理由"
-    //    时给一点点随机性，避免她成了必须有事才开口的机器。
+    // 3) 到这里就**真的没有理由了** → 不主动。
     //
-    // ⚠️ 2026-11-24：曾试过改成"做噩梦惊醒"，操作者否了 —— 保持原样。
-    const probBase = Number(cfg.socialV2?.proactive?.randomFallbackProbability);
-    const prob = Math.min(1, Math.max(0, Number.isFinite(probBase) ? probBase : 0.08));
-    if (Math.random() < prob) {
-      return { route: 'curiosity', reason: 'proactiveCheck' };
-    }
-    return null;
+    // ★★ 2026-11-26 修：删掉"随机兜底"。
+    //
+    //   原来这里还留着一层概率抽样，掷中就返回裸的 `proactiveCheck` ——
+    //   **没有动机**。唤醒词里于是只剩场景行和消息，她瞪着屏幕不知道自己
+    //   为什么醒。实测 11-26 00:01:30 就是这样：凌晨一点被叫醒，零理由。
+    //
+    //   而上面第 2 步的注释（还有 buildProactiveCandidates 末尾那层
+    //   `ambientFallbackCandidates`）早就写着"不再退回随机"——注释和实现
+    //   一直在打架，跑的是实现那版。
+    //
+    //   现在按注释的意思做：`buildProactiveCandidates` 里已经有兜底理由池
+    //   （check_in / quiet_care / state_share / activity_share，每条都带 motive），
+    //   连它都给不出来 = 此刻确实无话可说 → 不开口，并说出什么时候再来。
+    return {
+      blocked: true,
+      blockedBy: 'no-reason',
+      // 下一个整点后再看。夜里不会每 60 秒撞一次（这是 11-26 那晚的根因）。
+      retryAt: now + 60 * 60 * 1000
+    };
   }
 
   /** 当日键（YYYY-MM-DD），用于候选去重。 */
   function todayKeyOf(ms) {
     const d = new Date(Number(ms) || Date.now());
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  }
+
+  /**
+   * 「本夜」键（2026-11-26 新增）。
+   *
+   * ── 为什么不能用日历日期 ────────────────────────────────────────────────
+   *
+   * 噩梦的「一夜最多一次」原来拿 `todayKeyOf` 判 —— 那是**日历日**。
+   * 于是她 23:00 睡下、23:30 做了噩梦（记 `11-26`），
+   * 过了零点判定键变成 `11-27`，`alreadyNightmared` 不再成立，
+   * **同一夜可以做第二次噩梦**。正常作息必然跨午夜，这不是边角情况。
+   *
+   * ── 口径 ────────────────────────────────────────────────────────────────
+   *
+   * 以 **18:00 为分界**：18:00 之前算「昨天那夜」，18:00 起算「今夜」。
+   *   · 11-26 19:00 → 夜键 11-26（今夜）
+   *   · 11-27 02:00 → 夜键 11-26（还是昨晚那夜）✔ 不会重置
+   *   · 11-27 09:00 → 夜键 11-26（早上仍属昨夜）
+   *   · 11-27 19:00 → 夜键 11-27（新的一夜）
+   *
+   * 为什么分界定在 18:00 而不是零点或清晨：
+   *   · 零点分界 = 就是这个 bug；
+   *   · 清晨分界（比如 06:00）会让「凌晨 5 点做噩梦」和「晚上 11 点做噩梦」
+   *     归到两夜 —— 而她可能一觉睡过去，那仍是同一觉；
+   *   · 18:00 是"天黑了、准备进入夜间模式"的自然边界，
+   *     且离她实际入睡（22:00–01:00）足够远，不会把一觉切两半。
+   *
+   * @param {number} ms
+   * @returns {string} YYYY-MM-DD（代表那一夜开始的日期）
+   */
+  function nightKeyOf(ms) {
+    const NIGHT_START_HOUR = 18;
+    const t = Number(ms) || Date.now();
+    const d = new Date(t);
+    // 18:00 之前 → 归到前一天
+    if (d.getHours() < NIGHT_START_HOUR) d.setDate(d.getDate() - 1);
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
   }
 
@@ -18444,7 +19289,17 @@ async function main() {
     }
   }
 
-  function scheduleProactiveCheckV2(key) {
+  /**
+   * 排下一次主动机会检查。
+   *
+   * @param {string} key
+   * @param {object} [opts]
+   * @param {number} [opts.notBefore] 最早什么时候再检查（毫秒时间戳）。
+   *   上一次判定被闸门拒了的时候，闸门会给出它自己放行的时刻，
+   *   从这里传进来 —— 见 pickProactiveRouteV2 里那些 `blocked` 返回。
+   *   不传 = 按"上次开口 + 间隔"算（正常路径）。
+   */
+  function scheduleProactiveCheckV2(key, opts = {}) {
     if (cfg.socialV2?.proactive?.enabled === false) return;
     if (socialV2.paused || currentMode !== 'reserved2') return;
     if (!isSessionAllowedInCurrentMode(key)) return;
@@ -18464,6 +19319,39 @@ async function main() {
     }
     if (st.proactiveTimer) return;
     const p = cfg.socialV2?.proactive ?? {};
+
+    // ★★ 2026-11-26 五次改（操作者最终设计）：
+    //
+    //   「一般她睡着了就关闭主动唤醒，除了噩梦和我发消息她是不会起床的，
+    //     这是我设计**八点起床**的核心」
+    //
+    //   所以睡着时**不排常规主动机会定时器** —— 那些"该不该开口"的判定全不跑。
+    //
+    //   但**噩梦不能一起关掉**：噩梦就是从主动机会检查里掷出来的
+    //   （pickProactiveRouteV2 的 ⓪ 段）。所以要保留一个**只掷噩梦**的粗粒度检查。
+    //
+    //   做法：睡着时按 40 分钟一次排，到点只调 pickProactiveRouteV2；
+    //   它 ⓪ 段会自动只放行噩梦，其余一律 blocked —— 不会叫醒她。
+    if (isLifeAsleepNow()) {
+      if (st.proactiveTimer) return;
+      const NIGHTMARE_CHECK_MS = 40 * 60 * 1000;
+      st.proactiveNextCheckAt = Date.now() + NIGHTMARE_CHECK_MS;
+      st.proactiveTimer = setTimeout(() => {
+        st.proactiveTimer = null;
+        st.proactiveNextCheckAt = 0;
+        const picked = pickProactiveRouteV2(key);
+        if (picked && picked.route === 'proactiveNightmare') {
+          log(`[proactive] ${key} 噩梦惊醒`);
+          void sendWakePromptV2(key, 'proactiveNightmare')
+            .then((delivered) => { if (delivered !== false) recordProactiveSentV2(key, picked.route); })
+            .catch((error) => log(`[reserved2] 噩梦唤醒异常 ${key}:`, error?.message ?? error));
+        }
+        // 下一轮：睡着就继续按 40 分钟排；醒了就走正常逻辑
+        scheduleProactiveCheckV2(key);
+      }, NIGHTMARE_CHECK_MS);
+      st.proactiveTimer.unref?.();
+      return;
+    }
 
     // ── 私聊：额度制（2026-11-23）───────────────────────────────────────
     //
@@ -18499,7 +19387,41 @@ async function main() {
       const overrideTmp = daypartGapOverride(policy, gapOptsTmp);
       const gap = overrideTmp > 0 ? overrideTmp : proactiveGapMsOf(policy, undefined, gapOptsTmp);
       const base = Number(proactiveStateOf(key).lastProactiveAt) || 0;
-      const earliest = base > 0 ? base + gap : Date.now() + 60 * 1000;
+      // ★★ 2026-11-26 修：**没记过账时，也要等够一个间隔**。
+      //
+      // 原来是 `base > 0 ? base + gap : Date.now() + 60 * 1000` ——
+      // 只要"上次主动开口"读成 0（新会话、老数据迁移、或 11-26 那个
+      // 落盘漏字段的 bug），排出来的检查时刻就永远是"现在 + 60 秒"。
+      // 而 60 秒太短，短到静默门槛（对方 15 分钟没说话）和
+      // "刚回过话"（她 30 分钟内说过话）这两道闸都还没放行，
+      // 于是每次到点都被拒 → 立刻再排 60 秒 → **每分钟空转一次**；
+      // 一旦那两道闸刚好放行，她就毫无预兆地被叫醒（11-26 00:01 就是这样）。
+      //
+      // 现在：没有历史账 = 从此刻起算一整个间隔。语义上也更对 ——
+      // "她上次开口"未知，最保守的假设是"刚刚说过"，而不是"从没说过"。
+      let earliest = (base > 0 ? base : Date.now()) + gap;
+      // ★★ 2026-11-26：上一次判定被闸门拒了 → 直接排到那道闸放行的时刻。
+      //
+      // 这是"每分钟重试一次"的正面修法。原来所有闸都只 return null，
+      // 调用方拿不到任何信息，只能按 earliest 再排一次 —— 而 earliest
+      // 早已是过去时间，delay 被压到 60 秒下限，于是空转。
+      // 现在闸门自己说"我什么时候放行"，这里照排，不再熬。
+      //
+      // ★★ 2026-11-26 二次修：`notBefore` 必须**直接取代** earliest，不能取 max。
+      //
+      //   原来是 `if (notBefore > earliest) earliest = notBefore` ——
+      //   只有当闸门放行时刻**比 gap 更晚**时才采纳。而夜里 gap 有 108–173 分钟
+      //   远大于免打扰/噩梦那几道闸给的 40 分钟，于是**闸门说的话全被 gap 吃掉**：
+      //     05:56 被 quietHours 拒 → 本该排 08:00，却被 gap 推成 06:36 →
+      //     06:36 又被拒 → 07:16 → 07:56 … 一觉里撞同一道闸五遍。
+      //   闸门已经明确说了"我什么时候放行"，那就是唯一正确的答案 ——
+      //   再跟 gap 取大等于假设"闸门说得不算数"。
+      const notBefore = Number(opts.notBefore) || 0;
+      if (notBefore > 0) {
+        // 闸门给的是"它放行的时刻"。判定与排程之间隔了几秒时它可能已经过去 ——
+        // 那种情况就立刻再看一次，但**不早于现在**（下面的 delay 仍有 60 秒下限兜底）。
+        earliest = Math.max(notBefore, Date.now());
+      }
       // ── 抖动：**同一轮调度只摇一次**（2026-11-24 修）──────────────────
       //
       // 原来是 `jitter = gap * 0.1 * (Math.random()*2-1)`，每次进这个函数都摇。
@@ -18507,15 +19429,33 @@ async function main() {
       // 或某个 setter 顺手重排），显示的"下次检查还有 X"就变了 ——
       // 用户看到的是"点一下刷新，间隔就变"，像是 bug。
       //
-      // 现在把抖动值**存进 st**，并在同一轮调度里复用：
-      //   · `st.proactiveJitterFor` 记这个抖动是给哪个 `earliest` 算的
+      // 现在把抖动值**存进 proactiveStateOf(key)**，并在同一轮调度里复用：
+      //   · `rec.proactiveJitterFor` 记这个抖动是给哪个 `earliest` 算的
       //   · `earliest` 没变就复用旧抖动，变了（说明真的进入下一轮）才重摇
       // 这样刷新多少次，同一个间隔期内看到的数字都一样。
-      if (st.proactiveJitterFor !== earliest) {
-        st.proactiveJitterFor = earliest;
-        st.proactiveJitter = gap * 0.1 * (Math.random() * 2 - 1);
+      //
+      // ★★ 2026-11-26 修：**容器要统一。**
+      //
+      //   原来写的是 `st.proactiveJitterFor`（getSocialV2State 的会话对象），
+      //   而落盘白名单里同时又有 `rec.proactiveJitterFor`（proactiveStateOf 的
+      //   globalMemory.proactive.byKey 记录）—— 两个完全不同的容器。
+      //   会话对象那半不在 saveSocialV2State 的白名单里，从不落盘；
+      //   byKey 那半从没被写过，读出来恒 0。注释说"存了会让旧间隔粘着"，
+      //   而实际根本没有那段逻辑 —— 注释和实现对不上。
+      //
+      //   现在统一到 `proactiveStateOf(key)`：它是**唯一**该被调用的主动状态入口
+      //   （见那个函数的注释），而且落盘白名单里已经有这两个字段。
+      //
+      // ★ 2026-11-26：被闸门拒后**不摇抖动**。那时候的 earliest 是
+      //   "闸门放行的时刻"，不是"她大概会开口的时刻"——多摇 ±10% 只会
+      //   让放行前一分钟又白跑一次。抖动只用在正常间隔上。
+      const jitterSpan = notBefore > 0 ? 0 : gap * 0.1;
+      const pState = proactiveStateOf(key);
+      if (pState.proactiveJitterFor !== earliest) {
+        pState.proactiveJitterFor = earliest;
+        pState.proactiveJitter = jitterSpan * (Math.random() * 2 - 1);
       }
-      const jitter = Number(st.proactiveJitter) || 0;
+      const jitter = Number(pState.proactiveJitter) || 0;
       const delay = Math.max(60 * 1000, Math.round(earliest - Date.now() + jitter));
       st.proactiveNextCheckAt = Date.now() + delay;
       st.proactiveTimer = setTimeout(() => {
@@ -18523,7 +19463,24 @@ async function main() {
         st.proactiveNextCheckAt = 0;
         ensureWakeableV2(st, { key });
         const picked = pickProactiveRouteV2(key);
-        if (picked && !isConversationBusyV2(key, st)) {
+        // ── 被闸门拒了：排到它放行的时刻，而不是 60 秒后再来一次 ──────────
+        //
+        // 每道闸都带回 `retryAt`（额度到明天零点 / 间隔满了 / 对方静默够久 /
+        // 她说完话满 30 分钟 / 宽限期结束）。不采纳它就等于每分钟撞一次墙。
+        let blockedBy = '';
+        let retryAt = 0;
+        if (picked?.blocked) {
+          blockedBy = String(picked.blockedBy || '');
+          retryAt = Number(picked.retryAt) || 0;
+          log(`[proactive] ${key} 本轮不开口（${blockedBy}），`
+            + `约 ${Math.max(1, Math.round((retryAt - Date.now()) / 60000))}min 后再看`);
+        } else if (picked && isConversationBusyV2(key, st)) {
+          // 忙不是闸门问题，是"她正在跑一轮"。给 10 分钟再来，
+          // 比 60 秒合理 —— 一轮对话很少 1 分钟就结束。
+          blockedBy = 'busy';
+          retryAt = Date.now() + 10 * 60 * 1000;
+        }
+        if (picked && !picked.blocked && !isConversationBusyV2(key, st)) {
           log(`[proactive] ${key} tier=${proactiveTierOf(key)} route=${picked.route} `
             + `today=${proactiveTodayCount(key)}/${proactiveQuotaOf(key).quota}`);
           // 候选带动机时把动机拼进 reason（渲染端按 `proactiveCheck:动机` 解析）。
@@ -18545,7 +19502,9 @@ async function main() {
             })
             .catch((error) => log(`[reserved2] proactive 唤醒异常 ${key}:`, error?.message ?? error));
         }
-        scheduleProactiveCheckV2(key);
+        // 下一轮：被闸门拒的排到它放行的时刻；正常发过的走原来的 earliest。
+        // 没被拒也没发（比如候选一个都造不出来）→ 按正常间隔再来。
+        scheduleProactiveCheckV2(key, retryAt > 0 ? { notBefore: retryAt } : undefined);
       }, delay);
       st.proactiveTimer.unref?.();
       log(`[reserved2] 已安排主动机会检查 ${key}（tier ${proactiveTierOf(key)}），约 ${Math.round(delay / 60000)}min 后`);
@@ -18553,6 +19512,27 @@ async function main() {
     }
 
     // ── 群聊：原来的随机唤醒（保持不变）────────────────────────────────
+    //
+    // ★ 2026-11-26 二次改：群聊这道闸的语义和私聊**完全一致** ——
+    //   只在「她醒着」时按钟点拦；她睡着的那条走噩梦机制（不归这里管）。
+    //   上一版没区分睡没睡，操作者要熬夜时会被误伤。
+    const quietG = quietHoursOf();
+    if (quietG && !isLifeAsleepNow()) {
+      const nowG = new Date();
+      const minuteG = nowG.getHours() * 60 + nowG.getMinutes();
+      if (inQuietHours(minuteG, quietG)) {
+        // 排到免打扰结束那一刻，和私聊一致（不摇任意随机数）。
+        st.proactiveNextCheckAt = quietEndAt(Date.now(), quietG);
+        st.proactiveTimer = setTimeout(() => {
+          st.proactiveTimer = null;
+          st.proactiveNextCheckAt = 0;
+          scheduleProactiveCheckV2(key);
+        }, Math.max(60 * 1000, st.proactiveNextCheckAt - Date.now()));
+        st.proactiveTimer.unref?.();
+        log(`[proactive] ${key} 群聊进入免打扰时段，排到 ${new Date(st.proactiveNextCheckAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}`);
+        return;
+      }
+    }
     const min = Math.max(60 * 1000, Number(p.checkIntervalMinMs) || 30 * 60 * 1000);
     const max = Math.max(min, Number(p.checkIntervalMaxMs) || 90 * 60 * 1000);
     const delay = Math.floor(min + Math.random() * (max - min));
@@ -18628,6 +19608,11 @@ async function main() {
     if (st.rateLimitRetryTimer) {
       clearTimeout(st.rateLimitRetryTimer);
       st.rateLimitRetryTimer = null;
+    }
+    // ★ 2026-11-26：睡眠醒来定时器也要清（见 scheduleWakeUpTimerV2）。
+    if (st.wakeUpTimer) {
+      clearTimeout(st.wakeUpTimer);
+      st.wakeUpTimer = null;
     }
     if (Array.isArray(st.pendingWakeReasons)) st.pendingWakeReasons.length = 0;
   }
