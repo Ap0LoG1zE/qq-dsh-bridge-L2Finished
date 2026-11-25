@@ -266,6 +266,9 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     // ★ 2026-11-26：面板「主动机会」页的数据组装（含睡眠状态）。
     //   抽成函数之后可以单测，不用起 HTTP 服务造状态。
     buildProactiveSessionRow,
+    // ★ 2026-11-26：压缩判定要能单测 —— 阈值/闲置/忙碌三道闸都容易改错，
+    //   而压缩是不可逆的（误压一次就让她忘掉一段对话）。
+    idleCompactDecisionV2,
     // ★ 2026-11-26 补：自动醒的三个触发条件（睡满 / 精力满 / 早上定时）。
     //   要能直接断言"什么时候该醒"，而不是靠等定时器。
     maybeAutoWakeUpV2,

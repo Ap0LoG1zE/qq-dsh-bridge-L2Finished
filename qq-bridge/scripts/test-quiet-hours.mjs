@@ -305,3 +305,100 @@ test('life.statusText.desireHigh 可配（工具返回值里的那句话）', as
     assert.equal(h.cfg.life.statusText.desireHigh, '自定义档位词');
   });
 });
+
+// ══ 压缩策略（2026-11-26 核对）══════════════════════════════════════════════
+//
+// 压缩是不可逆的（旧上下文被摘要掉），误压一次就让她忘掉一段对话 ——
+// 所以三道闸都得钉住：配置、闲置、上下文大小。
+
+test('压缩配置：默认走 /compact_chat，禁用破坏性 /compact', async () => {
+  await withBridge({
+    socialV2: {
+      sticker: { enabled: false }, proactive: { enabled: true },
+      compaction: {
+        enabled: true, onlyPrivate: false, idleMs: 1800000,
+        thresholdTokens: 400000, checkIntervalMs: 60000,
+        command: '/compact_chat', allowDestructiveCompact: false
+      }
+    }
+  }, async (h) => {
+    const c = h.cfg.socialV2.compaction;
+    assert.equal(c.enabled, true);
+    assert.equal(c.command, '/compact_chat', '必须走保留尾部的那个命令');
+    assert.notEqual(c.command, '/compact', '绝不能默认走 /compact —— 它 retainTokens 硬编码 0');
+    assert.equal(c.allowDestructiveCompact, false, '破坏性压缩必须显式开关');
+    assert.equal(c.thresholdTokens, 400000, '阈值 40 万');
+    assert.equal(c.idleMs, 1800000, '闲置 30 分钟');
+  });
+});
+
+test('压缩判定：闲置不够长 → 不压', async () => {
+  await withBridge({
+    socialV2: {
+      sticker: { enabled: false }, proactive: { enabled: true },
+      compaction: { enabled: true, onlyPrivate: false, idleMs: 1800000, thresholdTokens: 400000 }
+    }
+  }, async (h) => {
+    const K = 'private:10001';
+    h.getSocialV2State(K);
+    const st = h.getSocialV2State(K);
+    const now = Date.now();
+    st.lastIncomingAt = now - 5 * 60 * 1000;   // 才 5 分钟
+    st.lastActionAt = now - 5 * 60 * 1000;
+    assert.equal(h.idleCompactDecisionV2(K, st, now), null, '闲置 5 分钟不该压');
+  });
+});
+
+test('压缩判定：全局关掉 → 不压', async () => {
+  await withBridge({
+    socialV2: {
+      sticker: { enabled: false }, proactive: { enabled: true },
+      compaction: { enabled: false, onlyPrivate: false, idleMs: 1800000, thresholdTokens: 400000 }
+    }
+  }, async (h) => {
+    const K = 'private:10001';
+    h.getSocialV2State(K);
+    const st = h.getSocialV2State(K);
+    const now = Date.now();
+    st.lastIncomingAt = now - 60 * 60 * 1000;
+    st.lastActionAt = now - 60 * 60 * 1000;
+    assert.equal(h.idleCompactDecisionV2(K, st, now), null, 'enabled=false 时一律不压');
+  });
+});
+
+test('压缩判定：本轮已压过 → 不重复压（等用户下一条消息解锁）', async () => {
+  await withBridge({
+    socialV2: {
+      sticker: { enabled: false }, proactive: { enabled: true },
+      compaction: { enabled: true, onlyPrivate: false, idleMs: 1800000, thresholdTokens: 400000 }
+    }
+  }, async (h) => {
+    const K = 'private:10001';
+    h.getSocialV2State(K);
+    const st = h.getSocialV2State(K);
+    const now = Date.now();
+    st.lastIncomingAt = now - 60 * 60 * 1000;
+    st.lastActionAt = now - 60 * 60 * 1000;
+    st.idleCompactedAt = now - 1000;
+    assert.equal(h.idleCompactDecisionV2(K, st, now), null, 'idleCompactedAt 非 0 → 不压');
+  });
+});
+
+test('压缩判定：上下文没到阈值 → 不压（这是最容易被改成"随便压"的一处）', async () => {
+  await withBridge({
+    socialV2: {
+      sticker: { enabled: false }, proactive: { enabled: true },
+      compaction: { enabled: true, onlyPrivate: false, idleMs: 1800000, thresholdTokens: 400000 }
+    }
+  }, async (h) => {
+    const K = 'private:10001';
+    h.getSocialV2State(K);
+    const st = h.getSocialV2State(K);
+    const now = Date.now();
+    st.lastIncomingAt = now - 60 * 60 * 1000;
+    st.lastActionAt = now - 60 * 60 * 1000;
+    // 测试环境没有真实 token 采样 → 读出来 0 → 必然低于 40 万 → 不压
+    assert.equal(h.idleCompactDecisionV2(K, st, now), null,
+      '上下文 0 < 400k → 不压（阈值闸有效）');
+  });
+});
