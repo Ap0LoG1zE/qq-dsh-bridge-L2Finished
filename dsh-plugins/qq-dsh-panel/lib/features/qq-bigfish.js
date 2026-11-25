@@ -57,6 +57,8 @@ export const ROUTES = {
   access: `${routePath}/access`,
   backend: `${routePath}/backend`,
   diagnose: `${routePath}/diagnose`,
+  // 2026-11-24：生活状态页。客户端请求 /life → 这里转发到桥接的 /api/life。
+  life: `${routePath}/life`,
 }
 
 const JSON_HEADERS = {
@@ -1637,6 +1639,28 @@ async function handleDiagnose(req, res) {
   })
 }
 
+// ── 生活状态（2026-11-24）───────────────────────────────────────────────────
+//
+// 纯转发：面板请求 /life → 这里打桥接的 /api/life → 原样回给客户端。
+//
+// 为什么不在面板侧重新计算：那些数值（condition 叠加、周期推算、赖性欲抑制）
+// 全在桥接里，面板只该显示，不该有第二套算法 —— 否则两边一定会漂。
+async function handleLife(req, res) {
+  const env = bridgeEnv()
+  if (!env.ok) return json(res, 200, { ok: false, error: env.error })
+
+  const r = await bridgeApi(env, '/api/life', { timeoutMs: 8000 })
+  if (!r.ok) {
+    // 桥接还没重启（新端点 404）时给一句**能行动**的话，
+    // 而不是把 404 原样丢给用户。
+    const hint = r.status === 404
+      ? '桥接还是旧版本，没有 /api/life 端点 —— 重启一次桥接即可。'
+      : (r.error || `桥接返回 HTTP ${r.status}`)
+    return json(res, 200, { ok: false, error: hint })
+  }
+  return json(res, 200, r.data || { ok: false, error: '桥接返回空数据' })
+}
+
 // ── 挂载 ────────────────────────────────────────────────────────────────────
 
 export function mount(ctx) {
@@ -1664,6 +1688,7 @@ export function mount(ctx) {
     [ROUTES.access, handleAccess],
     [ROUTES.backend, handleBackend],
     [ROUTES.diagnose, handleDiagnose],
+    [ROUTES.life, handleLife],
   ]
 
   const disposers = table.map(([routePath, impl]) =>

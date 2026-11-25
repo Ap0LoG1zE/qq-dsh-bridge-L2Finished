@@ -14,6 +14,20 @@ import * as wait from '../src/v2-wait.js';
 import * as safeFetch from '../src/safe-fetch.js';
 import * as mediaNormalize from '../src/media-normalize.js';
 import * as forward from '../src/forward.js';
+// 生活连续性（2026-11-23）：bridge.js 顶部 import 了 life-clock.js，
+// 而 harness 会**删掉所有 import** 改用 context 注入（见下方 split/reduce 那段）。
+// 不在这里摊入的话，VM 里 `buildNowLineOf` 就是 undefined ——
+// 调用点会抛 `ReferenceError: buildNowLineOf is not defined`，
+// 表现是「所有唤醒词相关的测试全红」，但真实运行环境毫无问题。
+import * as lifeClock from '../src/life-clock.js';
+import * as lifeCircleMod from '../src/life-circle.js';
+import * as lifeSleepMod from '../src/life-sleep.js';
+// 2026-11-25：bridge.js 又接了两个生活模块。harness 会删掉所有 import，
+// 不在这里摊入的话，VM 里那几个名字是 undefined ——
+// 表现是「几乎所有测试一起红 + ReferenceError」，而真实环境毫无问题。
+// 以后 bridge.js 每多一个 life-* / 其它模块 import，这里都要同步加一行。
+import * as lifeWeatherMod from '../src/life-weather.js';
+import * as lifeProactiveMod from '../src/life-proactive.js';
 // slang-learner.js 已随黑话功能下线而删除（qq_slang_* 工具一并移除）。
 // 这里不再 import，改成空对象摊入 —— 保持下面 `...slang` 的写法不破，且不会引到不存在的模块。
 const slang = {};
@@ -187,6 +201,31 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     // 落盘路径：测试要读临时目录里的 social-v2.json 检查字段。
     paths: { socialV2File: SOCIAL_V2_FILE, stateDir: STATE_DIR },
     buildWakePromptV2, buildWakeSnapshotV2, sendWakePromptV2, socialV2,
+    // 主动唤醒的 tier 额度制（2026-11-23）：测试要断言「档位 → tier → 额度」这条链，
+    // 以及「未回应只按 expected 路由记账」「额度是硬上限」这两条语义。
+    // 不导出的话只能靠等定时器真的触发，既慢又测不稳。
+    proactiveTierOf, proactiveQuotaOf, proactiveTodayCount, proactiveUnansweredOf,
+    proactiveUnansweredTotal, proactiveState, recordProactiveSentV2, resetUnansweredV2,
+    pickProactiveRouteV2, scheduleProactiveCheckV2,
+    // 间隔公式与档位表：测试要断言「未回应只会让间隔变大」「封顶真的生效」
+    // 「越亲密涨幅越大」这三条，直接算比等定时器快几千倍。
+    proactiveGapMsOf, PROACTIVE_TIERS,
+    // 2026-11-24 新增：时段权重 / daypart 计数 / 剩余额度压力。
+    // 这三块决定"她多久说一次"，调参全靠它们，必须能被直接断言。
+    hourActivityFactor, HOUR_ACTIVITY_WEIGHT, quotaPressureFactor,
+    daypartOfMinute, DAYPARTS, daypartGapOverride, proactiveDaypartCounts,
+    bumpProactiveDaypartCount,
+    // 额度换算（2026-11-23 四次修订）：额度不再是随机抽样，而是
+    // 「档内百分比 → 三等分取值」。测试要断言：
+    //   依赖档 0–33% 是 4、33–66% 是 5、66–100% 是 6。
+    quotaFromBand,
+    // 身体状态 / 睡眠（2026-11-23）：测试要模拟「睡了→醒来」并断言
+    // 起床状态只进一轮唤醒词。需要能清进程内缓存（否则读到的是旧值）。
+    settleLifeCircle,
+    takePendingSleepWake,
+    lifeCircleCacheReset: () => { lifeCircleCache = null; },
+    readLifeCircle,
+    writeLifeCircle,
     // 快照渲染与发送者标签：唤醒词（buildWakePromptV2）**不含**消息快照，
     // 快照是在投递时由 renderWakeSnapshotV2 拼上去的。要断言"消息行长什么样"
     // 必须单独测这两个，否则测出来的永远是空的。
@@ -340,6 +379,26 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     isStickerLike: _isStickerLike,
     describeInlineImage: _describeInlineImage,
     stickerLabelFromSummary: _stickerLabelFromSummary,
+    // 生活连续性（2026-11-23）：bridge.js 顶部 import 了
+    //   import { buildNowLine as buildNowLineOf } from './life-clock.js'
+    // VM 里没有模块解析，必须在这里按**别名**注入，否则调用点抛
+    // `ReferenceError: buildNowLineOf is not defined`。
+    // 只注入 bridge.js 真正用到的那个；以后它再 import 别的，这里要同步加。
+    buildNowLineOf: lifeClock.buildNowLine,
+    // 身体状态 / 睡眠（2026-11-23）：bridge.js 顶部从 life-circle.js / life-sleep.js
+    // import 了这些，VM 里靠这里注入。名字必须和 bridge.js 的 import 别名一致。
+    defaultLifeCircle: lifeCircleMod.defaultCircle,
+    normalizeLifeCircle: lifeCircleMod.normalizeCircle,
+    settleLifeCircleFn: lifeCircleMod.settleCircle,
+    addToLifeCircleFn: lifeCircleMod.addToCircle,
+    lifeCircleExtras: lifeCircleMod.circleExtras,
+    describeLifeCircle: lifeCircleMod.describeCircle,
+    DEFAULT_OFFLINE_AS_SLEEP_MS: lifeCircleMod.DEFAULT_OFFLINE_AS_SLEEP_MS,
+    buildSleepWakeText: lifeSleepMod.buildWakeText,
+    // 2026-11-25：bridge.js 新接的两个生活模块（名字与 import 别名一致）
+    createWeatherCache: lifeWeatherMod.createWeatherCache,
+    weatherShortText: lifeWeatherMod.weatherShortText,
+    buildProactiveCandidates: lifeProactiveMod.buildProactiveCandidates,
     cleanupTemp: () => {},
     ...globals,
   });

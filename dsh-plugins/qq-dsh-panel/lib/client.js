@@ -277,7 +277,7 @@ window.__ModuleLoader__.load({
       '.dsh-fb-actions{display:flex;gap:8px;align-items:center;margin-top:12px;flex-wrap:wrap}',
       '.dsh-fb-check{display:flex;align-items:center;gap:8px;padding:5px 0;font-size:12.5px;line-height:1.45}',
       // 状态行的成功/警告配色：早先只有 -ok 这个 class 被用过、却从没定义过样式，
-      // 于是"✓ 运行中"一直是裸文本。这里把两个都补上，纯语音的服务状态也要用。
+      // 于是"✓ 运行中"一直是裸文本。这里把两个都补上，语音的服务状态也要用。
       '.dsh-fb-check-ok{color:#3fbf6f}',
       '.dsh-fb-check-warn{color:#d99a2b}',
       '.dsh-fb-dot{flex:none;width:8px;height:8px;border-radius:50%}',
@@ -432,6 +432,39 @@ window.__ModuleLoader__.load({
     'color:var(--dsw-alias-text-secondary,rgba(127,127,127,1))}',
     // 会话列表：每行之间的分隔线收得更轻，避免和开关本身抢视觉
     '.dsh-fb-proact-list .dsh-fb-item + .dsh-fb-item{border-top:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.10))}',
+    // ── 私聊额度详情卡（2026-11-24）────────────────────────────────────
+    // 挂在会话开关下面，视觉上是"这个会话的详情"，不是新的一节。
+    '.dsh-fb-tierwrap{margin:8px 0 2px 34px}',
+    '.dsh-fb-tiercard{padding:10px 12px;border-radius:10px;',
+    'background:var(--dsw-alias-bg-l3,rgba(127,127,127,.07));',
+    'border:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.12));',
+    'display:flex;flex-direction:column;gap:7px}',
+    '.dsh-fb-tierhead{display:flex;align-items:baseline;gap:8px}',
+    '.dsh-fb-tierhead b{font-size:12.5px;color:var(--dsw-alias-text-primary,inherit)}',
+    '.dsh-fb-tiersub{font-size:11px;color:var(--dsw-alias-text-tertiary,rgba(127,127,127,.95))}',
+    // 今日额度进度条
+    '.dsh-fb-tierbar{height:5px;border-radius:999px;overflow:hidden;',
+    'background:var(--dsw-alias-bg-l2,rgba(127,127,127,.14))}',
+    '.dsh-fb-tierfill{height:100%;border-radius:999px;',
+    'background:var(--dsw-alias-brand-primary,#4d6bfe);transition:width .2s ease}',
+    // 用满时换色：不是报错，只是"今天说够了"
+    '.dsh-fb-tierfill.is-full{background:var(--dsw-alias-text-quaternary,rgba(127,127,127,.55))}',
+    '.dsh-fb-tierfacts{display:flex;gap:8px;flex-wrap:wrap}',
+    '.dsh-fb-tierfact{font-size:11px;padding:2px 8px;border-radius:999px;',
+    'background:var(--dsw-alias-bg-l2,rgba(127,127,127,.10));',
+    'color:var(--dsw-alias-text-secondary,rgba(127,127,127,1))}',
+    // 未回应导致放缓：用暖色，和普通信息区分开
+    '.dsh-fb-tierfact.is-warn{background:color-mix(in srgb,var(--dsw-alias-warning-primary,#d97706) 16%,transparent);',
+    'color:var(--dsw-alias-warning-primary,#d97706)}',
+    // 时段分布小柱
+    '.dsh-fb-tierdays{display:flex;gap:10px;align-items:flex-end;padding-top:2px}',
+    '.dsh-fb-tierday{display:flex;flex-direction:column;align-items:center;gap:3px}',
+    '.dsh-fb-tierdaybar{width:12px;border-radius:3px 3px 0 0;',
+    'background:var(--dsw-alias-brand-primary,#4d6bfe);opacity:.8}',
+    '.dsh-fb-tierdaybar.is-empty{background:var(--dsw-alias-bg-l1,rgba(127,127,127,.18));opacity:1}',
+    '.dsh-fb-tierday span{font-size:10px;color:var(--dsw-alias-text-quaternary,rgba(127,127,127,.8))}',
+    '.dsh-fb-tierwarn{font-size:11px;line-height:1.5;',
+    'color:var(--dsw-alias-warning-primary,#d97706)}',
       // 竖线：除最后一条外都画，且从圆点中心往下延伸
       '.dsh-fb-selfspine{flex:none;width:11px;position:relative;display:flex;justify-content:center}',
       '.dsh-fb-selfspine::before{content:"";position:absolute;top:15px;bottom:-9px;width:1px;',
@@ -748,7 +781,10 @@ window.__ModuleLoader__.load({
     { id: 'stickers', label: '表情' },
     { id: 'access', label: '访问控制' },
     { id: 'backend', label: '后端' },
-    { id: 'diagnose', label: '诊断' },
+    // 2026-11-24：原「诊断」页替换成「状态」页。
+    // 诊断那套（自检 / 端点对齐 / 模型）仍有 `id: 'diagnose'` 保留在 URL 路由里，
+    // 需要时可以改回来；页签上先让位给生活状态。
+    { id: 'life', label: '状态' },
   ]
 
   // [字段路径, 显示名, 说明, 附加]
@@ -1241,6 +1277,8 @@ window.__ModuleLoader__.load({
     else if (tabId === 'access') url = f.api + '/access'
     else if (tabId === 'backend') url = f.api + '/backend'
     else if (tabId === 'diagnose') url = f.api + '/diagnose'
+    // 2026-11-24：「状态」页走桥接的 /api/life（生活状态全貌）。
+    else if (tabId === 'life') url = f.api + '/life'
     // 「思考链」页只读插件自己的状态（不经过桥接）。
     // 「状态」页不再显示思考链开关了 —— 它跟 QQ 机器人无关，单独成栏。
     // 但「状态」页仍然并发取一份 think 状态：桥接没跑时 renderTab 会走
@@ -1348,6 +1386,7 @@ window.__ModuleLoader__.load({
     if (mState.tab === 'access') return renderAccessTab(d)
     if (mState.tab === 'backend') return renderBackendTab(d)
     if (mState.tab === 'diagnose') return renderDiagnoseTab(d)
+    if (mState.tab === 'life') return renderLifeTab(d)
   }
 
   function renderStatusTab(d) {
@@ -1366,13 +1405,13 @@ window.__ModuleLoader__.load({
         syncFeature(mState.feature)
       })
     })
-    // 纯语音开关：和上线/下线放同一行 —— 它同样是"她现在怎么说话"的总开关。
+    // 语音开关：和上线/下线放同一行。它是"允不允许她发语音"的许可 ——
     // 打开后她照常打字，桥接把文字合成为睦的声音再发；她自己不知道，人设不受影响。
     var tts = d.tts || {}
     var ttsOn = tts.enabled === true
     var ttsReady = tts.ready === true
     var ttsBtn = h('button', 'dsh-fb-btn' + (ttsOn ? '' : ' ghost'),
-      ttsOn ? '纯语音：开' : '纯语音：关')
+      ttsOn ? '语音：开' : '语音：关')
     ttsBtn.type = 'button'
     ttsBtn.title = ttsOn
       ? (ttsReady ? '她的话会合成为睦的声音发出' : '已开启，但 TTS 服务未就绪，会先退回文字')
@@ -1386,9 +1425,9 @@ window.__ModuleLoader__.load({
         if (!r || !r.ok) {
           toast((r && r.error) || '切换失败')
         } else if (!r.enabled) {
-          toast('纯语音已关闭（她恢复为纯文字）')
+          toast('语音已关闭（她只能打字）')
         } else if (r.ready) {
-          toast(r.started ? '纯语音已开启（TTS 服务已自动拉起）' : '纯语音已开启')
+          toast(r.started ? '语音已开启（TTS 服务已自动拉起）' : '语音已开启')
         } else {
           toast('已开启，但 TTS 服务没起来：' + (r.detail || '未知原因') + '（暂用文字发送）')
         }
@@ -1869,6 +1908,168 @@ window.__ModuleLoader__.load({
     return Math.round(n / 3600000) + ' 小时'
   }
 
+  // 时长（毫秒）→ 「1.5 小时」。用于显示实际间隔。
+  function proactiveDur(ms) {
+    var n = Number(ms)
+    if (!isFinite(n) || n <= 0) return '—'
+    var hh = n / 3600000
+    if (hh < 1) return Math.round(n / 60000) + ' 分钟'
+    return (Math.round(hh * 10) / 10) + ' 小时'
+  }
+
+  // 一天的时段顺序（和后端 daypartOfMinute 的 key 对齐）
+  var PROACTIVE_DAYPARTS = [
+    { key: 'morning', label: '早' },
+    { key: 'noon', label: '午' },
+    { key: 'afternoon', label: '下午' },
+    { key: 'evening', label: '晚' },
+    { key: 'late_night', label: '深夜' },
+  ]
+
+  /**
+   * 私聊的额度制详情卡。
+   *
+   * ── 2026-11-24 新增 ──────────────────────────────────────────────────
+   *
+   * 为什么必须单独做一块：主动机会在私聊早就**不是概率制**了，而是
+   * 「好感度档位 → tier → 每日额度 → 档内按百分比切分」，间隔还受
+   * 时段权重、剩余额度、未回应次数三层影响。
+   *
+   * 面板原来只显示"30% 概率 / 30–90 分钟检查"——那对私聊是**假的**。
+   *
+   * ⚠️ 2026-11-24 二次修订：**全部改用内联样式**。
+   *   第一版用 CSS 类（.dsh-fb-tiercard 等），但面板的 style 元素是
+   *   `if (document.getElementById('dsh-fb-style')) return` 只注入一次，
+   *   热更新场景下新加的类可能拿不到样式 —— 实测就出现了"卡片渲染出来了
+   *   但完全没有排版"（文字挤在一起、没有背景/间距）。
+   *   内联样式不依赖 style 元素的生命周期，在哪都能显示对。
+   *   代价是没法做 :hover/:focus 这类伪类，但这张卡本来就是纯展示。
+   */
+  function renderPrivateTierCard(item) {
+    var t = item.tier
+    var box = h('div', 'dsh-fb-tiercard')
+    // 卡片容器：浅色底 + 圆角 + 内边距，视觉上是"这个会话的详情"
+    box.style.cssText = [
+      'margin:8px 0 2px 34px',
+      'padding:11px 13px',
+      'border-radius:10px',
+      'background:rgba(127,127,127,.07)',
+      'border:1px solid rgba(127,127,127,.13)',
+      'display:flex',
+      'flex-direction:column',
+      'gap:8px',
+    ].join(';')
+
+    // ① 档位 + 分数（左粗右淡，同一行）
+    var top = h('div')
+    top.style.cssText = 'display:flex;align-items:baseline;gap:8px;flex-wrap:wrap'
+    var tierName = h('b', null, (t.label || '—') + '档')
+    tierName.style.cssText = 'font-size:13px;font-weight:600'
+    top.appendChild(tierName)
+    var stageText = h('span', null,
+      (t.stageLabel || '未知') + ' · ' + Math.round(Number(t.score) || 0) + ' 分')
+    stageText.style.cssText = 'font-size:11.5px;opacity:.62'
+    top.appendChild(stageText)
+    box.appendChild(top)
+
+    // ② 今日额度进度条
+    var quota = Number(t.quota) || 0
+    var used = Number(t.usedToday) || 0
+    var pct = quota > 0 ? Math.min(100, Math.round((used / quota) * 100)) : 0
+    var barOuter = h('div')
+    barOuter.style.cssText = [
+      'height:5px', 'border-radius:999px', 'overflow:hidden',
+      'background:rgba(127,127,127,.16)',
+    ].join(';')
+    var barFill = h('div')
+    barFill.style.cssText = [
+      'height:100%', 'width:' + pct + '%', 'border-radius:999px',
+      // 用满时换成中性灰：不是报错，只是"今天说够了"
+      'background:' + (used >= quota && quota > 0
+        ? 'rgba(127,127,127,.55)'
+        : 'var(--dsw-alias-brand-primary,#4d6bfe)'),
+      'transition:width .2s ease',
+    ].join(';')
+    barOuter.appendChild(barFill)
+    box.appendChild(barOuter)
+
+    var quotaText = h('span', null,
+      '今天 ' + used + ' / ' + quota + ' 条'
+      + (quota > 0 ? '（还剩 ' + Math.max(0, quota - used) + ' 条）' : ''))
+    quotaText.style.cssText = 'font-size:11.5px;opacity:.7;margin-top:-3px'
+    box.appendChild(quotaText)
+
+    // ③ 实际间隔 + 被什么放大了（小药丸）
+    var facts = h('div')
+    facts.style.cssText = 'display:flex;gap:7px;flex-wrap:wrap'
+    var pill = function (text, warm) {
+      var el = h('span', null, text)
+      el.style.cssText = [
+        'font-size:11px', 'padding:2px 9px', 'border-radius:999px',
+        warm
+          ? 'background:rgba(217,119,6,.16);color:#d97706'
+          : 'background:rgba(127,127,127,.12);opacity:.85',
+      ].join(';')
+      return el
+    }
+    facts.appendChild(pill('当前间隔 ' + proactiveDur(t.gapMs), false))
+    if (Number(t.unanswered) > 0) {
+      facts.appendChild(pill('没回 ' + t.unanswered + ' 次 · 已放缓', true))
+    }
+    if (Number(t.gapLayers && t.gapLayers.hourFactor) > 1) {
+      facts.appendChild(pill('这个点偏安静', false))
+    }
+    box.appendChild(facts)
+
+    // ④ 今天各时段发了几条（小柱状）
+    var dp = t.dayparts || {}
+    var hasAny = false
+    for (var di = 0; di < PROACTIVE_DAYPARTS.length; di++) {
+      if (Number(dp[PROACTIVE_DAYPARTS[di].key]) > 0) { hasAny = true; break }
+    }
+    if (hasAny) {
+      var bars = h('div')
+      bars.style.cssText = 'display:flex;gap:10px;align-items:flex-end;padding-top:3px'
+      var maxN = 1
+      for (var mi2 = 0; mi2 < PROACTIVE_DAYPARTS.length; mi2++) {
+        maxN = Math.max(maxN, Number(dp[PROACTIVE_DAYPARTS[mi2].key]) || 0)
+      }
+      for (var pi = 0; pi < PROACTIVE_DAYPARTS.length; pi++) {
+        (function (part) {
+          var n = Number(dp[part.key]) || 0
+          var cell = h('div')
+          cell.style.cssText = 'display:flex;flex-direction:column;align-items:center;gap:3px'
+          var col = h('div')
+          col.style.cssText = [
+            'width:12px',
+            'height:' + Math.max(3, Math.round((n / maxN) * 26)) + 'px',
+            'border-radius:3px 3px 0 0',
+            // 没发过的时段用浅灰，发过的用品牌色 —— 一眼看出"哪个时段没动静"
+            'background:' + (n === 0
+              ? 'rgba(127,127,127,.20)'
+              : 'var(--dsw-alias-brand-primary,#4d6bfe)'),
+            'opacity:' + (n === 0 ? '1' : '.8'),
+          ].join(';')
+          cell.appendChild(col)
+          var lab = h('span', null, part.label + (n > 0 ? String(n) : ''))
+          lab.style.cssText = 'font-size:10px;opacity:.6'
+          cell.appendChild(lab)
+          bars.appendChild(cell)
+        })(PROACTIVE_DAYPARTS[pi])
+      }
+      box.appendChild(bars)
+    }
+
+    // ⑤ 额度为 0 时说明原因（不然开关开了却从不冒泡，像 bug）
+    if (quota <= 0) {
+      var warn = h('span', null,
+        '这个档位（' + (t.stageLabel || '当前') + '）的主动额度是 0：关系还没走到能主动的位置。')
+      warn.style.cssText = 'font-size:11.5px;line-height:1.55;color:#d97706'
+      box.appendChild(warn)
+    }
+    return box
+  }
+
   function renderProactiveTab(d) {
     var g = d.global || {}
     var list = Array.isArray(d.sessions) ? d.sessions : []
@@ -1899,14 +2100,30 @@ window.__ModuleLoader__.load({
     headTop.appendChild(h('b', null, globalOff ? '主动机会：全局已关闭' : '主动机会：全局开启'))
     head.appendChild(headTop)
 
+    // ── 2026-11-24：说明文案分两种 ──────────────────────────────────────
+    // 原来只有一段"群安静够久 + 概率命中"，但私聊现在是**额度制**，
+    // 那段话对私聊完全是错的。这里按"有没有私聊会话"分别说明。
+    var hasPrivate = false
+    for (var hp = 0; hp < list.length; hp++) {
+      if (String(list[hp].key || '').indexOf('private:') === 0) { hasPrivate = true; break }
+    }
     var idleMin = Math.round((Number(g.idleThresholdMs) || 900000) / 60000)
     var probPct = Math.round((Number(g.probability) || 0) * 100)
-    head.appendChild(h('span', 'dsh-fb-proact-sub',
-      globalOff
-        ? '在「回复节奏」里把主动机会打开，下面这些开关才会真正起作用。'
-        : '聊天要安静满 ' + idleMin + ' 分钟、且按 ' + probPct + '% 概率命中，她才可能主动开口。'
-          + '每轮检查间隔 ' + Math.round((Number(g.checkIntervalMinMs) || 1800000) / 60000)
-          + '~' + Math.round((Number(g.checkIntervalMaxMs) || 5400000) / 60000) + ' 分钟。'))
+    var subText
+    if (globalOff) {
+      subText = '在「回复节奏」里把主动机会打开，下面这些开关才会真正起作用。'
+    } else if (hasPrivate) {
+      subText = '私聊按额度走：好感度档位决定每天最多几条，档内按分数切分；'
+        + '间隔还会被时段、剩余额度、未回应次数调整。群聊仍是概率制（安静满 '
+        + idleMin + ' 分钟 + ' + probPct + '% 命中，每 '
+        + Math.round((Number(g.checkIntervalMinMs) || 1800000) / 60000) + '~'
+        + Math.round((Number(g.checkIntervalMaxMs) || 5400000) / 60000) + ' 分钟检查一次）。'
+    } else {
+      subText = '聊天要安静满 ' + idleMin + ' 分钟、且按 ' + probPct + '% 概率命中，她才可能主动开口。'
+        + '每轮检查间隔 ' + Math.round((Number(g.checkIntervalMinMs) || 1800000) / 60000)
+        + '~' + Math.round((Number(g.checkIntervalMaxMs) || 5400000) / 60000) + ' 分钟。'
+    }
+    head.appendChild(h('span', 'dsh-fb-proact-sub', subText))
 
     var stat = h('div', 'dsh-fb-proact-stats')
     stat.appendChild(h('span', 'dsh-fb-proact-stat', onCount + ' 个会话允许'))
@@ -1927,7 +2144,18 @@ window.__ModuleLoader__.load({
         var bits = []
         bits.push(proactiveAgo(Number(item.idleMs)))
         if (item.unreadCount > 0) bits.push(item.unreadCount + ' 条未读')
-        if (item.enabled && item.nextCheckInMs != null) {
+        // ⚠️ 2026-11-24 修：原来显示 `nextCheckInMs`（**倒计时**），
+        //    面板每刷新一次数字就变（时间在流逝），看着像"点刷新间隔就变"。
+        //    现在优先显示**绝对时刻**（一次调度内恒定），没有才退回倒计时。
+        if (item.enabled && item.nextCheckAt) {
+          var at = new Date(Number(item.nextCheckAt))
+          if (!isNaN(at.getTime())) {
+            var hh = String(at.getHours()).padStart(2, '0')
+            var mm = String(at.getMinutes()).padStart(2, '0')
+            var left2 = proactiveLeft(Number(item.nextCheckInMs))
+            bits.push('下次检查 ' + hh + ':' + mm + (left2 ? '（还有 ' + left2 + '）' : ''))
+          }
+        } else if (item.enabled && item.nextCheckInMs != null) {
           var left = proactiveLeft(Number(item.nextCheckInMs))
           if (left) bits.push('下次检查还有 ' + left)
         } else if (item.enabled) {
@@ -1959,6 +2187,15 @@ window.__ModuleLoader__.load({
         })
         // 全局关着时开关仍可点（改的是会话级意愿），但视觉上弱化，避免误解。
         if (globalOff) row.style.opacity = '.62'
+
+        // ★ 2026-11-24：私聊在开关下面挂一张额度详情卡。
+        //   放在同一个 .dsh-fb-item 里，这样边框/间距沿用列表样式，
+        //   视觉上"这张卡属于这个会话"，而不是又开了一节。
+        if (!isGroup && item.tier) {
+          var cardItem = h('div', 'dsh-fb-tierwrap')
+          cardItem.appendChild(renderPrivateTierCard(item))
+          row.appendChild(cardItem)
+        }
         wrap.appendChild(row)
       })(list[i])
     }
@@ -2825,6 +3062,214 @@ window.__ModuleLoader__.load({
     if (d.elapsedMs) nodes.push(kv('本次检测耗时', d.elapsedMs + 'ms'))
     nodes.push(actionsRow([{ label: '重新检测', onClick: function () { loadTab('diagnose') } }]))
     setBody(nodes)
+  }
+
+  /* ---------------- 状态页（生活状态） ---------------- */
+
+  /**
+   * 渲染「状态」页：她此刻的身体、周期、天气、心情、以及所有活着的 condition。
+   *
+   * ⚠️ 全部用**内联样式**，不往 style 表里加类。
+   *    原因见 renderTierCard 上面的注释：面板的 style 元素是
+   *    `if (document.getElementById('dsh-fb-style')) return` 只注入一次，
+   *    插件热重载时新加的 CSS 类不会生效。
+   */
+  function renderLifeTab(d) {
+    if (!d) return setBody([h('div', 'dsh-fb-warn', '没有拿到数据')])
+    if (d.ok !== true) {
+      return setBody([
+        section('状态', [h('div', 'dsh-fb-warn', d.error || '读取失败')]),
+        actionsRow([{ label: '重新读取', onClick: function () { loadTab('life') } }])
+      ])
+    }
+
+    var nodes = []
+
+    // ── 顶部：现在几点 + 天气 ──
+    var headBits = []
+    if (d.clock) headBits.push(d.clock)
+    if (d.weather) {
+      var w = d.weather.text + ' ' + d.weather.tempC + '°'
+      if (d.weather.feelsC != null && d.weather.feelsC !== d.weather.tempC) w += '（体感 ' + d.weather.feelsC + '°）'
+      if (d.weather.stale) w += ' · 可能过期'
+      headBits.push(w)
+    }
+    var head = h('div', null, headBits.join('　'))
+    head.style.cssText = 'font-size:13px;font-weight:600;margin-bottom:2px'
+    var headSub = h('div', null, '时区 ' + (d.timezone || '—') + '　当天 ' + (d.dayKey || '—'))
+    headSub.style.cssText = 'font-size:11px;opacity:.55;margin-bottom:12px'
+    nodes.push(head, headSub)
+
+    // ── 身体三维：三条横条 ──
+    var c = d.circle || {}
+    nodes.push(section('身体', [
+      lifeBar('饱腹', c.satiety, {
+        // 饥饿侧：越低越该吃。颜色按"需要关注"来配，不按数值高低。
+        tone: c.satiety < 20 ? '#dc2626' : c.satiety < 50 ? '#d97706' : '#16a34a',
+        note: c.satiety < 20 ? '饿了' : c.satiety < 50 ? '有点饿' : '不饿'
+      }),
+      lifeBar('精力', c.energy, {
+        tone: c.energy < 20 ? '#dc2626' : c.energy < 45 ? '#d97706' : '#16a34a',
+        note: (c.energyBase != null && c.energyBase !== c.energy)
+          ? ('叠加后 ' + c.energy + '，原始 ' + c.energyBase)
+          : ''
+      }),
+      lifeBar('性欲', c.desire, {
+        tone: '#8b5cf6',
+        note: c.desire >= 80
+          ? (d.cycle && d.cycle.inPeriod ? '（经期中，不显示）' : '（会显示）')
+          : '（低于 80 不显示）'
+      }),
+      (function () {
+        var row = h('div', null, c.asleep === true ? '💤 正在睡' : '☀️ 醒着')
+        row.style.cssText = 'font-size:11.5px;opacity:.7;padding-top:4px'
+        return row
+      })()
+    ]))
+
+    // ── 心情 ──
+    if (d.mood) {
+      var moodRow = h('div', null, d.mood)
+      moodRow.style.cssText = 'font-size:15px;font-weight:600;color:#8b5cf6;padding:2px 0 6px'
+      nodes.push(section('心情', [moodRow]))
+    }
+
+    // ── 生理周期 ──
+    if (d.cycle) {
+      var cy = d.cycle
+      var cycleRows = []
+      // 六期进度条：小圆点串起来，当前那期高亮
+      var PHASES = [
+        ['menstrual', '月经'], ['follicular', '卵泡'], ['pre_ovulation', '排卵前'],
+        ['ovulation', '排卵'], ['luteal', '黄体'], ['pms', 'PMS']
+      ]
+      var strip = h('div')
+      strip.style.cssText = 'display:flex;gap:4px;margin:6px 0 10px'
+      for (var pi = 0; pi < PHASES.length; pi++) {
+        var pid = PHASES[pi][0]
+        var pname = PHASES[pi][1]
+        var on = pid === cy.phase
+        var cellEl = h('div', null, pname)
+        cellEl.style.cssText = [
+          'flex:1', 'text-align:center', 'font-size:10.5px', 'padding:5px 2px',
+          'border-radius:5px',
+          on
+            ? 'background:#dc2626;color:#fff;font-weight:600'
+            : 'background:rgba(127,127,127,.12);opacity:.62'
+        ].join(';')
+        strip.appendChild(cellEl)
+      }
+      cycleRows.push(strip)
+      cycleRows.push(kv('当前', cy.phaseName + ' · 第 ' + cy.dayInCycle + ' / ' + cy.cycleDays + ' 天'))
+      cycleRows.push(kv('距下次', cy.daysToNextPeriod + ' 天'))
+      cycleRows.push(kv('该期精力偏移', (cy.energyMedian >= 0 ? '+' : '') + cy.energyMedian))
+      if (cy.mark) {
+        var markRow = h('div', null, cy.mark)
+        markRow.style.cssText = 'font-size:12px;line-height:1.6;color:#dc2626;padding-top:4px'
+        cycleRows.push(markRow)
+      }
+      nodes.push(section('生理周期', cycleRows))
+    }
+
+    // ── 活跃 condition ──
+    var conds = Array.isArray(d.conditions) ? d.conditions : []
+    if (conds.length) {
+      var condNodes = []
+      for (var i = 0; i < conds.length; i++) {
+        var cc = conds[i]
+        var card = h('div')
+        card.style.cssText = [
+          'padding:8px 10px', 'margin:5px 0', 'border-radius:7px',
+          'background:rgba(127,127,127,.08)',
+          'border-left:3px solid ' + lifeKindColor(cc.kind)
+        ].join(';')
+        var line1 = h('div', null, cc.label || cc.kind)
+        line1.style.cssText = 'font-size:12.5px;line-height:1.5'
+        var line2 = h('div')
+        var bits = []
+        bits.push(cc.kind)
+        if (cc.energyDelta) bits.push((cc.energyDelta > 0 ? '+' : '') + cc.energyDelta + ' 精力')
+        if (cc.mood) bits.push('心情 ' + cc.mood)
+        if (cc.intensity != null) bits.push('权重 ' + cc.intensity)
+        bits.push('剩 ' + (cc.remainMinutes >= 60
+          ? Math.floor(cc.remainMinutes / 60) + ' 小时 ' + (cc.remainMinutes % 60) + ' 分'
+          : cc.remainMinutes + ' 分'))
+        line2.textContent = bits.join('　')
+        line2.style.cssText = 'font-size:10.5px;opacity:.6;margin-top:3px'
+        card.appendChild(line1)
+        card.appendChild(line2)
+        condNodes.push(card)
+      }
+      nodes.push(section('叠加状态（' + conds.length + ' 条）', condNodes))
+    } else {
+      var empty = h('div', null, '没有叠加状态 —— 此刻只有身体三维在起作用')
+      empty.style.cssText = 'font-size:11.5px;opacity:.55;padding:4px 0'
+      nodes.push(section('叠加状态', [empty]))
+    }
+
+    // ── 开关与今日记录 ──
+    var f = d.flags || {}
+    var flagText = []
+    flagText.push(f.circle ? '身体✓' : '身体✗')
+    flagText.push(f.cycle ? '周期✓' : '周期✗')
+    flagText.push(f.health ? '健康✓' : '健康✗')
+    flagText.push(f.sleep ? '睡眠✓' : '睡眠✗')
+    flagText.push(f.discomfort ? '不适✓' : '不适✗')
+    flagText.push(f.meals ? '饭点✓' : '饭点✗')
+    flagText.push(f.weather ? '天气✓' : '天气✗')
+    var flagRow = h('div', null, flagText.join('　'))
+    flagRow.style.cssText = 'font-size:11px;opacity:.65;line-height:1.7'
+
+    var m = d.meta || {}
+    var metaRows = [flagRow]
+    metaRows.push(kv('今天已掷', '不适 ' + (m.lastDiscomfortRoll || '—')
+      + '　健康 ' + (m.lastHealthRoll || '—')
+      + '　睡眠 ' + (m.lastSleepDay || '—')))
+    if (m.lastSleepHours) metaRows.push(kv('上次睡眠时长', m.lastSleepHours + ' 小时'))
+    nodes.push(section('设置与记录', metaRows))
+
+    nodes.push(actionsRow([{ label: '刷新', onClick: function () { loadTab('life') } }]))
+    setBody(nodes)
+  }
+
+  /** 一条带横条的状态维度。 */
+  function lifeBar(name, value, opts) {
+    opts = opts || {}
+    var v = Math.max(0, Math.min(100, Number(value) || 0))
+    var wrap = h('div')
+    wrap.style.cssText = 'margin:7px 0'
+    var top = h('div')
+    top.style.cssText = 'display:flex;justify-content:space-between;align-items:baseline;font-size:12px;margin-bottom:4px'
+    var left = h('span', null, name)
+    left.style.cssText = 'font-weight:600'
+    var right = h('span', null, String(v) + (opts.note ? '　' + opts.note : ''))
+    right.style.cssText = 'font-size:11px;opacity:.68'
+    top.appendChild(left)
+    top.appendChild(right)
+    var outer = h('div')
+    outer.style.cssText = 'height:6px;border-radius:3px;background:rgba(127,127,127,.16);overflow:hidden'
+    var fill = h('div')
+    fill.style.cssText = 'height:100%;width:' + v + '%;border-radius:3px;background:'
+      + (opts.tone || '#16a34a') + ';transition:width .25s'
+    outer.appendChild(fill)
+    wrap.appendChild(top)
+    wrap.appendChild(outer)
+    return wrap
+  }
+
+  /** condition 类型 → 左边色条颜色。 */
+  function lifeKindColor(kind) {
+    var map = {
+      cycle_discomfort: '#dc2626',
+      health: '#ea580c',
+      sleep: '#2563eb',
+      sleep_afterglow: '#0ea5e9',
+      meal: '#ca8a04',
+      care_warmth: '#db2777',
+      cycle_recovery: '#7c3aed',
+      afterglow: '#64748b'
+    }
+    return map[kind] || '#6b7280'
   }
 
   /* ---------------- toast ---------------- */

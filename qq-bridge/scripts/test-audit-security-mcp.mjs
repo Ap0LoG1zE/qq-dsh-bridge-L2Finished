@@ -192,7 +192,9 @@ test('object-shaped bridge errors are rendered readably, not as [object Object]'
     { ok: false, error: { code: 'send/rejected', message: '消息含敏感信息，已阻止发送' } },
     { status: 200 },
   ));
-  const result = await callTool('qq_send_group_message', { groupId: '456', message: 'fixture' });
+  // 2026-11-23：qq_send_group_message 已删除（现在只有二代，发送走 qq_send_message）。
+  // 这条测试只验证「错误文本可读」，换成同样走 agentApi 的 qq_reply 即可。
+  const result = await callTool('qq_reply', { groupId: '456', replyToMessageId: 1, message: 'fixture' });
   assert.equal(result.isError, true);
   const text = String(result.content[0].text);
   assert.ok(!/\[object Object\]/.test(text), `错误文本不得是不可读的对象：${text}`);
@@ -207,7 +209,9 @@ test('a bridge 200 with ok:false is reported to the model as a failure', async (
     { ok: false, error: '消息含敏感信息，已阻止发送' },
     { status: 200 },
   ));
-  const result = await callTool('qq_send_group_message', { groupId: '456', message: 'fixture' });
+  // 2026-11-23：qq_send_group_message 已删除（现在只有二代，发送走 qq_send_message）。
+  // 这条测试只验证「错误文本可读」，换成同样走 agentApi 的 qq_reply 即可。
+  const result = await callTool('qq_reply', { groupId: '456', replyToMessageId: 1, message: 'fixture' });
   assert.equal(result.isError, true, 'ok:false 必须作为工具错误返回');
   assert.match(result.content[0].text, /阻止发送/);
 });

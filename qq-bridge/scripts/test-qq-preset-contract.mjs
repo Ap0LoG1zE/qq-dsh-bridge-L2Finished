@@ -52,21 +52,31 @@ test('压缩边界与工具剪枝保持不变', () => {
   assert.deepEqual(compaction.config.find((row) => row.id === 'tool-result-pruner').config, {
     thresholdChars: 50000, headChars: 45000, tailChars: 2000,
   });
-  // 压缩边界（2026-10-28 重定）：**对话进行中绝不压缩**。
-  // 旧值 0.15（≈15 万触发）会让上下文长期骑在阈值上方，每隔两三步就压一次；
-  // 压缩改写历史前缀 → provider 的 KV cache 整段失效 → 之后每步重算全部历史
-  // （实测 45~55 秒/步）。所以阈值抬到 0.95（≈95 万，正常会话到不了）只当
-  // 安全阀，真正的压缩由桥接在「闲置边界」主动触发（bridge.js idleCompactV2）。
+  // 压缩边界（2026-11-25 第三次重定）：**改回靠 DSH 原生压缩**。
+  //
+  // 历史：
+  //   · 2026-10-28 从 0.15 抬到 0.95 —— 那时压缩由桥接的闲置边界主动触发，
+  //     0.95 只当安全阀（对话中压会毁 KV cache，实测 45~55 秒/步）。
+  //   · 2026-11-25 降到 0.5 —— 因为发现 DSH 的 `/compact`（compactNow）
+  //     把 retainTokens **硬编码 0**，闲置压缩实际是"除最后一条外全压掉"，
+  //     用户丢了 1000+ 条对话。所以弃用闲置压缩，改回原生：
+  //     阈值 0.5（50 万）触发，retainTokens 20 万原样保留。
+  //     代价是压缩发生在对话中途、那一步缓存失效 —— 操作者权衡后接受。
   const compactionBasic = compaction.config.find((row) => row.id === 'compaction-basic').config;
-  // 2026-11-13：操作者把 retain/max 抬到了 200k/20k（原来的 80k/8k 保留太短，
-  // 压缩后容易被压掉太多近期上下文）。thresholdRatio 仍是 0.95 —— 那条是护栏，不跟着变。
   assert.deepEqual(compactionBasic, {
-    thresholdRatio: 0.95, retainTokens: 200000, maxTokens: 20000,
+    thresholdRatio: 0.5, retainTokens: 200000, maxTokens: 20000,
   });
-  // 护栏：任何把阈值调回「对话中会触发」的改动都必须先过这里。
+  // 护栏一：阈值必须明显高于 retainTokens（DSH 会校验 retainTokens < thresholdTokens，
+  // 违反直接抛 TargetPressureConfigError）。按 1M 窗口算 0.5 × 1M = 50 万 > 20 万。
+  const impliedThreshold = 1_000_000 * Number(compactionBasic.thresholdRatio);
   assert.ok(
-    Number(compactionBasic.thresholdRatio) >= 0.9,
-    `thresholdRatio 必须 >= 0.9（对话中不压缩）；当前 ${compactionBasic.thresholdRatio} 会让上下文骑在阈值上反复压缩、把 KV cache 打死`,
+    impliedThreshold > Number(compactionBasic.retainTokens),
+    `thresholdRatio×1M (${impliedThreshold}) 必须大于 retainTokens (${compactionBasic.retainTokens})，否则 DSH 直接抛错`,
+  );
+  // 护栏二：不允许回到"几乎不触发"的 0.9+（那等于不压缩，长聊会爆上下文）。
+  assert.ok(
+    Number(compactionBasic.thresholdRatio) <= 0.8,
+    `thresholdRatio 不该 >= 0.9（那等于永不压缩）；当前 ${compactionBasic.thresholdRatio}`,
   );
 });
 
@@ -101,7 +111,7 @@ test('「教它怎么说话」的通用规则已删除，语气交给角色卡',
 
 // 合并后只有一个 preset，但「压缩边界」这条护栏仍然要有：
 // 任何一档漏改都会让那条会话在对话中压缩 —— 症状是"只有某个会话特别慢"，更难排查。
-test('合并预设的压缩边界：对话进行中不允许触发压缩', () => {
+test('合并预设的压缩边界：阈值与 retainTokens 自洽', () => {
   for (const name of [MERGED]) {
     const doc = yaml.load(fs.readFileSync(
       new URL(`../dsh/agent-presets/${name}/agent.cordis.yml`, import.meta.url), 'utf8',
@@ -109,9 +119,27 @@ test('合并预设的压缩边界：对话进行中不允许触发压缩', () =>
     const group = doc.find((row) => row.id === 'compaction');
     const basic = group?.config?.find((row) => row.id === 'compaction-basic')?.config;
     assert.ok(basic, `${name} 缺少 compaction-basic`);
+
+    // 2026-11-25：从"禁止对话中压缩"改成"阈值与保留量自洽"。
+    //
+    // 改的原因：DSH 的 `/compact` 把 retainTokens 硬编码成 0，
+    // 桥接的闲置压缩实际会清空历史。所以弃用它、改回原生压缩 ——
+    // 而原生压缩**只能**在对话中途触发（由 agent/pre-step 钩子驱动）。
+    // "对话中绝不压缩"这条约束已经不成立，断言必须跟着改，
+    // 否则它会逼着把阈值调回 0.95（= 永不压缩 = 长聊爆上下文）。
+    const ratio = Number(basic.thresholdRatio);
+    const retain = Number(basic.retainTokens);
+    assert.ok(ratio > 0 && ratio < 1, `${name} 的 thresholdRatio 必须在 (0,1)：${ratio}`);
+    // 按 1M 窗口换算，阈值必须严格大于保留量（DSH 会校验，违反直接抛错）。
+    const implied = 1_000_000 * ratio;
     assert.ok(
-      Number(basic.thresholdRatio) >= 0.9,
-      `${name} 的 thresholdRatio=${basic.thresholdRatio}：对话中途会触发压缩，必须 >= 0.9`,
+      implied > retain,
+      `${name}：thresholdRatio×1M (${implied}) 必须 > retainTokens (${retain})，否则 DSH 抛 TargetPressureConfigError`,
+    );
+    // 也不允许"永不触发"：>=0.9 等于不压缩，长聊会爆上下文。
+    assert.ok(
+      ratio <= 0.8,
+      `${name} 的 thresholdRatio=${ratio} 太高（>=0.9 等于永不压缩）；当前设计是 0.5`,
     );
   }
 });
@@ -135,8 +163,8 @@ test('snapshots are optional, partial snapshots require reading, and watermarks 
   // ③ 是重新加回来的（操作者在别的会话补了一条准备动作）。
   // 这里只钉「这一节存在」，用 . 代替具体数字：数字会随内容增减变，钉死只会反复误报。
   assert.match(prefix, /【新会话 \/ 刚压缩完：先拿这.样东西】/);
-  assert.match(prefix, /① \*\*调 qq_get_prompt\*\*/);
-  assert.match(prefix, /② \*\*调 qq_memory_query\*\*/);
+  assert.match(prefix, /① 调 qq_get_prompt/);
+  assert.match(prefix, /② 调 qq_memory_query/);
   assert.ok(!prefix.includes('这一步不用调工具'),
     '「看【本轮消息】」是每轮都该做的，不该塞进"新会话专属"这一节');
   // 2026-11-12 精简：预设是给她看的，不是给维护者看的。
@@ -149,7 +177,12 @@ test('snapshots are optional, partial snapshots require reading, and watermarks 
 
 test('one closing action acknowledges the read watermark without an observation wait', () => {
   assert.match(prefix, /qq_mark_read\(throughSeq=/);
-  assert.match(prefix, /qq_set_wake_config\(throughSeq=…, config=…\)/);
+  // 2026-11-23：**收尾只剩 qq_mark_read 一条路**。
+  //   触发器冻结之后 qq_set_wake_config 不再收 throughSeq 起作用的位置感，
+  //   预设也把收尾判据统一成 qq_mark_read（见【收尾】那节）。
+  //   原来钉的 `qq_set_wake_config(throughSeq=…, config=…)` 已经不存在，
+  //   继续钉它等于要求"留着一条已经废弃的收尾方式"。
+  assert.match(prefix, /qq_set_wake_config/);
   // 2026-11-12（操作者在别的会话重写了这一节）：
   //   · 段名从【等、回与沉睡前观察】改成【等、回与收尾】——"观察窗口"这个概念退役了。
   //   · 收尾结果多了 suggestedThroughSeq（放弃那几条新消息的入口）。
@@ -201,7 +234,15 @@ test('social autonomy and visual, forwarding, sticker and web capabilities remai
     '每条只能一张，不能附带文字', '不要频繁拍',
     // 2026-11-13：操作者又把这节改成了【纯语音】，并加上 qq_set_voice（只有主人能开关）。
     // 断言跟着**当前能力面**走：语音是"打字自动合成"，不是她去调发语音工具。
-    '【纯语音】', '你打的字会被自动转成你的声音发出去', 'qq_set_voice',
+    //
+    // 2026-11-21 / 11-23 再改：语音从「开关开着就把所有字都转语音」变成**按需**——
+    //   她想用声音说话时，先 qq_set_voice 打开，再给 qq_send_message 带 voice:true。
+    //   于是旧断言钉的两句（`【纯语音】`、`你打的字会被自动转成你的声音发出去`）
+    //   在当前预设里已经不存在了。
+    // ⚠️ 这里要钉的是**能力线索**，不是某一次的标题：
+    //   只要「有个开关 + 发送时要显式带 voice:true + 没开就退回打字」这三件事还在，
+    //   能力面就没退。反过来，如果哪天真的删掉语音，下面两条会立刻红。
+    '【语音】', 'qq_set_voice', 'voice:true', '就会退回打字',
     'mcp__web-search-safe__web_search', 'mcp__web-search-safe__web_fetch',
   ]) assert.ok(prefix.includes(text), `missing capability or voice rule: ${text}`);
 
@@ -234,11 +275,16 @@ test('autonomy limits and the observation escape hatch stay described', () => {
     // 2026-11-12 精简：五类记忆统一成「- **类别** …」的格式，标题也加了总纲。
     // 删掉了一条纯劝说的（原「这两类写下来是有回报的」）—— 它只是把
     // activeTopic/pendingThought 的说明又复述一遍，没有新信息。
-    '按「多久之后还成立」分五类',
-    '**selfNote** 只有你能写',
+    // 2026-11-24：**轻量记忆只剩四类** —— activeTopic / pendingThought 从记忆
+    // 体系里整体移除（全库累计只写过一两条，她从不回头查，等于纯噪音）。
+    // 那两条断言（「还活着的话题」「想说没说出口的那一句」）跟着删掉：
+    // 钉一个已经不存在的类别，只会让测试永远红着，而能力面并没有退。
+    '按「多久之后还成立」分四类',
+    'selfNote 只有你能写',
     // memberImpression 的断言见下面（2026-11-20 操作者改成「记对一个人的印象」开头）
-    '**activeTopic** 记这个聊天里还活着的话题', '24 小时没人再提自动消失',
-    '**pendingThought** 记你此刻想说还没说出口的那一句', '2 小时后就没了',
+    // 记错了要能删：删除入口（qq_memory_remove）必须还在预设里，否则错的印象
+    // 会跟着一个人留几个月 —— 这是四类精简后唯一还需要"反向操作"的地方。
+    'qq_memory_remove', '别让一条错的印象留几个月',
     // 2026-11-12：target 从「填群名片」放宽成「填人名」（私聊没有群名片）。
     // 并纠正「同一个人只该有一条印象」——实际每人最多 10 条，满了顶掉最早的。
     // 2026-11-17：`ccab978 refactor(memory)` 把【记忆卫生】大幅精简 —— 五类记忆
@@ -251,9 +297,9 @@ test('autonomy limits and the observation escape hatch stay described', () => {
     // 改开头之后就不匹配了。断言要钉**当前文案里真正承载规则的那一句**。
     '记对一个人的印象，记具体小事，不记空泛评价，用 target 指定是谁',
     // 2026-11-12 精简：todo 那条改成粗体类别名开头，判断标准单独成段（原来挤在列表项缩进里）。
-    '**todo** 一两天内要兑现的事', 'extra.dueAtMs', 'extra.done=true',
+    'todo 一两天内要兑现的事', 'extra.dueAtMs', 'extra.done=true',
     '这事过了两三天还成立吗',
-    '**longTerm** 几个月后仍成立的事', 'extra.tag',
+    'longTerm 几个月后仍成立的事', 'extra.tag',
     // 旧工具已删除，预设里不能再出现它的名字（否则模型会去调一个不存在的工具）。
     // 这条是**反向**断言，放在最后单独检查。
     // 黑话面：slang-learner.js 与整个「黑话学习」子系统已删除，qq_slang_query/qq_slang_submit
@@ -268,7 +314,16 @@ test('autonomy limits and the observation escape hatch stay described', () => {
     // 指定成员唤醒
     // 2026-11-12 精简：查人那段原来解释了"桥接怎么维护别名表"，那是给她看的预设里
     // 不该出现的实现细节。现在只留操作指令 + 一条禁令，措辞也跟着变了。
-    'triggers.speakerIds', '不要凭记忆编号',
+    //
+    // 2026-11-23 改：触发器全局冻结（FIXED_WAKE_TRIGGERS），`triggers.speakerIds`
+    // 从此不归她调。
+    // 2026-11-25（操作者）：**不要再往预设里写「唤醒条件是固定的 / 别再传 triggers」**。
+    //   · 她当然可以调 qq_set_wake_config —— 那工具就是让她自己定"下次什么时候醒"的；
+    //     写成"别传 triggers"读起来像在劝她别用这个工具。
+    //   · 而且这是纯说明性文本：传了不会改变结果，说了也不改变行为，只占字符。
+    //   现在钉的是那一节**真正在教她怎么用工具**的那句。
+    '由你自己定：下次什么时候被主动叫醒',
+    '不要凭记忆编号',
     'qq_get_userid(query=那个人名)', '不要拉群成员名单',
   ]) assert.ok(prefix.includes(text), `missing rule: ${text}`);
 

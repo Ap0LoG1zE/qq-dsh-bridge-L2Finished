@@ -62,4 +62,55 @@ if (process.argv.includes('--live')) {
   }
 }
 
+
+// ── 回归（2026-11-21）：换行必须转成句号 ──────────────────────────────────
+// 她发的那条 25 秒语音断在"和你分享生活中的各种"，后面 31 字全没了。
+// 根因不是模型，是**预处理把换行当成空白压掉了**：
+//   换行是她的分句信号，压成空格后变成一整段无标点长句，
+//   how_to_cut='凑四句一切' 找不到边界 → 整段一次过模型 → 超长被截。
+// 实测：同一段文本，压空格 22.82 秒（截断）；转句号 35.66 秒（完整）。
+{
+  const ttsSrc = fs.readFileSync(new URL('../src/tts.js', import.meta.url), 'utf8')
+  assert.ok(
+    ttsSrc.includes("replace(/\\s*\\n\\s*/g, '。')"),
+    'tts.js 应把换行转成句号（否则长文本会被切句逻辑当成一整段，导致截断）',
+  )
+  // 反例：整段无标点的文本，必须能被预处理加上边界
+  assert.ok(
+    !/const clean = String\(text \?\? ''\)\.replace\(\/\\s\+\/g, ' '\)/.test(ttsSrc),
+    '不该再直接把所有空白压成空格 —— 那会吃掉换行这个分句信号',
+  )
+}
+ok('长文本换行转句号（防止超长被截断）')
+
+
+// ── 回归（2026-11-21）：voice:true 参数链路 ────────────────────────────
+// 操作者要求：她可以给 qq_send_message 带 voice:true 发语音；默认打字。
+// 语音没开时**自动退回打字**（不报错、不吞消息）。
+{
+  const ROOT2 = new URL('..', import.meta.url)
+  const bridgeSrc = fs.readFileSync(new URL('../src/bridge.js', import.meta.url), 'utf8')
+  const mcpSrc = fs.readFileSync(new URL('../src/mcp-snowluma-safe.js', import.meta.url), 'utf8')
+
+  // ① 桥接：onebotSend 要有 wantVoice，判定必须是「她要求 + 开关开着」
+  assert.ok(bridgeSrc.includes('wantVoice = false'), 'onebotSend 应接受 wantVoice 参数')
+  assert.ok(bridgeSrc.includes('const canVoice = wantVoice === true'), '语音判定应以"她显式要求"为前置条件，不能只看全局开关')
+  assert.ok(bridgeSrc.includes('opts.voice === true'), 'sendMessagesV2 应把 opts.voice 传给 onebotSend')
+  assert.ok(bridgeSrc.includes('const wantVoice = body.voice === true;'), '发送端点应读 body.voice')
+
+  // ② MCP 工具暴露 voice 参数
+  assert.ok(mcpSrc.includes('voice: z.boolean().optional()'), 'qq_send_message 应暴露 voice 参数')
+  assert.ok(mcpSrc.includes('voice: voice === true'), 'MCP 应把 voice 传给桥接端点')
+
+  // ③ 不再叫「纯语音」
+  assert.ok(!bridgeSrc.includes('纯语音'), 'bridge.js 不该再有「纯语音」字样')
+  assert.ok(!mcpSrc.includes('纯语音'), 'mcp-snowluma-safe.js 不该再有「纯语音」字样')
+
+  // ④ 降级路径：语音合成不了要退回文字，不能丢消息
+  const i = bridgeSrc.indexOf('const recordSegment = canVoice')
+  const seg = bridgeSrc.slice(i, i + 400)
+  assert.ok(seg.includes("type: 'text'"), '语音不可用时应退回 text 段，不能吞掉消息')
+}
+ok('voice:true 参数链路（默认打字，语音开关未开自动降级）')
+
 console.log(`\nTTS 测试通过：${pass} 项`);

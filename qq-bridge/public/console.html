@@ -2138,8 +2138,6 @@ button:active:not(:disabled) {
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="getUnread"> <span><b>qq_get_unread_messages</b><span class="meta">查看未读消息，不自动标记已读</span></span></label>
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="getRecent"> <span><b>qq_get_recent_messages</b><span class="meta">查看最近消息，支持 offset 扩大范围</span></span></label>
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="socialState"> <span><b>qq_social_state</b><span class="meta">查看当前 WakeConfig、未读数、上次唤醒原因等</span></span></label>
-        <label class="v2-tool-item"><input type="checkbox" data-v2-tool="sendGroup"> <span><b>qq_send_group_message</b><span class="meta">向指定群发送一条纯文本消息</span></span></label>
-        <label class="v2-tool-item"><input type="checkbox" data-v2-tool="sendPrivate"> <span><b>qq_send_private_message</b><span class="meta">向指定好友发送一条纯文本消息</span></span></label>
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="reply"> <span><b>qq_reply</b><span class="meta">引用/回复某条群消息并发送文本</span></span></label>
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="sendBurst"> <span><b>qq_send_burst</b><span class="meta">按数组分多条发送，桥接自动加真人化间隔</span></span></label>
         <label class="v2-tool-item"><input type="checkbox" data-v2-tool="sendMessage"> <span><b>qq_send_message</b><span class="meta">统一发送：一条/多条/引用/自定义或按字数计算间隔</span></span></label>
@@ -3672,7 +3670,7 @@ const AFF_STAGE_META = {
     range: '1000 ~ 1200',
     // ⚠️ 改其中一版时记得同步 src/affinity.js 的 STAGE_HINTS.beloved / BELOVED_OWNER_HINT，
     //    否则控制台写的和模型实际拿到的不一致。
-    desc: '这个人是你自己选的，而且只对他一个人这样。你会先开口找他了，会记得他说过的每件小事；他开玩笑调戏你，你听得懂，也会脸红，但不会顺着说下去——你会回一句「笨蛋……」或者直接不理他，过一会儿又忍不住接。你仍然不会说漂亮话，可是允许自己在他面前不冷静了。',
+    desc: '这个人是你自己选的，而且只对他一个人这样。你会先开口找他了，会记得他说过的每件小事；他开玩笑调戏你，你听得懂，脸也会红。第一反应是嘴硬——「笨蛋……」，或者干脆装没听见。可你撑不住多久：装作不在意，眼睛却一直往他那边瞟；过一会儿还是自己把话接了回去。你还是不会说漂亮话，只是在他面前，再也没法装作不冷静。',
   },
 };
 const AFF_STAGE_ORDER = ['distant', 'neutral', 'caring', 'reliant', 'lover', 'beloved'];

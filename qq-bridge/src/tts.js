@@ -75,8 +75,8 @@ export const TTS_DEFAULTS = Object.freeze({
   // ── 采样与节奏 ──
   // speed 是**倍速**：1.0=原速，<1 变慢。<1 会拖长音频时长（听感更从容），
   //   服务端 slider 允许 0.6~1.65，超出会被它自己夹住。
-  // 2026-11-11：0.85 → 0.95 → 0.9。0.85 听着偏拖，0.95 又有点赶，取中间。
-  speed: 0.9,
+  // 2026-11-21：0.9 → 1.0（原速）。此前 0.85→0.95→0.9 绕了一圈，操作者最终要原速。
+  speed: 1.0,
   // pause_second 是**句间停顿秒数**（0.1~0.5）。整句连读会显得急，
   //   调大一点能听出"喘了口气"，这比单纯降倍速更自然。
   pauseSecond: 0.4,
@@ -416,7 +416,20 @@ export async function ensureSovitsWeights(rawCfg = {}, { log = () => {} } = {}) 
  */
 export async function synthesize(text, rawCfg = {}, { log = () => {}, cacheDir = '' } = {}) {
   const cfg = normCfg(rawCfg);
-  const clean = String(text ?? '').replace(/\s+/g, ' ').trim().slice(0, Number(cfg.maxChars) || 200);
+  // 换行 → 句号，再压空白（2026-11-21 修）。
+  //
+  // 为什么不能直接把所有空白压成空格：她的长文本常用**换行**分句、几乎不打标点，
+  // 压成空格后就变成一整段没边界的长句，how_to_cut 切不开、整段一次过模型，
+  // 超长部分会被静默丢掉（实测无标点 155 字只出 18 秒，带标点 175 字能出 47 秒）。
+  // 换行本来就是我们想要的分句信号，转成句号正好喂给切句逻辑。
+  const normalized = String(text ?? '')
+    .replace(/\r\n?/g, '\n')          // 统一行尾
+    .replace(/\n[\s]*\n+/g, '\n')    // 连续空行并成一个
+    .replace(/\s*\n\s*/g, '。')      // 换行（含两侧空白）→ 句号
+    .replace(/[。]{2,}/g, '。')         // 避免「。。」
+    .replace(/\s+/g, ' ')
+    .trim();
+  const clean = normalized.slice(0, Number(cfg.maxChars) || 200);
   if (!clean) throw new Error('要合成的文本是空的');
 
   const outDir = cacheDir || cfg.outDir || path.join(process.cwd(), 'state', 'tts');

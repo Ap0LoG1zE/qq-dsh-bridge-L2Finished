@@ -32,18 +32,22 @@ const ACTIVE = { mode: 'active' };
 const DIVING = { mode: 'diving', infinite: true, triggers: { atMention: true, anyMessage: false } };
 const plain = (value) => JSON.parse(JSON.stringify(value));
 const seqs = (messages) => Array.from(messages ?? [], (message) => message.seq);
-/** 回包只有一句话：从这里取「标记了 N 条」。 */
+/** 回包里只有一句话：从这里取「标记了 N 条」。
+ *  2026-11-23 起回执只说「下次什么时候醒」，**只有真的标了才提一句**「顺带标记 N 条已读」，
+ *  没标就一个字都不说（连「没有新的要标记」也删了）。所以"没提"就是 0，
+ *  但仍然要求回执里必须有水位（`读到 #N`）—— 否则就是回执格式漂了，不能再静默当 0。 */
 const markedOf = (data) => {
   const text = String(data?.text ?? '');
   const m = /标记 (\d+) 条已读/.exec(text);
   if (m) return Number(m[1]);
-  if (/没有新的要标记/.test(text)) return 0;
-  throw new Error(`回包里既没有「标记 N 条已读」也没有「没有新的要标记」：${JSON.stringify(text || data)}`);
+  if (/读到 #\d+/.test(text)) return 0;
+  throw new Error(`回执里既没提「标记 N 条已读」也没有「读到 #N」：${JSON.stringify(text || data)}`);
 };
 /** unread / recent 只回渲染好的文本行，按行里的 #N 取 seq。
- *  ⚠️ 只匹配消息行（`[群] #12 …` / `[私聊…] #12 …`）：抬头那句「读到 #12」也是
- *  同一个 #N 格式，用宽匹配会把它算成一条消息，导致 seq 列表重复。 */
-const lineSeqs = (data) => [...String(data?.text ?? '').matchAll(/^\[[^\]]*\]\s*#(\d+)\s/gm)].map((m) => Number(m[1]));
+ *  ⚠️ 2026-11-23 起消息行**不再带** `[群]` / `[私聊…]` 标签（一个会话只服务一个聊天），
+ *  行长这样：`#12 某人·16:34（1小时前）：内容`。
+ *  抬头那句「读到 #12」的 # 不在行首，所以 `^#N ` 既不会误吃抬头，也不会漏消息。 */
+const lineSeqs = (data) => [...String(data?.text ?? '').matchAll(/^#(\d+)\s/gm)].map((m) => Number(m[1]));
 let failures = 0;
 let tests = 0;
 
@@ -215,17 +219,31 @@ await test('合并收尾遵守 mark-read / wake-config 两个独立开关', asyn
   assert.deepEqual(seqs(st.unread), [1]);
 });
 
-await test('非法的唤醒配置不能顺带确认一个本来合法的游标', async ({ st, request, append }) => {
+await test('唤醒条件已冻结：传什么都按固定值覆盖，但不影响水位原子性', async ({ st, request, append }) => {
+  // 2026-11-23：triggers 不再是可配字段（私聊群聊都不许改）。
+  // 旧断言是"全部关掉会 400"，现在这组配置会被**静默改回固定值**，
+  // 不再是非法输入。这里同时验证两件事：
+  //   ① 传进去的 false 全被覆盖成冻结值（atMention/nameMention/poke=true, question=false）
+  //   ② 即使 triggers 被改写，也是**成功**路径 —— 水位照常消费，不会被顺带清掉。
   append('must remain unread');
   await request('unread');
-  const before = plain(st.wakeConfig);
   const result = await request('wake-config', { body: { throughSeq: 1, config: {
-    mode: 'diving', infinite: true, triggers: { atMention: false, nameMention: false, question: false,
-      poke: false, anyMessage: false, probability: 0, keywords: [], speakerIds: [] },
+    mode: 'diving', infinite: true, triggers: { atMention: false, nameMention: false, question: true,
+      poke: false, anyMessage: true, probability: 0.9, keywords: ['x'], speakerIds: ['123'] },
   } } });
-  assert.equal(result.status, 400);
-  assert.deepEqual(seqs(st.unread), [1]);
-  assert.deepEqual(plain(st.wakeConfig), before);
+  assert.equal(result.status, 200, '冻结后这组配置是合法的，不该再 400');
+  const tr = st.wakeConfig.triggers;
+  assert.equal(tr.atMention, true, '@ 恒开');
+  assert.equal(tr.nameMention, true, '名字恒开');
+  assert.equal(tr.poke, true, '拍一拍恒开');
+  assert.equal(tr.question, false, '提问恒关');
+  assert.equal(tr.anyMessage, false, 'anyMessage 被清掉');
+  assert.equal(tr.probability, 0, '概率被清掉');
+  // 用 JSON 比较，避免 deepEqual 对 frozen/原型差异的误报。
+  assert.equal(JSON.stringify(tr.keywords ?? []), '[]', '关键词被清掉');
+  assert.equal(JSON.stringify(tr.speakerIds ?? []), '[]', '指定成员被清掉');
+  // 水位仍然照常消费 —— 冻结触发器不该影响已读语义
+  assert.deepEqual(seqs(st.unread), [], '合法配置应当正常消费水位');
 });
 
 // ── 三、水位是下限：逐出之后不能退回 0 ────────────────────────────────────
@@ -555,16 +573,28 @@ await test('离线排队的唤醒在派发时尊重暂停与禁用，且不暴�
   }
 });
 
+// 2026-11-25：message-detail 的返回从 JSON 改成**纯文本消息行**
+//（和 unread / recent 同一套格式，见 bridge.js 里 "★ 2026-11-25" 那段注释）。
+// 所以断言不能再读 data.info.*，改成检查文本里有没有截断提示。
 await test('message-detail 会如实报告截断，而不是把预览当全文', async ({ h, st, request, append }) => {
   append('短消息');
   const short = await request('message-detail', { query: '&messageId=1' });
   assert.equal(short.status, 200);
-  assert.equal(short.data.info.textTruncated, false, '短消息不应被标为截断');
+  // 短消息：不该出现"正文被截断"提示
+  assert.equal(/正文被截断/.test(String(short.data.text ?? '')), false,
+    `短消息不应被标为截断：${JSON.stringify(short.data).slice(0, 200)}`);
+
   append('长'.repeat(400));
   const long = await request('message-detail', { query: '&messageId=2' });
   assert.equal(long.status, 200);
-  assert.equal(long.data.info.text.length, 200);
-  assert.equal(long.data.info.textTruncated, true, '被截断的预览必须如实报告');
+  const longText = String(long.data.text ?? '');
+  // 长消息：必须带截断提示 + 指向 qq_get_message_full
+  assert.equal(/正文被截断/.test(longText), true,
+    `被截断的预览必须如实报告：${JSON.stringify(long.data).slice(0, 300)}`);
+  assert.equal(/qq_get_message_full/.test(longText), true,
+    `截断提示里必须给出读全文的工具：${longText.slice(0, 300)}`);
+  // 预览本身仍然只到 200 字（存储上限），不因为改了格式就变长
+  assert.ok(longText.length > 0);
 });
 
 console.log(`\nToken economy bridge regressions: ${tests - failures}/${tests} passed.`);

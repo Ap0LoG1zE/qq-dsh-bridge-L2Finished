@@ -174,7 +174,7 @@ function describeFetchFailure(error) {
   if (/ENOTFOUND|EAI_AGAIN/i.test(both)) {
     return '地址解析失败（网络/DNS）。稍后再试，或告诉管理员检查后端。';
   }
-  return `调用失败：${msg || code || '未知错误'}（可重试一次；仍失败就如实说）`;
+  return `调用失败：${msg || code || '未知错误'}`;
 }
 
 function describeHttpFailure(status, body) {
@@ -182,7 +182,7 @@ function describeHttpFailure(status, body) {
   if (status === 429) return `被限流：${detail || '这个会话发送/唤醒太快'}。等几秒再试，别连发。`;
   if (status === 401 || status === 403) return `没有权限：${detail || '会话令牌无效或当前档位不允许'}。同样的参数重试也没用。`;
   if (status === 404) return `找不到会话或接口：${detail || '可能刚被重置'}。先重新读一次状态。`;
-  if (status >= 500) return `桥接内部错误（HTTP ${status}）：${detail || '见 state/bridge.err.log'}。稍后重试一次。`;
+  if (status >= 500) return `桥接内部错误（HTTP ${status}）：${detail || '见 state/bridge.err.log'}`;
   return detail || `桥接 API HTTP ${status}`;
 }
 
@@ -603,34 +603,9 @@ server.tool(
 }
 
 server.tool(
-  'qq_send_group_message',
-  '向指定 QQ 群发送一条纯文本消息；如需引用某条消息，可传 replyToMessageId（非零整数，可为负数），可先用 qq_get_recent_messages / qq_get_message_detail 查询。二代模式（reserved2）下这是可用的发送工具之一，但优先使用 qq_send_message；reserved2 下调用时必须携带会话令牌 token，否则会被拒绝。不要在发送后输出“已发送”类汇报。目标群必须命中系统白名单（config.json 的 allow.groups），否则拒绝。',
-  {
-    groupId: z.union([z.number(), z.string()]).describe('群号（必须在白名单内）'),
-    message: z.string().describe('消息文本，纯文本，不要用 Markdown 或 CQ 码'),
-    replyToMessageId: z.union([z.number(), z.string()]).optional().describe('要引用/回复的消息 id（非零整数，可为负数，可选）'),
-    token: z.string().optional().describe('二代会话令牌（reserved2 模式下必填；closed-agent 模式不需要）')
-  },
-  async ({ groupId, message, replyToMessageId, token }) => {
-    try {
-      const cleanMessage = unquoteJsonString(message);
-      const data = await agentApi('/api/send/group', {
-        method: 'POST',
-        // token 既放 body（兼容旧调用）又放 header：桥接的「agent 流量」判定基于 header，
-        // 只带 body 会让这条请求在桥接眼里像控制台请求，绕过 agent 专用的闸门与审计。
-        ...(token ? { headers: { 'x-agent-token': token } } : {}),
-        body: JSON.stringify({ groupId: String(groupId), message: cleanMessage, replyToMessageId, token: token || undefined })
-      });
-      return { content: [{ type: 'text', text: serializeModelData(data) }] };
-    } catch (error) {
-      return { content: [{ type: 'text', text: `发送失败：${error?.message ?? error}` }], isError: true };
-    }
-  }
-);
-
-server.tool(
   'qq_reply',
-  '在指定 QQ 群里引用/回复某条消息，并发送一条文本。适合群消息很多、需要明确“我回的是哪条”时使用；replyToMessageId 是被引用消息的 id（非零整数，QQ 消息 id 可能为负数），可先用 qq_get_recent_messages / qq_get_unread_messages / qq_get_message_detail 查到具体消息内容和 id。发送前桥接会校验该 id 存在且属于当前会话。二代模式下这是你正常可用的引用工具，但不要每条都引用。只有以下情况才需要引用：① 你这条消息指向的人或消息并非最新一条别人的消息（也就是你在回更早的某条）；② 你连续几句话里不同消息指代的是不同的消息或不同的人。其他情况（上下文唯一、刚在接同一条最新消息）不要引用，别让对方猜，也别为了用工具而用。reserved2 下调用时必须携带会话令牌 token。目标群必须命中系统白名单（config.json 的 allow.groups），否则拒绝。',
+  '在指定群里引用/回复某条消息。什么时候该引用、什么时候不用，见 qq_send_message 的说明。'
+  + 'replyToMessageId 是被引用消息的 id（非零整数，可能为负），可用 qq_get_recent_messages / qq_get_message_detail 查到。',
   {
     groupId: z.union([z.number(), z.string()]).describe('群号（必须在白名单内）'),
     replyToMessageId: z.union([z.number(), z.string()]).describe('被引用/回复的消息 id（非零整数，可为负数）'),
@@ -644,30 +619,6 @@ server.tool(
         method: 'POST',
         ...(token ? { headers: { 'x-agent-token': token } } : {}),
         body: JSON.stringify({ groupId: String(groupId), replyToMessageId, message: cleanMessage, token: token || undefined })
-      });
-      return { content: [{ type: 'text', text: serializeModelData(data) }] };
-    } catch (error) {
-      return { content: [{ type: 'text', text: `发送失败：${error?.message ?? error}` }], isError: true };
-    }
-  }
-);
-
-server.tool(
-  'qq_send_private_message',
-  '向指定 QQ 好友发送一条私聊消息。若提供 replyToMessageId，会以 QQ 引用/回复形式发出（引用条 + 文本）。replyToMessageId 必须是非零整数消息 id（QQ 消息 id 可能为负数），可先用 qq_get_message_detail 查询。二代模式（reserved2）下这是可用的发送工具之一，但优先使用 qq_send_message；调用时必须携带会话令牌 token，否则会被拒绝。不要在发送后输出“已发送”类汇报。目标 QQ 必须命中系统白名单（config.json 的 allow.private），否则拒绝。',
-  {
-    userId: z.union([z.number(), z.string()]).describe('好友 QQ 号（必须在白名单内）'),
-    message: z.string().describe('消息文本，纯文本，不要用 Markdown 或 CQ 码'),
-    replyToMessageId: z.union([z.number(), z.string()]).optional().describe('要引用/回复的消息 id（非零整数，可为负数，可选）'),
-    token: z.string().optional().describe('二代会话令牌（reserved2 模式下必填；closed-agent 模式不需要）')
-  },
-  async ({ userId, message, replyToMessageId, token }) => {
-    try {
-      const cleanMessage = unquoteJsonString(message);
-      const data = await agentApi('/api/send/private', {
-        method: 'POST',
-        ...(token ? { headers: { 'x-agent-token': token } } : {}),
-        body: JSON.stringify({ userId: String(userId), message: cleanMessage, replyToMessageId, token: token || undefined })
       });
       return { content: [{ type: 'text', text: serializeModelData(data) }] };
     } catch (error) {
@@ -852,27 +803,20 @@ server.tool(
 
 server.tool(
   'qq_set_wake_config',
-  '设置指定会话的二代唤醒配置：mode/无限期或有限时间/提前唤醒条件（@、名字、关键词、提问、拍一拍、概率、anyMessage、指定成员）。triggers.speakerIds 是可选的“指定群友发言唤醒”：填一个或多个群友 QQ 号后，只要其中任意一位在群里发言就会唤醒你；不设置则不启用。适合在等某个人回复、或某人反应慢怕错过时使用。triggers.poke 开启后，群里有人拍一拍（包括拍你或拍别人）会唤醒你。注意：观察窗口已退役，设置潜水前不必调用任何等待工具；只要没有「还没展示给你的新消息」就可以直接设置。记得至少留一个可唤醒的触发条件（@/名字/关键词/提问/概率任一），否则会被桥接重置为默认配置。',
+  '设置你下次睡多久、什么时候被主动叫醒：mode（潜水/活跃）、潜水时长（无限期或有限时间）、多条消息合并窗口。'
+  + '要安静就潜水（sleepMs / infinite=false）。'
+  + '注意：收尾用 qq_mark_read，不是本工具。'
+  + '注意：观察窗口已退役，设置潜水前不必调用任何等待工具；只要没有「还没展示给你的新消息」就可以直接设置。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【令牌】）'),
     throughSeq: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional().describe('可同时确认已读：使用已查看结果中的 readThroughSeq，省去额外 qq_mark_read；不传则只设置唤醒配置。若 markRead 工具被关闭，该水位会被忽略，本工具只设置唤醒配置'),
     config: z.object({
-      mode: z.enum(['diving', 'active']).optional().describe('diving=潜水，active=活跃（anyMessage 开启）'),
-      infinite: z.boolean().optional().describe('true=无限期，只有条件命中才唤醒；false=有限时间'),
+      mode: z.enum(['diving', 'active']).optional().describe('diving=潜水（只有 @/名字/拍一拍叫得醒），active=活跃（任何新消息都唤醒）'),
+      infinite: z.boolean().optional().describe('true=无限期潜着，直到被叫醒；false=有限时间（配合 sleepMs / sleepUntil 用）'),
       sleepMs: z.number().optional().describe('有限潜水毫秒数（从当前时间起算）'),
       sleepUntil: z.string().optional().describe('有限潜水截止时间 ISO 字符串，优先级高于 sleepMs'),
-      triggers: z.object({
-        atMention: z.boolean().optional().describe('被 @ 或引用自己时唤醒'),
-        nameMention: z.boolean().optional().describe('被叫名字/昵称时唤醒'),
-        speakerIds: z.array(z.union([z.number(), z.string()])).max(20).optional().describe('指定群友 QQ 号数组：这些群友中任意一位发言时唤醒（可选，最多 20 个，不设置则不启用；私聊不适用，设置会被桥接清除；可从 qq_get_userid / qq_get_group_members / qq_get_message_detail 的 userId/user_id 获取）'),
-        keywords: z.array(z.string()).optional().describe('出现任意关键词时唤醒'),
-        question: z.boolean().optional().describe('被直接提问/点名挑战时唤醒'),
-        poke: z.boolean().optional().describe('有人拍一拍时唤醒（群聊包括拍你和拍别人，私聊为对方拍你）'),
-        anyMessage: z.boolean().optional().describe('任意新消息都唤醒（活跃模式）'),
-        probability: z.number().optional().describe('普通消息按该概率随机唤醒（0~1）')
-      }).optional(),
-      batchWindowMs: z.number().optional().describe('多条消息合并唤醒窗口（毫秒，>=1000）')
+      batchWindowMs: z.number().optional().describe('多条消息合并唤醒窗口（毫秒，>=1000）：对方连发几条时等这么久再一起给你')
     }).describe('要设置的唤醒配置，缺省字段保留原值')
   },
   async ({ key, token, config, throughSeq }) => {
@@ -906,7 +850,7 @@ server.tool(
 
 server.tool(
   'qq_send_burst',
-  '在指定 QQ 群分多条发送消息（二代仿真模式专用），桥接会按真人化随机间隔发送。暂不支持引用，需要引用请用 qq_reply。注意：数组里的每个字符串就是一条 QQ 消息，字符串内部不要用空格分隔中文短句，需要多条请用数组元素；每条消息要读起来完整，不要把同一句话拆到两条里。',
+  '在指定 QQ 群分多条发送消息（二代仿真模式专用），桥接会按真人化随机间隔发送。暂不支持引用，需要引用请用 qq_reply。数组里的每个字符串就是一条 QQ 消息。',
   {
     groupId: z.union([z.number(), z.string()]).describe('群号（必须在白名单内）'),
     token: z.string().describe('会话令牌（见唤醒提示中的【令牌】）'),
@@ -962,13 +906,15 @@ server.tool(
 
 server.tool(
   'qq_send_message',
-  '统一发送工具：可发一条或多条，可引用某条消息。二代仿真模式专用。注意：字符串=一条消息，数组=多条消息；**单次能带的条数由面板「单次最多几条」控制**（默认 3；超了整次被拒、一条都发不出去）——想发更多就分几次调用；每个字符串内部不要用空格分隔中文短句，需要多条请用数组元素；每条消息要读起来完整，不要把同一句话拆到两条里。只有以下情况才需要传 replyToMessageId 引用：① 你这条消息指向的人或消息并非最新一条别人的消息（也就是你在回更早的某条）；② 你连续几句话里不同消息指代的是不同的消息或不同的人。其他情况（上下文唯一、刚在接同一条最新消息）不要引用，别让对方猜，也别为了用工具而用。',
+  '统一发送工具：可发一条或多条，可引用某条消息。二代仿真模式专用。注意：字符串=一条消息，数组=多条消息；**单次能带的条数由面板「单次最多几条」控制**（默认 3；超了整次被拒、一条都发不出去）——想发更多就分几次调用；什么时候该引用见预设【引用与点名】那一节。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【令牌】）'),
     messages: z.union([z.string(), z.array(z.string()).min(1)]).describe('要发送的内容：字符串=一条；数组=分多条。**单次条数有上限**（面板「单次最多几条」，默认 3），超了整次调用会被拒绝（一条都发不出去）；要发更多请分几次调用'),
     replyToMessageId: z.union([z.number(), z.string()]).optional().describe('要引用/回复的消息 id（非零整数，可为负数，可选）'),
     atUserId: z.union([z.number(), z.string()]).optional().describe('要 @ 的群成员 QQ 号（群聊中用于点名某个人；与引用二选一即可，不要滥用）'),
+    // 2026-11-21：让她能显式要求"这条用语音说"。默认 false（打字）。
+    voice: z.boolean().optional().describe('true=这条用语音发；不传或 false=打字。语音没开或合成失败时会自动退回打字')
     // 2026-11-19 删掉 gapMode / gapMs / gaps 三个参数。
     //
     // 原因：操作者发现她会传 `"gapMode": "auto"` —— 因为 enum 的第一个值就是它，
@@ -980,7 +926,7 @@ server.tool(
     // 桥接端点仍然接受这三个字段（手写 HTTP 调用或旧客户端可能用），
     // 只是不再暴露给模型。
   },
-  async ({ key, token, messages, replyToMessageId, atUserId }) => {
+  async ({ key, token, messages, replyToMessageId, atUserId, voice }) => {
     try {
       let finalMessages = messages;
       if (typeof finalMessages === 'string') {
@@ -1003,7 +949,7 @@ server.tool(
       const data = await agentApi('/api/socialV2/send-message', {
         method: 'POST',
         // 2026-11-20：不再传 noWait —— 该参数已整体删除。
-        body: JSON.stringify({ key, messages: finalMessages, replyToMessageId, atUserId: atUserId ?? null }),
+        body: JSON.stringify({ key, messages: finalMessages, replyToMessageId, atUserId: atUserId ?? null, voice: voice === true }),
         headers: { 'x-agent-token': token },
         timeoutMs: 300000
       });
@@ -1069,13 +1015,72 @@ if (cfg.socialV2?.tools?.recallMessage !== false) {
   );
 }
 
+// ── 身体状态（饥饿 / 精力 / 第三项）2026-11-23 ──────────────────────────────
+//
+// 三个值都是 0~100，但**方向不一样，别搞混**：
+//   satiety / energy —— "还剩多少"，随时间掉，她做了事往上 **加**；
+//   desire           —— "攒了多少"，随时间涨，被满足往下 **减**。
+//
+// 为什么是"她调工具改"而不是"从她说的话里判断"：
+//   "我不饿""饿死我了但刚吃完"全含关键词，方向正好相反；
+//   而 QQ 上"我好困啊"多数是在找话题，不是在报数。抽错比不抽糟得多 ——
+//   她会说出自相矛盾的话，而且没人能发现。
+//
+// 无条件注册（不受 tools 开关控制）：它是**她身体的一部分**，不是可选功能。
+// 但不在 EAGER_TOOLS 里 —— 调用频率低，走 qq_find_tool 即可，别占常驻 schema。
+server.tool(
+  'qq_life_circle',
+  '查看或改变自己的身体状态：饥饿 / 精力 / 第三项（0~100）。\n'
+  + '**只在你真的做了某件事之后才调它**：吃过东西 → satiety 加；睡够了/歇过来了 → energy 加；'
+  + '被满足 → desire **减**。\n'
+  + '要睡的时候传 asleep=true 说一声就行——**醒来不用你管**：下一次有人叫醒你时，'
+  + '系统会自动把你当作醒了，并把这一觉睡得怎么样告诉你。\n'
+  + '（不传 asleep 就保持原状。系统不会到点当你睡着——通宵不睡不会凭空回血。）\n'
+  + '不传任何参数就是纯查询。数值会随时间自己动，你不需要手动反向调。\n'
+  + '别为了"显得累/显得饿"去传负数——负数会被当作 0 忽略。',
+  {
+    key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+    token: z.string().describe('会话令牌（见唤醒提示中的【令牌】）'),
+    add: z.object({
+      satiety: z.number().optional().describe('饥饿值回升量，0~70（**正数=吃饱了**）。吃了一顿 +55~70，垫一口 +10~20'),
+      energy: z.number().optional().describe('精力回升量，0~60（**正数=休息过了**）。睡一觉 +30~50，歇一会儿 +10~20'),
+      desire: z.number().optional().describe('第三项的**释放量**，0~60（**正数=被满足了，数值往下减**）。'
+        + '**只在私聊有效**，群聊会被忽略')
+    }).optional().describe('要改的量。不传 = 只查询'),
+    asleep: z.boolean().optional().describe('true=我现在要睡了。**醒来不用传 false**：'
+      + '下次被唤醒时系统会自动当她醒了，并给出这一觉的起床状态。'
+      + '睡着期间精力每小时回 8，醒着每小时掉 3'),
+    cared: z.boolean().optional().describe('true=这一轮你被对方关心了（安慰、嘱咐、'
+      + '主动问你怎么样、惦记你之类的）。会让你的心情软一点、精神好一点。'
+      + '**判断标准在你自己**：真的觉得被关心到了才传，不要因为对方说了句客套话就传。'
+      + '一次对话最多传一次。')
+  },
+  async ({ key, token, add, asleep, cared }) => {
+    try {
+      const data = await agentApi('/api/socialV2/life-circle', {
+        method: 'POST',
+        body: JSON.stringify({
+          key,
+          add: add ?? {},
+          ...(typeof asleep === 'boolean' ? { asleep } : {}),
+          ...(cared === true ? { cared: true } : {})
+        }),
+        headers: { 'x-agent-token': token },
+        timeoutMs: 15000
+      });
+      return { content: [{ type: 'text', text: data?.text ? String(data.text) : serializeModelData(data) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `身体状态操作失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
 if (cfg.socialV2?.tools?.sendPoke !== false) {
   server.tool(
     'qq_send_poke',
-    '发送 QQ 拍一拍（群聊/私聊）。适合用“戳一下”代替一句废话、提醒对方、自然回应别人的拍一拍，或偶尔主动戳一下正在聊的人/熟人——这样更拟真；但别频繁，真人不会一直戳人。'
-    + '群聊必须传 targetUserId：**填消息里那个人的昵称就行**（桥接会按别名表换成 QQ 号）；'
-    + '同名的人有多个时会报错让你改用 QQ 号，那时再用 qq_get_userid 查。私聊可不传（默认拍当前私聊对象）。'
-    + 'reserved2 下必须携带会话令牌 token，发送会受桥接白名单与发送频率限制。',
+    '发送 QQ 拍一拍（群聊/私聊）。适合用“戳一下”代替一句废话、提醒对方、自然回应别人的拍一拍，或偶尔主动戳一下正在聊的人/熟人——这样更拟真；'
+    + '群聊必须传 targetUserId：**填消息里那个人的昵称就行**；'
+    + '同名的人有多个时会报错让你改用 QQ 号，那时再用 qq_get_userid 查。私聊可不传（默认拍当前私聊对象）。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【令牌】）'),
@@ -1104,7 +1109,7 @@ if (cfg.socialV2?.tools?.sendPoke !== false) {
 
 server.tool(
   'qq_wait_for_messages',
-  '等待分两种用途。purpose="reply"（短静默）：回复前确认对方有没有补充，按最后来信补足 quietMs（建议 4000~10000，后台下限 10000）；已安静足够立即返回，新消息重算静默。purpose="messages"（长等待）：不会真的阻塞——桥接在后台盯着，有指向你的新消息会立刻唤醒你，没有就什么都不做；调用它会立即返回 timeout=true，含义是「别在这儿等，去收尾」。收尾不需要等待：直接 qq_mark_read 或 qq_set_wake_config（私聊不用等；群聊只要没有未读就能收）。返回里的 readThroughSeq 就是收尾要传的水位。',
+  '等待分两种用途。purpose="reply"（短静默）：回复前确认对方有没有补充，按最后来信补足 quietMs（建议 4000~10000，后台下限 10000）；已安静足够立即返回，新消息重算静默。purpose="messages"（长等待）：不会真的阻塞——桥接在后台盯着，有指向你的新消息会立刻唤醒你，没有就什么都不做；调用它会立即返回 timeout=true，含义是「别在这儿等，去收尾」。收尾不需要等待：直接 qq_mark_read（私聊不用等；群聊只要没有未读就能收）。返回里的 readThroughSeq 就是收尾要传的水位。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【令牌】）'),
@@ -1194,7 +1199,9 @@ server.tool(
   async ({ key, token, messageId }) => {
     try {
       const data = await agentApi(`/api/socialV2/message-detail?key=${encodeURIComponent(key)}&messageId=${encodeURIComponent(String(messageId))}`, { headers: { 'x-agent-token': token } });
-      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      // 2026-11-25：桥接现在返回消息行文本（和 unread/recent 同一套格式），
+      // 直接透传 text，不再把整个对象序列化成 JSON。
+      return { content: [{ type: 'text', text: data?.text ? String(data.text) : serializeModelData(data) }] };
     } catch (error) {
       return { content: [{ type: 'text', text: `获取消息详情失败：${error?.message ?? error}` }], isError: true };
     }
@@ -1208,8 +1215,6 @@ server.tool(
   + '本工具直接从 QQ 服务端重新拉取那条消息，返回未截断的全部文字。\n\n'
   + '什么时候用：qq_get_unread_messages / qq_get_recent_messages 里某条消息'
   + '带 textTruncated:true，或明显在半句话上断掉，而你想读完它。\n\n'
-  + '读不读取决于你对这段文本的感受——如果它让你恶心、冒犯、不适，就别读了，'
-  + '没必要勉强自己把别人的东西看完。\n\n'
   + '只返回文字段；图片/语音/文件只给出类型名（mediaKinds），不返回任何本地路径。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
@@ -1224,7 +1229,9 @@ server.tool(
         headers: { 'x-agent-token': token },
         timeoutMs: 60000
       });
-      return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      // 2026-11-25：桥接现在返回消息行文本（和 unread/recent 同一套格式），
+      // 直接透传 text，不再把整个对象序列化成 JSON。
+      return { content: [{ type: 'text', text: data?.text ? String(data.text) : serializeModelData(data) }] };
     } catch (error) {
       return { content: [{ type: 'text', text: `读取完整原文失败：${error?.message ?? error}` }], isError: true };
     }
@@ -1260,17 +1267,19 @@ server.tool(
     + '【todo】一两天内要兑现的事（明天讲那张卡片、六点提醒他拿快递）。'
     + '默认 48 小时自动消失，**不要写进 longTerm** —— 那是给几个月后仍成立的事的。'
     + '【longTerm】跨会话、几个月后看依然成立的事（他是谁、约过什么、明确的喜恶、公认的梗），用 extra.tag 定权重。'
-    + '【activeTopic】这个聊天正在聊、还会接着聊的话题（24 小时没人提就过期）。'
-    + '【pendingThought】你想说但还没说出口的话（默认 2 小时过期）。'
     + '【memberImpression】对某位群友的具体观察。【selfNote】你对自己的认识，只有你能写。'
     + '想回顾时用 qq_memory_query 查。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【令牌】）'),
-    category: z.enum(['todo', 'activeTopic', 'pendingThought', 'memberImpression', 'selfNote', 'longTerm'])
+    // 2026-11-24：删掉 activeTopic / pendingThought 两类。
+    // 理由（操作者判断，实测支持）：它们写进去之后**她根本不会回头查**，
+    // 全库累计只有 5 条，而它们在主动唤醒里占两个路由位 —— 等于两个永久空转的分支。
+    // 记忆只留四个真正会被用到的类别。
+    category: z.enum(['todo', 'memberImpression', 'selfNote', 'longTerm'])
       .describe('记忆类别。拿不准时问自己「这事过了两三天还成立吗」：'
         + '不成立 → todo；成立几个月 → longTerm'),
-    content: z.string().describe('记忆内容。todo/longTerm 写一句话结论（≤200 字）；activeTopic 写话题；pendingThought 写想说的话'),
+    content: z.string().describe('记忆内容。todo/longTerm 写一句话结论（≤200 字）'),
     // 2026-11-12：target 提到顶层。
     // 原来它埋在 extra 里，而"给谁记"是这条调用最关键的参数之一 —— 模型很自然地
     // 把 target 和 category/content 平铺在顶层，于是收到
@@ -1279,10 +1288,6 @@ server.tool(
     target: z.string().optional().describe('memberImpression 必填：这个人的名字或昵称（也可放 extra.target）'),
     extra: z.object({
       target: z.string().optional().describe('memberImpression 时的群友名字/昵称（与顶层 target 等价）'),
-      participants: z.array(z.string()).optional().describe('activeTopic 的参与者列表'),
-      pendingQuestion: z.string().optional().describe('activeTopic 里还没问出口的问题'),
-      motivation: z.string().optional().describe('pendingThought 的动机，如 curiosity/sociability'),
-      expiresAtMs: z.number().optional().describe('pendingThought 过期毫秒数，默认 2 小时'),
       dueAtMs: z.number().optional().describe('仅 todo 有效：从现在到约定时间还有多久（毫秒）。'
         + '不填默认 48 小时。「半小时后」=1800000，「明天这个时候」=86400000。'),
       done: z.boolean().optional().describe('仅 todo 有效：这件事已经做完了。'),
@@ -1307,7 +1312,7 @@ server.tool(
       // 待办/印象/自省/长期记忆 六段），约 280~970 字符 —— 她刚写进去，
       // 不需要把这六段再读一遍。要回顾时用 qq_memory_query。
       const catLabel = {
-        todo: '待办', activeTopic: '进行中的话题', pendingThought: '想说未说的',
+        todo: '待办',
         memberImpression: '群友印象', selfNote: '自省', longTerm: '长期记忆'
       }[category] || category;
       const brief = String(content || '').replace(/\s+/g, ' ').trim().slice(0, 30);
@@ -1389,19 +1394,17 @@ server.tool(
 );
 
 /**
- * 纯语音开关（2026-11-13 新增）：只有主人能切。
+ * 语音开关：发语音条之前要先打开它。
  * 开启后桥接会把她打的字合成语音发出去，工具本身只是改一个开关。
  */
 server.tool(
   'qq_set_voice',
-  '打开或关闭「纯语音」模式：开启后你打的字会被自动转成你的声音发出去，关闭则回到打字。'
-  + '**只有 ownerQQ 对应账号的私聊里能开关**（群里或别人要求都会被拒）。'
-  + '对方让你用声音说话时打开，让你停就关掉。'
-  + '不要自己主动切换，只在明确要求时用。',
+  '打开语音：`qq_send_message` 要带 `voice:true` 发语音条时，得先把这个打开。'
+  + '关着时带 voice:true 会退回打字。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【令牌】）'),
-    enabled: z.boolean().describe('true=打开纯语音，false=关闭'),
+    enabled: z.boolean().describe('true=允许发语音，false=禁止'),
   },
   async ({ key, token, enabled }) => {
     try {
@@ -1412,16 +1415,16 @@ server.tool(
         timeoutMs: 60000,
       });
       // 极简返回：只要开/关两个字。
-      return { content: [{ type: 'text', text: `纯语音：${data?.enabled ? '开' : '关'}` }] };
+      return { content: [{ type: 'text', text: `语音：${data?.enabled ? '开' : '关'}` }] };
     } catch (error) {
       const msg = String(error?.message ?? error);
       // 只用来**识别**权限拒绝，不回显给模型（返回的是下面那句固定文案）。
       // 判据用「ownerQQ」和新旧两版文案的共同特征，不必逐字匹配旧措辞
-      // —— 旧版桥接那两句都含「开关纯语音」，用这个更稳。
-      if (/ownerQQ|开关纯语音|能开关/.test(msg)) {
-        return { content: [{ type: 'text', text: '纯语音：关（仅 ownerQQ 私聊可开）' }] };
+      // —— 旧版桥接那两句都含「开关语音」，用这个更稳。
+      if (/ownerQQ|开关语音|能开关/.test(msg)) {
+        return { content: [{ type: 'text', text: '语音：关（仅 ownerQQ 私聊可开）' }] };
       }
-      return { content: [{ type: 'text', text: `纯语音：切换失败（${msg}）` }], isError: true };
+      return { content: [{ type: 'text', text: `语音：切换失败（${msg}）` }], isError: true };
     }
   }
 );
@@ -1447,14 +1450,15 @@ function formatFactsBlock(data) {
 server.tool(
   'qq_memory_query',
   '查看当前会话的记忆（只读）。'
-    + '**不带 category 是主要用法**：一次返回全部——selfNote 自我认知 + 群友印象 + 待办 + 进行中的话题 + 想说的话 + **长期记忆**。'
+    + '**不带 category 是主要用法**：一次返回全部——selfNote 自我认知 + 群友印象 + 待办 + **长期记忆**。'
     + '新会话第一轮、上下文刚被压缩过时，查这一次就够了，不用分开查。'
     + '带 category 只看某一类（单类维护时用）。'
     + '返回是排好版的纯文本，不是 JSON。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【令牌】）'),
-    category: z.enum(['todo', 'activeTopic', 'pendingThought', 'memberImpression', 'selfNote', 'longTerm'])
+    // 2026-11-24：删掉 activeTopic / pendingThought —— 见 qq_memory_append 的说明。
+    category: z.enum(['todo', 'memberImpression', 'selfNote', 'longTerm'])
       .optional()
       .describe('可选。**不传 = 一次拿回全部记忆（推荐）**；传了就只看那一类'),
   },
@@ -1479,7 +1483,7 @@ server.tool(
       // 【长期记忆】，两种格式拼在一起、读起来是断的（操作者实际看到了这个）。
       // 现在桥接侧保证了 formatted 恒为非空纯文本（没数据也会写"没有"），
       // 这里只在该字段意外缺失时才兜底，且兜底也输出人话而不是 JSON。
-      const lightText = formatted || '【记忆】读取成功，但桥接没有返回可读正文（这是异常状态，重试一次；仍异常请报告）。';
+      const lightText = formatted || '【记忆】读取成功，但没有可读正文';
       // ── 2026-11-18：**把长期记忆追加回来** ────────────────────────────────
       //
       // 2026-11-17 曾经删掉这段，理由是「长期事实已经由 qq-agent-context 插件
@@ -1511,12 +1515,13 @@ server.tool(
 
 server.tool(
   'qq_memory_remove',
-  '删除一条轻量记忆：activeTopic/pendingThought 用 content 匹配原文删除；memberImpression 用 target 参数指定群友名字删除。',
+  '删除一条轻量记忆：memberImpression 用 target 指定群友名字删除。'
+    + '（2026-11-24：activeTopic / pendingThought 已从记忆体系移除，不再支持。）',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【令牌】）'),
-    category: z.enum(['activeTopic', 'pendingThought', 'memberImpression', 'selfNote']).describe('记忆类别'),
-    content: z.string().optional().describe('要删除的话题/想法原文（memberImpression 不需要）'),
+    category: z.enum(['memberImpression', 'selfNote']).describe('记忆类别'),
+    content: z.string().optional().describe('要删除的内容原文（memberImpression 不需要）'),
     target: z.string().optional().describe('memberImpression 时要删除的群友名字')
   },
   async ({ key, token, category, content, target }) => {
@@ -1535,11 +1540,12 @@ server.tool(
 
 server.tool(
   'qq_memory_clear',
-  '清空轻量记忆：不传 category 清空全部；传 activeTopic/pendingThought/memberImpression 只清空对应类别。',
+  '清空轻量记忆：不传 category 清空全部；传 memberImpression / selfNote 只清空对应类别。'
+    + '（2026-11-24：activeTopic / pendingThought 已从记忆体系移除。）',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【令牌】）'),
-    category: z.enum(['activeTopic', 'pendingThought', 'memberImpression', 'selfNote']).optional().describe('要清空的类别，缺省清空全部')
+    category: z.enum(['memberImpression', 'selfNote']).optional().describe('要清空的类别，缺省清空全部')
   },
   async ({ key, token, category }) => {
     try {
@@ -1559,7 +1565,7 @@ server.tool(
 if (cfg.socialV2?.tools?.getImages !== false) {
   server.tool(
     'qq_get_message_images',
-    '获取指定 QQ 消息中的图片/表情，并直接以图像内容返回给模型（视觉模型可“看懂”）。当消息文本里出现 [图片]、[表情] 或 hasMedia=true 时调用。支持一条消息里的多张图片/表情；二代模式下必须携带会话令牌。**动图（GIF/动态表情）会被桥接抽帧拼成多格图再给你**：说明里会写「动图 N 帧/…s，已抽 X 帧拼成 A×B 网格，行优先 左上→右下」——按格子顺序理解动作即可，不要把它当成一张九宫格照片；没有这类说明就是静态图。体积过大的图会被自动缩放/重编码，说明里会给出原始尺寸与体积；如果真的压不到可用体积，返回里会直接写明原因（例如「超过上限」），此时如实告诉对方你看不到，不要编造画面。',
+    '获取指定 QQ 消息中的图片/表情，并直接以图像内容返回给模型（视觉模型可“看懂”）。当消息文本里出现 [图片]、[表情] 或 hasMedia=true 时调用。支持一条消息里的多张图片/表情；二代模式下必须携带会话令牌。**动图（GIF/动态表情）会被桥接抽帧拼成多格图再给你**：说明里会写「动图 N 帧/…s，已抽 X 帧拼成 A×B 网格，行优先 左上→右下」——按格子顺序理解动作即可，不要把它当成一张九宫格照片；没有这类说明就是静态图。体积过大的图会被自动缩放/重编码，说明里会给出原始尺寸与体积；如果真的压不到可用体积，返回里会直接写明原因（例如「超过上限」）。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       messageId: z.union([z.number(), z.string()]).describe('要查看的消息 id（QQ 消息 id 可为负数；二代也可用本地 seq）'),
@@ -1667,7 +1673,7 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.getStickerI
 if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.sendSticker !== false) {
   server.tool(
     'qq_send_sticker',
-    '在指定会话发送一个 QQ 收藏表情包（自定义表情）。stickerId 用 qq_list_stickers 返回的 id / md5 / url，或者直接传**与备注完全一致**的文字（如「被示爱很害羞时用」）。注意：一条消息只能是一张表情，不能在同一气泡里附带文字；想说的话请先用 qq_send_message / qq_reply 作为单独气泡发送，再单独发这张表情。需要引用/点名时可用 replyToMessageId / atUserId（群聊）。真人偶尔用表情包很自然，但别刷屏。',
+    '在指定会话发送一个 QQ 收藏表情包（自定义表情）。stickerId 用 qq_list_stickers 返回的 id / md5 / url，或者直接传**与备注完全一致**的文字（如「被示爱很害羞时用」）。注意：想说的话请先用 qq_send_message / qq_reply 作为单独气泡发送，再单独发这张表情。需要引用/点名时可用 replyToMessageId / atUserId（群聊）。真人偶尔用表情包很自然，但别刷屏。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【令牌】）'),
@@ -1702,7 +1708,7 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.sendSticker
 if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.collectSticker !== false) {
   server.tool(
     'qq_collect_sticker',
-    '收藏当前会话里别人发的一张表情/图片到你的 QQ 收藏表情，并可写一句简短备注（如“好图偷了，兄弟”）。messageId 用 qq_get_unread_messages / qq_get_recent_messages 返回的 messageId 或 seq。注意：不要频繁收藏，只在真的觉得有意思/好用/戳中你时才偷图；收藏后你可以在 qq_list_stickers 里看到并继续使用。',
+    '收藏当前会话里别人发的一张表情/图片到你的 QQ 收藏表情，并可写一句简短备注（如“好图偷了，兄弟”）。messageId 用 qq_get_unread_messages / qq_get_recent_messages 返回的 messageId 或 seq。只在真的觉得有意思/好用/戳中你时才偷图；收藏后你可以在 qq_list_stickers 里看到并继续使用。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【令牌】）'),
@@ -1826,7 +1832,7 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.setStickerR
 if (cfg.socialV2?.tools?.getForwardMsg !== false) {
   server.tool(
     'qq_get_forward_msg',
-    '查看当前会话中出现的合并转发消息/聊天记录内容（只读，只返回文字，不返回图片）。当消息文本里出现 `[转发消息 id=...]`，或 qq_get_unread_messages / qq_get_recent_messages / qq_get_message_detail 返回的某条消息带 forwardIds / hasForward: true 时调用。只能查看当前会话确实收到过的转发消息 id，不能任意读取。\n\n默认返回最多 100 条、每条最多 500 字。首行会写明总条数与是否被截断——写着「只显示前 N 条」就说明后面还有；确实要读完再传 full: true（每条 2000 字、最多 100 条）。读不读全段取决于你自己：让你不适就别读了。',
+    '查看当前会话中出现的合并转发消息/聊天记录内容（只读，只返回文字，不返回图片）。当消息文本里出现 `[转发消息 id=...]`，或 qq_get_unread_messages / qq_get_recent_messages / qq_get_message_detail 返回的某条消息带 forwardIds / hasForward: true 时调用。只能查看当前会话确实收到过的转发消息 id，不能任意读取。\n\n默认返回最多 100 条、每条最多 500 字。首行会写明总条数与是否被截断——写着「只显示前 N 条」就说明后面还有；确实要读完再传 full: true（每条 2000 字、最多 100 条）。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【令牌】）'),
@@ -2057,17 +2063,10 @@ server.tool(
 //     模型能自己改对，不需要再走一次 find。
   server.tool(
     'qq_get_lyrics',
-    '查一首歌的歌词（QQ音乐 / 网易云音乐）。只返回**歌词正文纯文本**（已去掉时间轴和制作人员名单，一行一句）。'
-    + '没有 JSON、没有字段名、也不复述歌名，直接用眼睛读。\n\n'
-    + '**什么时候用**：群里有人发了音乐卡片并聊起这首歌，你想接话、想引用某句词、或者想知道这歌在讲什么。'
-    + '卡片摘要里已经给了曲名、歌手和 id，直接拿来用，不要自己瞎猜、也不要再去 web_fetch 那个链接。\n\n'
-    + '**首选按 id 取词**：摘要形如 `[QQ音乐] 晴天 · 周杰伦 · mid:0039MnYb0qxYhV`，'
-    + '`mid:` 对应 platform="qq"，`id:` 对应 platform="netease"，把这两个传进来就够，不必再传歌名歌手。'
-    + '这条路直达那首歌，不会有歧义。\n\n'
-    + '摘要里没有 id（小程序形态的卡片常见）时才退到按歌名搜：传 platform + title + artist。'
-    + '**platform 一定按卡片上写的平台传** —— 拿 QQ音乐 的歌名去网易云搜，搜出来的十有八九是翻唱。\n\n'
-    + '只有「按歌名搜」这条路才可能撞上翻唱，那时返回开头会有一行「⚠️」说明；按 id 取的词永远是那首歌本身的。\n\n'
-    + '歌词是给你读懂这首歌用的，**不要整段搬到群里**，引用一两句最合适的就行。',
+    '查一首歌的歌词（QQ音乐 / 网易云音乐），返回纯文本歌词，一行一句。'
+    + '群里有人发了音乐卡片、你想接话时用。卡片摘要里已有曲名/歌手/id，不用再去 web_fetch 那个链接。'
+    + '有 id 就按 id 取（platform 配卡片的 mid/id），没有 id 才按歌名搜——'
+  + '**搜歌名时 platform 必须按卡片上写的传**，拿错平台搜出来多半是翻唱。',
     {
       platform: z.enum(['qq', 'netease']).optional()
         .describe('平台：qq=QQ音乐，netease=网易云音乐。来自音乐卡片时**务必传**，否则可能搜到翻唱'),
@@ -2145,7 +2144,10 @@ if (deferEnabled()) {
     拍: ['poke', '拍一拍', '戳'],
     群: ['group', '群成员', '群列表'],
     等待: ['wait', '等消息', '蹲'],
-    收尾: ['mark_read', '已读', '潜水', '唤醒']
+    收尾: ['mark_read', '已读', '看完', '划走'],
+    // 2026-11-24：唤醒从「收尾」别名里拆出来 —— 原来找''怎么收尾''会把 qq_set_wake_config 一起搜出来，
+    // 但它不是收尾工具（只管下次睡多久）。
+    唤醒: ['wake', '潜水', '睡了', '叫醒', '什么时候被叫醒']
   };
 
   server.tool(

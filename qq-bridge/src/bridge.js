@@ -22,7 +22,54 @@ import { mdToPlain, splitForQQ, truncateText, truncateTextTail } from './md-to-p
 import { SENSITIVE_RE, auditOutbound } from './sensitive.js';
 import { looksLikeUnfinished } from './v2-wait.js';
 import { compactModelMessage, describeAge } from './qq-model-view.js';
-import { safeFetchBuffer, looksLikeImageBuffer } from './safe-fetch.js';
+import { safeFetch, safeFetchBuffer, looksLikeImageBuffer } from './safe-fetch.js';
+import { buildNowLine as buildNowLineOf } from './life-clock.js';
+import {
+  defaultCircle as defaultLifeCircle,
+  normalizeCircle as normalizeLifeCircle,
+  settleCircle as settleLifeCircleFn,
+  addToCircle as addToLifeCircleFn,
+  circleExtras as lifeCircleExtras,
+  describeCircle as describeLifeCircle,
+  DEFAULT_OFFLINE_AS_SLEEP_MS
+} from './life-circle.js';
+import {
+  DEFAULT_CYCLE_DAYS,
+  floorDay,
+  phaseAt,
+  phaseEffect,
+  rollDiscomfort
+} from './life-cycle.js';
+import {
+  TRANSITIONS,
+  normalizeConditions as normalizeConds,
+  activeConditions as activeLife,
+  composeEnergy as composeEnergyDelta,
+  composeMood as composeMoodPick,
+  reapExpired as reapExpiredLife,
+  makeCondition as makeConditionLife,
+  upsertCondition as upsertCondLife,
+  dedupeByKind
+} from './life-conditions.js';
+import {
+  HEALTH_POOL,
+  CARE_POOL,
+  NIGHTMARE_POOL,
+  DREAM_POOL,
+  pickWithDefault,
+  MEAL_MOODS,
+  SLEEP_AFTERGLOW_SPEC,
+  CYCLE_RECOVERY_SPEC,
+  mealMoodAt,
+  buildHealthCauses,
+  healthChance,
+  pickFromPool,
+  sleepVerdict,
+  makeAfterglow as makeAfterglowV2
+} from './life-vitals.js';
+import { createWeatherCache, weatherShortText } from './life-weather.js';
+import { buildProactiveCandidates } from './life-proactive.js';
+import { buildWakeText as buildSleepWakeText } from './life-sleep.js';
   // B站分享卡片内联展开。只导入需要的这两个。
 import { setCardConfig, summarizeCard } from './card-parse.js';
 import { normalizeImageForModel } from './media-normalize.js';
@@ -33,7 +80,7 @@ import { resolvePriceTable } from './model-prices.js';
 import { createTokenLedger } from './token-ledger.js';
 import { createStore as createMemoryStore } from './memory-store.js';
 import { selectForInjection as selectFactsForInjection, addFact, loadFacts, weightOf, archiveFact, TAG_WEIGHTS, factsFileOf } from './memory-facts.js';
-import { INITIAL_SCORE as AFFINITY_INITIAL, STAGES as AFFINITY_STAGES, SCORE_MIN as AFFINITY_SCORE_MIN, SCORE_MAX as AFFINITY_SCORE_MAX, stageOf as affinityStageOf, bumpAffinity, decayAffinity, scoreForMessage, describeAffinity } from './affinity.js';
+import { INITIAL_SCORE as AFFINITY_INITIAL, STAGES as AFFINITY_STAGES, SCORE_MIN as AFFINITY_SCORE_MIN, SCORE_MAX as AFFINITY_SCORE_MAX, stageOf as affinityStageOf, bumpAffinity, decayAffinity, scoreForMessage, describeAffinity, proactiveTierForScore, proactiveQuotaBandForScore } from './affinity.js';
 import { createRecall } from './memory-search.js';
 import { createArtifactStore } from './artifact-store.js';
 import {
@@ -61,7 +108,7 @@ import { isStickerLike, describeInlineImage, stickerLabelFromSummary } from './m
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
 const STATE_DIR = path.join(ROOT, 'state');
-// 纯语音的合成产物：按"文本+音色"哈希缓存，同一句话不重复合成。
+// 语音的合成产物：按"文本+音色"哈希缓存，同一句话不重复合成。
 const TTS_CACHE_DIR = path.join(STATE_DIR, 'tts');
 // 原文库检索器：懒加载（首次检索才建索引），events 目录 mtime 变了自动重建。
 // 与 memoryStoreHandle 一样放在模块级，避免每个请求都新建一份索引。
@@ -83,6 +130,13 @@ const SOCIAL_V2_FILE = path.join(STATE_DIR, 'social-v2.json');
 // 单独一个文件：它属于操作者配置，不能随 social-v2.json 的会话状态一起被重置清掉。
 const INITIAL_PROMPTS_FILE = path.join(STATE_DIR, 'initial-prompts.json');
 const STICKER_FILE = path.join(STATE_DIR, 'stickers.json');
+// 身体循环状态（饱腹/精力/yu wang）。单独一个文件，理由同 initial-prompts.json：
+// 它必须活过「清除上下文 / 重置二代状态」—— 那些操作只该清会话，不该清她的身体。
+// 也刻意不塞进 social-v2.json 的 conversations：那里每个 key 都是真实 QQ 聊天。
+const LIFE_CIRCLE_FILE = path.join(STATE_DIR, 'life-circle.json');
+// 生理周期锚点：只存 { anchorDay, cycleDays } 两个数，阶段每次现算。
+// 单独一个文件、**没有任何工具能写它** —— 纯后端被动推算（操作者要求）。
+const LIFE_CYCLE_FILE = path.join(STATE_DIR, 'life-cycle.json');
 const FEEDBACK_FILE = path.join(STATE_DIR, 'feedback.json');
 const TOOL_LOG_FILE = path.join(STATE_DIR, 'tool-calls.jsonl');
 const TOKEN_USAGE_FILE = path.join(STATE_DIR, 'token-usage.jsonl');
@@ -103,6 +157,48 @@ const DEFERRED_RESIDENT_TOOLS = new Set([
   'qq_find_tool',
   'qq_call_tool'
 ]);
+
+/**
+ * 唤醒触发器的**冻结**规则（2026-11-23 操作者拍板：**私聊和群聊都不允许改**）。
+ *
+ * 结论：triggers 从此**不是模型可配的东西**，一律钉死为
+ *   atMention: true · nameMention: true · poke: true · question: false
+ *
+ * 为什么连群聊也不给改：
+ *   · 让模型自己关掉"被 @ 就醒"，等于把**她能被叫醒的唯一保证**交给一个可能
+ *     误判的回合 —— 一次手滑就永久沉睡，而她自己不知道已经睡了。
+ *   · question 在 2026-11-12 就因误判率 60% 被判死（见 evaluateWakeTriggerV2
+ *     的注释），留着开关只让她以为"关掉了就不醒"，实际文本判定照样会误触发。
+ *   · 真该由她决定的是**要不要回**（发送）和**潜多久**（sleepMs / infinite 不变），
+ *     不是"什么事件能叫醒我"。这两类字段都在别处，没被这次改动影响。
+ *
+ * 顺带清掉四个对唤醒判定已无意义、且只留坏事可能的字段：
+ *   · anyMessage  —— 活跃模式已由 mode 表达（mode==='active' 本身就是任何消息都醒）
+ *   · probability —— 不再按概率抽样唤醒
+ *   · speakerIds  —— 容易残留成"只等某人"，那人不再发言就永不唤醒
+ *   · keywords    —— 正文关键词匹配误伤率高，实测她几乎不用
+ *
+ * ⚠️ 必须放在**模块层**：wake-config 路由在文件前部就要用它，而 const 不会被提升。
+ */
+const FIXED_WAKE_TRIGGERS = Object.freeze({
+  atMention: true,
+  nameMention: true,
+  poke: true,
+  question: false
+});
+
+/** 把 triggers 拍回冻结值（模型传什么都按这个覆盖）。 */
+function applyFixedWakeTriggersV2(triggers) {
+  const next = { ...(triggers && typeof triggers === 'object' ? triggers : {}) };
+  Object.assign(next, FIXED_WAKE_TRIGGERS);
+  next.anyMessage = false;
+  // 必须是 0：只要 >0，evaluateWakeTriggerV2 就会把它当成一条真实唤醒路径
+  //（「任意消息 × 概率」），潜水语义和主动额度统计会一起被打乱。
+  next.probability = 0;
+  next.speakerIds = [];
+  next.keywords = [];
+  return next;
+}
 
 /**
  * 模式拼写的**唯一**归一入口（输入边界）。
@@ -1023,8 +1119,6 @@ function loadConfig() {
         getUnread: true,
         getRecent: true,
         socialState: true,
-        sendGroup: true,
-        sendPrivate: true,
         reply: true,
         sendBurst: true,
         sendMessage: true,
@@ -1048,7 +1142,7 @@ function loadConfig() {
         stickerNote: true,
         collectSticker: true,
       },
-      // 纯语音（文字 → 睦的声音）：她照常打字，桥接把文字合成语音再发。
+      // 语音（文字 → 睦的声音）：她照常打字，桥接把文字合成语音再发。
       // 默认关闭。开关在控制台「运行概览 → 暂停/恢复」那一排。
       tts: { ...TTS_DEFAULTS },
       // ── 收尾前观望（mark_read / set_wake_config 的"空转"）───────────────
@@ -1072,26 +1166,49 @@ function loadConfig() {
         sleepMaxMs: 0,
         recommendedSleepMinMs: 300000,
         recommendedSleepMaxMs: 7200000,
+        // ── 下面五项**已失效**（2026-11-23 冻结触发器）─────────────────────
+        // triggers 不再是可配项：atMention/nameMention/poke 恒 true、question 恒 false。
+        // 保留这些键只为两件事：① 旧 config.json 里已有它们，删了会让控制台的
+        // "已保存但字段消失"看起来像丢配置；② 控制台读取时不至于 undefined。
+        // **改它们不会改变任何行为** —— 真正的来源是 FIXED_WAKE_TRIGGERS。
         recommendedProbability: 0.05,
         recommendedKeywords: ['小鲸鱼', 'DeepSeek', 'deepseek', 'DS', 'D老师', 'd老师', 'D指导', 'd指导', 'D师傅', 'd师傅', '深度求索', '大肥鱼', '鲸鱼', 'DeepSeek V3', 'DeepSeek R1', 'R1'],
         recommendedAtMention: true,
         recommendedNameMention: true,
         recommendedQuestion: true,
         recommendedPoke: true,
-        recommendedHint: '如果你要潜水，推荐先调用 qq_wait_for_messages(timeoutMs=300000) 完成一次沉睡前观察：5 分钟内没人说话就可以设置下一次唤醒并沉睡；若期间有人发新消息，先查看 newMessages，判断不需要你参与可直接沉睡，若参与了则下次想睡需再等观察窗口。潜水时长推荐 5~120 分钟，普通消息概率 0.05；@/名字/关键词/提问唤醒建议保持开启。需要等特定某人/某几人时，可额外设置 triggers.speakerIds。',
+        recommendedHint: '如果你要潜水，推荐先调用 qq_wait_for_messages(timeoutMs=300000) 完成一次沉睡前观察：5 分钟内没人说话就可以设置下一次唤醒并沉睡；若期间有人发新消息，先查看 newMessages，判断不需要你参与可直接沉睡，若参与了则下次想睡需再等观察窗口。潜水时长推荐 5~120 分钟。**唤醒条件不由你调**：@你、叫你名字、拍一拍会叫醒你，其余不会。想安静就潜水（sleepMs），想离开就用 mark_read 收尾。',
         batchWindowMs: 8000,
         maxWakePerMinute: 1,
         maxWakePerHour: 12,
         noActionLimit: 3,
         maxWakeConfigReminders: 2
       },
-      // ── 闲置压缩（上下文边界管理）──────────────────────────────────────────
-      // 设计原则：**对话进行中绝不压缩**。压缩会改写历史前缀，前缀一变
-      // provider 的 KV cache 就整段失效，之后每步都要重算全部历史。所以压缩
-      // 只发生在「用户已经安静足够久、DSH 也没在跑」的边界上，且一轮对话
-      // 最多压一次（idleCompactedAt 由下一条用户消息解锁）。
+      // ── 闲置压缩（2026-11-25 **默认关闭**）─────────────────────────────────
+      //
+      // 为什么关掉（重要，别再默认打开）：
+      //   本机制只能通过 `/compact`（commands/execute）触发，而 DSH 的
+      //   `compactNow()` 里那行是**硬编码 0**：
+      //       selectCompactableRange(session, measurement, 0)
+      //   retainTokens=0 ⇒ 循环第一轮就 break ⇒ 只保留最后一个节点，
+      //   其余全部压成摘要。用户以为的"保留尾部 20 万"从未发生过，
+      //   实际是"40 万上下文一夜之间掉到几千，前面一千多条全没了"。
+      //
+      //   本鱼核对了 DSH 源码里 8 处 selectCompactableRange 调用：
+      //     compactNow            → 0                     （/compact，硬编码）
+      //     compactIfNeeded(overflow) → 0                 （溢出恢复，也是 0）
+      //     compactPressure       → spec.retainTokens ✅  （唯一用配置的）
+      //   compactPressure 只有 DSH 内部的 agent/pre-step 钩子能触发，
+      //   桥接没有入口。所以想保留尾部只能靠预设里的原生压缩。
+      //
+      //   保留这套代码（而不是删除）：`idleCompactDecisionV2` 里已经加了一条
+      //   「manuallyTriggered 才算」的硬性拒绝 —— 见下面的实现。将来 DSH 若
+      //   在 compactNow 上开了 retainTokens 参数，把 enabled 改回 true 即可复活。
+      //
+      // 设计原则（历史遗留说明）：对话进行中不压缩，因为压缩会改写历史前缀，
+      // provider 的 KV cache 整段失效，那一步要重算全部历史。
       compaction: {
-        enabled: true,
+        enabled: false,
         onlyPrivate: true,        // 只对私聊（owner）做；群聊上下文靠话题自然推进
         idleMs: 1800000,          // 30 分钟没有**用户**消息（模型自己的动作不重置计时）
         thresholdTokens: 300000,  // 上下文超过 30 万 token 才值得压（1M 窗口的 30%）
@@ -1207,6 +1324,17 @@ function loadConfig() {
         maxCount: 5
       },
       ...(file.socialV2 ?? {})
+    },
+    // 生活连续性（2026-11-23 起）。
+    // 目前只有唤醒词首位那一行【现在】：
+    //   · 时间 / 星期 / 节气 / 农历节日 —— 全部本地计算（src/life-clock.js），零网络零状态；
+    //   · 天气、饥饿、精力、经期 —— 后续步骤往 buildNowLine 的 extras 里塞。
+    // 显式写 `enabled: false` 就完全不注入（这一行每轮都变，虽然只影响 user message，
+    // 但还是留一个总开关，出问题能立刻关掉而不必改代码）。
+    life: {
+      enabled: true,
+      timezone: 'Asia/Shanghai',
+      ...(file.life ?? {})
     }
   };
 
@@ -1223,8 +1351,6 @@ function loadConfig() {
     getUnread: true,
     getRecent: true,
     socialState: true,
-    sendGroup: true,
-    sendPrivate: true,
     reply: true,
     sendBurst: true,
     sendMessage: true,
@@ -1256,12 +1382,12 @@ function loadConfig() {
   };
 
   // ⚠️ 2026-11-12：`socialV2.voice`（语音库 / 固定语音发送）已整体删除。
-  //   那是原作者做的一套功能，操作者不再使用 —— 现在用的是**纯语音 TTS**
+  //   那是原作者做的一套功能，操作者不再使用 —— 现在用的是**语音 TTS**
   //   （她的话用 GPT-SoVITS 合成后发出），链路在 onebotSend / maybeSendAsVoice 里，
   //   直接生成 record 段，与本配置无关。
   //   同时删掉：qq_send_voice / qq_list_voices、voice-core.js、send-voice-lib.js、
   //   /api/socialV2/send-voice、/api/socialV2/voices、控制台语音库面板。
-  //   保留：socialV2.tts（纯语音）与 socialV2.ffmpegPath（media-normalize 要用）。
+  //   保留：socialV2.tts（语音）与 socialV2.ffmpegPath（media-normalize 要用）。
 
   // socialV2.sticker.collect 也需要深度合并，避免旧配置缺失 collect 子项时丢默认值。
   cfg.socialV2.sticker = {
@@ -2633,6 +2759,36 @@ async function main() {
     // 给空数组既能满足形状，也保证"全局永远不会有进行中话题"。
     activeTopics: [],
     pendingThoughts: [],
+    // 主动机会的记账（2026-11-24）：额度、间隔、未回应、当天用过的理由。
+    // 单独一块而不是挂在会话上 —— "今天已经找过他几次"是跨会话的账。
+    proactive: null,
+    // ── 主动唤醒额度（2026-11-23 新增，见 PROACTIVE_TIERS）─────────────────
+    //
+    // 为什么是**全局一份**而不是按会话：
+    //   「今天已经找过他几次」这件事属于"她跟这个人/这个世界的关系"，
+    //   不属于某个聊天房间。按会话存会出现"私聊额度用完、群聊还有"这种
+    //   真人不会有的分裂。
+    //
+    // 为什么放 globalMemory 而不是 socialV2 根上：
+    //   globalMemory 已经活过「清上下文 / 重置」，而额度本来就不该被重置清掉
+    //   （清了等于"重置一次就白送一轮额度"）。
+    proactive: {
+      v: 1,
+      // 每日计数。todayKey 一换就归零（按本地时区切日，见 PROACTIVE_DAY_KEY_TZ 说明）。
+      todayKey: '',
+      todayCount: 0,
+      // 上一次真正发出去的主动消息时刻（毫秒）。0 = 从没发过。
+      lastProactiveAt: 0,
+      // 上次走的是哪条路由（'continuation' / 'relational' / 'relatedTopic' / 'curiosity'）。
+      lastRoute: '',
+      // 未回应计数（按路由分开）。结构：{ [route]: { count, since } }
+      // since = 这一轮"开始等回复"的时刻；count 累加，靠真实入站活动清零。
+      unanswered: {},
+      // 正在等回复的起点。0 = 没在等。
+      awaitingReplySince: 0,
+      // 每条路由累计发了几条（控制台展示用，不做决策）。
+      routeSentCounts: {}
+    },
     // 形如会话状态的最小字段：不是会话，但被当成状态对象传进通用函数时不该炸。
     key: GLOBAL_MEMORY_KEY
   };
@@ -3022,7 +3178,21 @@ async function main() {
       // 单聊天也要给 key：标签可能已经简化成「群」，光有令牌没法发言。
       const only = members[0] ?? key;
       const canonical = canonicalV2Key(only) || only;
-      return `【令牌】${chatLabelForV2(canonical)} → key "${canonical}"，token ${fallbackToken}`;
+      const base = `【令牌】${chatLabelForV2(canonical)} → key "${canonical}"，token ${fallbackToken}`;
+      // 管理员会话：**只发不建**的跨聊天发言权。解绑共享之后，管理员私聊只看得到自己这一条，
+      // 模型不可能自己想到"我这个 token 其实也能发去群里"。不写清楚它就不会用（实测问过）。
+      // 措辞刻意只讲"能发到哪、不能干什么"，不解释后端实现。
+      //
+      // ⚠️ 这里直接用 cfg.ownerQQ 比较，**不要**引用下方 main() 内的 ownerPrivateKeyOf：
+      //    那个 const 在 L37xx 才初始化，而本函数定义在 L3017；虽然现存调用点都在其后，
+      //    但那样等于把"函数不能早于某行被调用"变成隐式契约，改一次调用顺序就炸。
+      const ownerUid = String(cfg?.ownerQQ ?? '').trim();
+      if (ownerUid && canonical === `private:${ownerUid}`) {
+        // 只给"能干什么"这一句。能力边界、后端实现、行为劝告都不写 ——
+        // 模型只需要知道 key 可以填别的聊天；其余是噪声，每轮都在烧 token。
+        return `${base}\n【跨聊天】qq_send_message 的 key 可填任意 "group:群号" / "private:QQ号"。`;
+      }
+      return base;
     }
     // 2026-11-10 合并成一行：原版是「群 20001 → 38721c0c…」+「调用工具时把 key 和令牌
     // 配成一对…」共 5 行约 220 字，每轮唤醒都进历史并随每一步重发。
@@ -3722,6 +3892,62 @@ async function main() {
       if (agentTokenOk(key, token)) return true;      // 本聊天自己的令牌
       return isOwnerAgentToken(token);                // 主人私聊：可发往任意聊天
     };
+
+    /**
+     * 「只发不建」判定：主人令牌发往**不在白名单**的聊天时走这条。
+     *
+     * 需求原文：**只能发，不会创建新的会话**。原始实现里非白名单会在
+     * modeAllowed() 处直接 403；但主人有时只需要往某个群喊一句，不该因此
+     * 给那个群开出一个完整会话（唤醒配置、未读队列、随机 token、定时器…）。
+     *
+     * 所以这里放行发送，但调用方必须**跳过 getSocialV2State(key)**，
+     * 否则 getSocialV2State 会懒创建一个完整会话状态并被 saveSocialV2State()
+     * 持久化 —— 那就等于「发一条 = 建一个会话」，正是要避免的。
+     *
+     * @param {string} key 目标聊天 key
+     * @param {string} token 请求方 agent token
+     * @param {boolean} allowedByPolicy modeAllowed 的结果
+     * @returns {boolean} 是否按「只发不建」处理
+     */
+    const isSendOnlyBypass = (key, token, allowedByPolicy) => {
+      if (allowedByPolicy) return false;              // 白名单内：走正常路径
+      if (!isOwnerAgentToken(token)) return false;    // 只有主人能借用这条
+      // 必须是合法 key 形态（canonicalV2Key 已在调用方校验过，这里再兜一层）
+      return !!canonicalV2Key(key);
+    };
+
+    /**
+     * 「只发不建」用的临时会话状态（**只在内存里活一次请求**）。
+     *
+     * 形状与 getSocialV2State() 的返回值一致，够发送路径用：sendTimes 支撑限频、
+     * 其它字段让 resolveReplyTargetV2 / recordSentMessagesV2 / paceAfterSendV2
+     * 之类不因 undefined 崩掉。它的**唯一目的**是替代 getSocialV2State(key)，
+     * 从而不把目标聊天登记成真实会话。
+     *
+     * ⚠️ 每次调用返回新对象，绝不缓存、绝不塞进 socialV2.conversations。
+     */
+    const makeEphemeralSendState = () => ({
+      wakeConfig: { ...defaultWakeConfigV2() },
+      recentMessages: [],
+      unread: [],
+      lastWakeReason: '',
+      lastAiReplyAt: 0,
+      lastActionAt: 0,
+      agentToken: '',
+      bootstrapSent: true,      // 不触发冷启动注入
+      wakeTimes: [],
+      sendTimes: [],
+      stickerCollectTimes: [],
+      lastIncomingAt: 0,
+      lastUnreadSeq: 0,
+      lastReadThroughSeq: 0,
+      modelSeenSeqs: new Set(),
+      activeTopics: [],
+      selfNotes: [],
+      pendingThoughts: [],
+      memberImpressions: {},
+      affinities: {},
+    });
     const server = http.createServer(async (req, res) => {
       let url;
       try { url = new URL(req.url ?? '/', `http://127.0.0.1:${port}`); }
@@ -4015,6 +4241,103 @@ async function main() {
             snowluma: snowlumaHealthSnapshot(),
             activity: readActivityTail(100)
           });
+          return;
+        }
+        // ── 生活状态（2026-11-24 新增，给面板「状态」页用）────────────────
+        //
+        // 返回当前的身体/周期/条件全貌，**只读**。
+        // 与 /api/status 分开的原因：那个端点被 QQ 侧的智能体也会调用（受限视图），
+        // 而这里包含性欲、生理期这类只该给操作者看的东西 —— 混进去容易漏。
+        if (req.method === 'GET' && url.pathname === '/api/life') {
+          if (req.headers['x-agent-token'] || req.headers['x-agent-call'] !== undefined) {
+            sendJson({ ok: false, error: '生活状态只对控制台开放' }, 403);
+            return;
+          }
+          try {
+            const now = Date.now();
+            const tz = String(cfg.life?.timezone || 'Asia/Shanghai');
+            const circle = settleLifeCircle();
+            const conds = readLifeCond();
+            const active = activeLife(conds.list, now);
+            const cyc = readLifeCycle();
+            const today = floorDay(now, tz);
+            const info = cyc.anchorDay ? phaseAt(cyc.anchorDay, today, cyc.cycleDays) : null;
+            const eff = info ? phaseEffect(info, { text: cfg.life?.statusText }) : null;
+            const composed = composeEnergyValueV2(circle.energy, conds.list);
+            const mood = composeMoodValueV2(conds.list, phaseMoodOfV2());
+            const weather = lifeWeatherCacheV2();
+
+            sendJson({
+              ok: true,
+              enabled: cfg.life?.enabled !== false,
+              timezone: tz,
+              dayKey: todayKeyOf(now),
+              clock: (() => {
+                try {
+                  const f = new Intl.DateTimeFormat('en-CA', {
+                    timeZone: tz, hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
+                  });
+                  return f.format(new Date(now));
+                } catch { return ''; }
+              })(),
+              // 身体三维（0~100）。energy 给的是**叠加后**的值，另附原始值便于排查。
+              circle: {
+                satiety: Math.round(circle.satiety),
+                energy: Math.round(composed),
+                energyBase: Math.round(circle.energy),
+                desire: Math.round(circle.desire),
+                asleep: circle.asleep === true
+              },
+              mood: mood || '',
+              cycle: info ? {
+                phase: info.phase,
+                phaseName: info.phaseName,
+                dayInCycle: info.dayInCycle,
+                cycleDays: cyc.cycleDays,
+                daysToNextPeriod: info.daysToNextPeriod,
+                energyMedian: info.energyMedian,
+                mark: eff && eff.show ? String(eff.note || '') : '',
+                inPeriod: info.phase === 'menstrual'
+              } : null,
+              weather: weather ? {
+                text: weather.text, tempC: weather.tempC, feelsC: weather.feelsC,
+                sunrise: weather.sunrise, sunset: weather.sunset,
+                stale: weather.stale === true
+              } : null,
+              // 活跃的 condition（含恢复尾声）。按 intensity 降序 —— 面板看到的顺序
+              // 就是"此刻哪件事最占上风"的顺序。
+              conditions: active
+                .slice()
+                .sort((a, b) => (b.intensity || 0) - (a.intensity || 0))
+                .map((c) => ({
+                  id: c.id,
+                  kind: c.kind,
+                  label: c.label,
+                  mood: c.mood,
+                  energyDelta: c.energyDelta,
+                  intensity: c.intensity,
+                  endsAt: c.endTs,
+                  remainMinutes: Math.max(0, Math.round((c.endTs - now) / 60000))
+                })),
+              meta: {
+                lastDiscomfortRoll: conds.meta.lastDiscomfortRoll,
+                lastHealthRoll: conds.meta.lastHealthRoll,
+                lastSleepDay: conds.meta.lastSleepDay,
+                lastSleepHours: conds.meta.lastSleepHours
+              },
+              flags: {
+                circle: cfg.life?.circle !== false,
+                cycle: cfg.life?.cycle !== false,
+                health: cfg.life?.health !== false,
+                sleep: cfg.life?.sleep !== false,
+                discomfort: cfg.life?.discomfort !== false,
+                meals: cfg.life?.meals !== false,
+                weather: cfg.life?.weather !== false
+              }
+            });
+          } catch (error) {
+            sendJson({ ok: false, error: `读取生活状态失败：${error?.message ?? error}` }, 500);
+          }
           return;
         }
         if (req.method === 'GET' && url.pathname === '/api/presets') {
@@ -4727,7 +5050,8 @@ async function main() {
           }
           const isV2 = currentMode === 'reserved2';
           const roleState = readRoleState();
-          const roleLine = roleState.role ? `【当前角色】${roleState.role}（完整角色卡请调用 qq_get_prompt 查看）\n\n` : '';
+          // 2026-11-23：括号内容删掉，只留名字（详见 buildRoleLineV2 的说明）。
+          const roleLine = roleState.role ? `【当前角色】${roleState.role}\n\n` : '';
           // 二代必须带会话令牌，否则 AI 调用任何 MCP 状态/发送工具都会被拒。
           let tokenLine = '';
           if (isV2) {
@@ -4799,7 +5123,7 @@ async function main() {
           // tools：只接受布尔开关
           // 注意 'fact' 已移除（2026-11-10）：长期事实并入 qq_memory_append 的 longTerm 类别，
           // 写入闸门走 'memory'。留在这里会让旧配置的 tools.fact 被重新写回。
-          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'sendFile', 'recallMessage'];
+          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'sendFile', 'recallMessage', 'getLyrics'];
           if (body.tools && typeof body.tools === 'object') {
             merged.tools = { ...(current.tools ?? {}), ...body.tools };
             for (const k of toolFlags) {
@@ -4969,18 +5293,18 @@ async function main() {
           sendJson({ ok: true, paused: socialV2.paused });
           return;
         }
-        // ── 纯语音（文字 → 睦的声音）──────────────────────────────────────
+        // ── 语音（文字 → 睦的声音）──────────────────────────────────────
         // GET  ：读当前开关 + 推理服务是否就绪（控制台打开页面时用来画状态）
         // POST ：切换开关。**打开时**如果推理服务没在跑，自动拉起并等它就绪。
         //        拉起失败不阻断开关本身（仍然记住"想开"），但会把原因回给控制台，
         //        避免出现"开关是开的、其实一直发文字"这种没人知道的静默降级。
-        // ── 纯语音（智能体通道）──────────────────────────────────────────
-        // 她能自己开关纯语音，但**只有跟主人私聊时才能开**。
+        // ── 语音（智能体通道）──────────────────────────────────────────
+        // 她能自己开关语音，但**只有跟主人私聊时才能开**。
         //
         // 身份判定不靠她传参数，而是桥接自己看当前 key：
         //   · private:<ownerQQ> → 就是主人，允许开
         //   · 群里 / 其他人的私聊 → 一律拒绝
-        // 这样即使她在群里被某人要求"开语音"，也开不起来 —— 纯语音是熟人在私聊里用的东西，
+        // 这样即使她在群里被某人要求"开语音"，也开不起来 —— 语音是熟人在私聊里用的东西，
         // 不是群里谁喊一声就能触发的开关。
         if (url.pathname === '/api/socialV2/tts' && req.headers['x-agent-token']) {
           const body = req.method === 'POST' ? await readBody() : {};
@@ -4998,7 +5322,7 @@ async function main() {
             if (!talkingToOwner) {
               // 她说这句时会带出去，所以用账号名而不是身份称呼 ——
               // 「主人」这类词会影响她对那个人的判断（操作者 2026-11-20 指出）。
-              sendJson({ ok: false, error: '仅 ownerQQ 的私聊可开关纯语音', enabled: socialV2.tts?.enabled === true }, 403);
+              sendJson({ ok: false, error: '仅 ownerQQ 的私聊可开关语音', enabled: socialV2.tts?.enabled === true }, 403);
               return;
             }
             const cur = normalizeTtsConfig(socialV2.tts ?? {});
@@ -5013,8 +5337,8 @@ async function main() {
             }
             socialV2.tts = { ...cur, enabled: want };
             saveSocialV2State();
-            log(`[tts] 智能体切换纯语音：${want ? '开' : '关'}（key=${keyRaw}，服务${ready ? '就绪' : '未就绪'}）`);
-            appendActivity(`[tts] 智能体切换纯语音 ${want ? '开启' : '关闭'}`);
+            log(`[tts] 智能体切换语音：${want ? '开' : '关'}（key=${keyRaw}，服务${ready ? '就绪' : '未就绪'}）`);
+            appendActivity(`[tts] 智能体切换语音 ${want ? '开启' : '关闭'}`);
             // 只回最少的信息：她要的是一句话，不是状态面板。
             sendJson({ ok: true, enabled: want, ready, started, detail });
             return;
@@ -5050,8 +5374,8 @@ async function main() {
             }
             socialV2.tts = { ...cur, enabled: want };
             saveSocialV2State();
-            log(`控制台：纯语音${want ? '已开启' : '已关闭'}（推理服务${ready ? '就绪' : '未就绪'}）`);
-            appendActivity(`[tts] 纯语音${want ? '开启' : '关闭'}；服务${ready ? '就绪' : '未就绪'}${started ? '（已自动拉起）' : ''}`);
+            log(`控制台：语音${want ? '已开启' : '已关闭'}（推理服务${ready ? '就绪' : '未就绪'}）`);
+            appendActivity(`[tts] 语音${want ? '开启' : '关闭'}；服务${ready ? '就绪' : '未就绪'}${started ? '（已自动拉起）' : ''}`);
             sendJson({ ok: true, enabled: want, ready, started, detail });
             return;
           }
@@ -5149,15 +5473,72 @@ async function main() {
             if (!st) continue;
             if (!isSessionAllowedInCurrentMode(key)) continue;
             const idleMs = Date.now() - (st.lastIncomingAt || 0);
+            // ── 2026-11-24：把 tier 额度那套的实时状态一并给面板 ──────────
+            //
+            // 面板原来只能显示"概率 30% / 间隔 30–90 分钟"，
+            // 而私聊早就改成额度制了 —— 那几行数字对私聊是**假的**。
+            // 现在按会话类型分别给：
+            //   私聊 → tier / 今日额度 / 已发几条 / 未回应 / 实际间隔 / 档位
+            //   群聊 → 仍是概率那套（字段名不变，保持兼容）
+            const isPrivate = key.startsWith('private:');
+            let tierInfo = null;
+            if (isPrivate) {
+              try {
+                const { governed, tier, policy, quota, band } = proactiveQuotaOf(key);
+                if (governed) {
+                  const nowTmp = new Date();
+                  // 2026-11-24：**按 key 取**。原来这三个都是全局的，
+                  // 面板于是把「所有会话加起来发了几条」当成「这个会话发了几条」。
+                  const usedToday = proactiveTodayCount(key);
+                  const unansweredCnt = proactiveUnansweredTotal(key);
+                  const ctx = { hour: nowTmp.getHours(), minute: nowTmp.getMinutes(), quota, usedToday };
+                  const ov = daypartGapOverride(policy, ctx);
+                  const gapMs = ov > 0 ? ov : proactiveGapMsOf(policy, unansweredCnt, ctx);
+                  tierInfo = {
+                    tier,
+                    label: String(policy?.label || ''),
+                    quota,
+                    usedToday,
+                    remaining: Math.max(0, quota - usedToday),
+                    unanswered: unansweredCnt,
+                    gapMs,
+                    // 额度区间（面板要显示「本档 8–12 条」这类文案）
+                    rangeLo: band ? Number(band.lo) : null,
+                    rangeHi: band ? Number(band.hi) : null,
+                    // 分数与档位名（面板显示「依赖 · 450 分」）
+                    score: Number(socialV2.affinities?.[key.slice('private:'.length)]?.score) || 0,
+                    stageLabel: (affinityStageOf(Number(socialV2.affinities?.[key.slice('private:'.length)]?.score) || 0) || {}).label || '',
+                    // 今天各时段发了几条（面板画小柱状图）
+                    dayparts: { ...proactiveDaypartCounts() },
+                    // 间隔被哪一层放大了（面板显示"因未回应 ×1.35"这类解释）
+                    gapLayers: { hourFactor: hourActivityFactor(nowTmp.getHours()) }
+                  };
+                }
+              } catch (error) {
+                log(`[proactive] 面板读取 tier 信息失败（已跳过）：${error?.message ?? error}`);
+              }
+            }
             rows.push({
               key,
               enabled: st.proactiveDisabled !== true,
               lastIncomingAt: Number(st.lastIncomingAt) || 0,
               idleMs,
               lastAiReplyAt: Number(st.lastAiReplyAt) || 0,
-              // 下一次检查还有多久（没排就是 null —— 关掉了 / 没进过调度）
+              // 「下一次检查什么时候」（没排就是 null —— 关掉了 / 没进过调度）
+              //
+              // ⚠️ 2026-11-24 修：原来只回 `nextCheckInMs`（**倒计时**），
+              //    于是面板每刷新一次数字就变一次（时间在流逝），
+              //    用户看到的是"点一下刷新，间隔就变"，以为有 bug。
+              //
+              //    现在**同时**回绝对时刻 `nextCheckAt`：
+              //      · 绝对时刻在一次调度内是**恒定**的，刷新多少次都一样
+              //      · 倒计时留给"还要多久"的即时显示
+              //    面板优先显示绝对时刻。
+              nextCheckAt: st.proactiveTimer ? (Number(st.proactiveNextCheckAt) || null) : null,
               nextCheckInMs: st.proactiveTimer ? Math.max(0, Number(st.proactiveNextCheckAt || 0) - Date.now()) : null,
-              unreadCount: Array.isArray(st.unread) ? st.unread.length : 0
+              unreadCount: Array.isArray(st.unread) ? st.unread.length : 0,
+              // 2026-11-24：私聊的额度制状态（群聊为 null）
+              tier: tierInfo
             });
           }
           // 群在前、私聊在后；同类按最近活跃排（最近说过话的更可能是你在意的）
@@ -5221,8 +5602,9 @@ async function main() {
             getUnread: 'qq_get_unread_messages',
             getRecent: 'qq_get_recent_messages',
             socialState: 'qq_social_state',
-            sendGroup: 'qq_send_group_message',
-            sendPrivate: 'qq_send_private_message',
+            // 2026-11-23：sendGroup / sendPrivate 已从 MCP 删除 —— 现在只有二代模式，
+            // 发送统一走 qq_send_message（参数是 key 而不是 groupId/userId）。
+            // 那两个旧工具只服务 closed-agent 模式，本机已不再使用。
             reply: 'qq_reply',
             sendBurst: 'qq_send_burst',
             sendMessage: 'qq_send_message',
@@ -5444,6 +5826,139 @@ async function main() {
           }
           return;
         }
+        // ── 身体循环（饱腹/精力/yu wang）2026-11-23 ─────────────────────────
+        // GET  ：读当前值（会先按时间结算，返回的是"此刻"的值）
+        // POST ：{"key","token","add":{satiety?,energy?,desire?}} 增量加值
+        //
+        // 边界：会话令牌 + 当前模式白名单，与其它 agent 端点一致。
+        // 身体是**全局一份**（不分私聊群聊）—— 她只有一个身体，群里说"我刚吃完饭"
+        // 私聊里也应该饱。但**yu wang**在群聊里不显示也不许加（见 includeDesire）。
+        if (url.pathname === '/api/socialV2/life-circle') {
+          const body = req.method === 'POST' ? await readBody() : {};
+          const key = String(req.method === 'POST' ? body.key : url.searchParams.get('key') ?? '').trim();
+          const token = String(req.headers['x-agent-token'] ?? (req.method === 'POST' ? body.token : url.searchParams.get('token')) ?? '');
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+          if (!agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!isSessionAllowedInCurrentMode(key)) { sendJson({ ok: false, error: '当前模式不允许该会话' }, 403); return; }
+          if (cfg.life?.circle === false) { sendJson({ ok: false, error: '身体状态已在配置里关闭（life.circle=false）' }, 403); return; }
+          try {
+            if (req.method === 'POST') {
+              const isPrivate = String(key).startsWith('private:');
+              const add = body.add && typeof body.add === 'object' ? body.add : {};
+              // 群聊不许加yu wang：她只有一个身体，但"被满足"这种事不该在群里发生。
+              if (!isPrivate) delete add.desire;
+              // ── 醒来检测必须在 settle **之前**做 ────────────────────────
+              //
+              // ⚠️ 2026-11-23 踩坑记录：醒来状态句子里全是空的，根因是时序。
+              //   `settleLifeCircle()` 会把「上次结算 → 现在」这段时间**消费掉**
+              //   并更新 lastTickedAt。如果在它之后才判断"刚醒"，那
+              //   `hours` 和 `recovered` 都只剩「settle 之后这一小段」≈ 0。
+              //
+              //   所以先取一份**原始快照**（未结算），用它当"入睡前"的基准，
+              //   再 settle、再判断 asleep 的 true→false。
+              const rawBeforeSettle = readLifeCircle();
+              const wasAsleep = rawBeforeSettle?.asleep === true;
+              const before = settleLifeCircle();
+              // asleep 是**显式三态**：true 睡了 / false 醒了 / 不传保持原状。
+              // 睡眠只由她自己说（或离线推断），不按时钟猜。
+              const asleep = typeof body.asleep === 'boolean' ? body.asleep : undefined;
+              const next = addToLifeCircleFn(before, add, Date.now(), {
+                gapMs: Date.now() - (Number(before.lastTickedAt) || 0),
+                offlineThresholdMs: lifeOfflineThresholdMs(),
+                asleep
+              });
+              // 睡 → 醒：用「原始快照」当入睡基准，`next` 当醒来后的值。
+              if (wasAsleep && asleep === false) {
+                try {
+                  pendingSleepWake = computeSleepWakeReport(rawBeforeSettle, next);
+                } catch (error) {
+                  pendingSleepWake = null;
+                  log(`[life] 起床状态计算失败（已跳过）：${error?.message ?? error}`);
+                }
+                // 她自己说"醒了"时也掷一次梦 —— 和自动醒走同一条路。
+                // 普通梦不唤醒她，只是留一句等她下次被叫到。
+                try { rollDreamOnWakeV2('self-wake'); } catch { /* 掷梦失败不影响醒来 */ }
+              }
+              writeLifeCircle(next);
+
+              // ── 吃了饭 → 清掉所有「饿了」类 condition（2026-11-24）──────
+              //
+              // 实测漏了这条：她调 qq_life_circle(satiety=+N) 之后，
+              // 数值上不饿了（satiety 59），但唤醒词里还挂着
+              // 「饿了，想吃点热的」—— 因为**加值只动数字，不动 condition**。
+              // 于是出现「不饿」和「饿了」同时显示的荒谬组合。
+              //
+              // 规则：只要这次调用抬了 satiety，就认为她吃过/垫过了，
+              // 所有 meal 类 + 任何 label 含"饿"的 condition 全部作废。
+              // 不看具体加了多少 —— 她自己调这个工具就代表"我吃了"这个事实。
+              if (typeof add.satiety === 'number' && add.satiety > 0) {
+                try {
+                  const lc = readLifeCond();
+                  const before = lc.list.length;
+                  const kept = lc.list.filter((c) => {
+                    if (c.kind === 'meal') return false;          // 饭点念头一律作废
+                    if (/饿/.test(String(c.label || ''))) return false;  // 任何带"饿"的也清
+                    return true;
+                  });
+                  if (kept.length !== before) {
+                    writeLifeCond({ list: kept, meta: lc.meta });
+                    log(`[life] 吃过饭，清掉 ${before - kept.length} 条"饿了"类条件`);
+                  }
+                } catch (error) {
+                  log(`[life] 清理饥饿条件失败（已跳过）：${error?.message ?? error}`);
+                }
+              }
+
+              // ── care_warmth：她调工具说"我被关心了一下"（2026-11-24）──────
+              // 操作者要求：判断"被关心"交给她自己调 `cared=true`，桥接不猜。
+              // 理由和饥饿一样：从话里判断"这句算不算关心"太模糊，
+              // 而她说"有人关心我了"是明确的信号。
+              let careAdded = false;
+              if (body.cared === true) {
+                try {
+                  const spec = pickFromPool(CARE_POOL);
+                  if (spec) {
+                    const lc = readLifeCond();
+                    writeLifeCond({
+                      list: upsertCondLife(lc.list, makeConditionLife({
+                        id: `care-${Date.now()}`,
+                        kind: 'care_warmth',
+                        label: spec.label,
+                        mood: spec.mood,
+                        energyDelta: spec.energyDelta,
+                        intensity: 45,
+                        startTs: Date.now(),
+                        durationHours: spec.hours,
+                        onEndTransition: TRANSITIONS.SOFT_AFTERGLOW
+                      })),
+                      meta: lc.meta
+                    });
+                    careAdded = true;
+                  }
+                } catch (error) {
+                  log(`[life] care_warmth 写入失败（已跳过）：${error?.message ?? error}`);
+                }
+              }
+              sendJson({
+                ok: true,
+                key,
+                values: { satiety: Math.round(next.satiety), energy: Math.round(next.energy), desire: Math.round(next.desire) },
+                text: describeLifeCircle(next)
+              });
+              return;
+            }
+            const cur = settleLifeCircle();
+            sendJson({
+              ok: true,
+              key,
+              values: { satiety: Math.round(cur.satiety), energy: Math.round(cur.energy), desire: Math.round(cur.desire) },
+              text: describeLifeCircle(cur)
+            });
+          } catch (error) {
+            sendJson({ ok: false, error: `身体状态读写失败：${error?.message ?? error}` }, 500);
+          }
+          return;
+        }
         if (req.method === 'POST' && url.pathname === '/api/socialV2/artifact') {
           // 产物索引（L3）：大块文本/代码/文件落盘，对话里只留 id + 描述。
           // 边界：只有 owner 私聊能用（群聊不需要文件柜）；scope 固定等于当前 key，
@@ -5509,10 +6024,24 @@ async function main() {
               if (content.length > 1000) { sendJson({ ok: false, error: 'content 太长（上限 1000 字）' }, 400); return; }
               const max = Math.max(1, Number(cfg.socialV2?.qzone?.maxPerDay) || 2);
               const now = Date.now();
-              qzSt.qzonePostTimes = (Array.isArray(qzSt.qzonePostTimes) ? qzSt.qzonePostTimes : [])
-                .map(Number).filter((t) => Number.isFinite(t) && now - t < 86400000);
-              if (qzSt.qzonePostTimes.length >= max) {
-                sendJson({ ok: false, error: `今天已经发过 ${qzSt.qzonePostTimes.length} 条说说，上限 ${max} 条/天` }, 429);
+              // ── 日额度的判定方式：**日历日**，不是滚动 24 小时（2026-11-24 改）──
+              //
+              // 原来用 `now - t < 86400000` 的滚动窗口，问题是：
+              //   早上 8 点发的一条，到第二天早上 8 点前还算"今天"，
+              //   于是"每天最多 2 条"实际变成了"任意 24 小时内最多 2 条"，
+              //   跨天时会突然卡住。
+              //
+              // 现在照 AstrBot 的 `sent_day` 做法：存一个日期字符串，
+              // 跨天就整体归零。简单、不会积数组、语义就是"今天"。
+              // 代价是 23:59 发的到 00:01 就重置额度 —— 那个代价可以接受。
+              const today = todayKeyOf(now);
+              if (qzSt.qzoneSentDay !== today) {
+                qzSt.qzoneSentDay = today;
+                qzSt.qzoneSentCount = 0;
+              }
+              const used = Number(qzSt.qzoneSentCount) || 0;
+              if (used >= max) {
+                sendJson({ ok: false, error: `今天已经发过 ${used} 条说说，上限 ${max} 条/天` }, 429);
                 return;
               }
               const params = { content, ugc_right: Number(body.ugcRight) || 1 };
@@ -5523,10 +6052,10 @@ async function main() {
                 params.target_uins = body.targetUins.map(Number).filter(Number.isFinite);
               }
               const r = await onebotHttpAction('send_qzone_msg', params, { timeoutMs: 60000 });
-              qzSt.qzonePostTimes.push(now);
+              qzSt.qzoneSentCount = (Number(qzSt.qzoneSentCount) || 0) + 1;
               saveSocialV2State();
               appendActivity(`${key} [qzone] 发了说说：${content.slice(0, 40)}`);
-              sendJson({ ok: true, tid: r?.data?.tid ?? null, time: r?.data?.time ?? now, used: qzSt.qzonePostTimes.length, max });
+              sendJson({ ok: true, tid: r?.data?.tid ?? null, time: r?.data?.time ?? now, used: qzSt.qzoneSentCount, max });
               return;
             }
             if (action === 'list') {
@@ -5616,7 +6145,7 @@ async function main() {
           const wantRaw = url.searchParams.get('includeRaw') === '1';
           const now = Date.now();
           const label = chatLabelForV2(key);
-          const lines = messages.map((m) => renderOneMessageLine(compactModelMessage(m, { now }), { label }));
+          const lines = messages.map((m) => renderOneMessageLine(compactModelMessage(m, { now }), { label, timeStyle: 'both' }));
           // 2026-11-12：首行把「总数 / 已给过 / 本次新增」三个数字讲清楚。
           // 之前只写「1 条（另有 2 条已在【本轮消息】里）」，而 unreadCount 字段是 3，
           // 模型看到 3 却只读到 1 条会以为工具漏了，于是反复重读。
@@ -5662,7 +6191,7 @@ async function main() {
           // unread 早就是文本行了（"[群] #seq 谁·多久前：内容"），这里跟着改，两边一致。
           const now = Date.now();
           const label = chatLabelForV2(key);
-          const lines = messages.map((m) => renderOneMessageLine(compactModelMessage(m, { now }), { label }));
+          const lines = messages.map((m) => renderOneMessageLine(compactModelMessage(m, { now }), { label, timeStyle: 'both' }));
           const head = messages.length
             ? `【最近 ${messages.length} 条】`
             : '（这个会话还没有消息）';
@@ -5734,7 +6263,7 @@ async function main() {
             // 贴给她那一批 = uncovered（她没看过的未读）。2026-11-15 收尾观望删掉后
             // 不再需要跟 observedFresh 取并集，直接用它，顺序按 seq 升序。
             const merged = uncovered.slice().sort((a, b) => (a.seq || 0) - (b.seq || 0));
-            const lines = merged.map((m) => renderOneMessageLine(compactModelMessage(m, { now }), { label }));
+            const lines = merged.map((m) => renderOneMessageLine(compactModelMessage(m, { now }), { label, timeStyle: 'both' }));
             const maxSeq = merged.reduce((mx, m) => Math.max(mx, Number(m.seq) || 0), 0);
             const totalUnread = (st.unread || []).length;
             const seenCount = Math.max(0, totalUnread - uncovered.length);
@@ -5904,12 +6433,20 @@ async function main() {
           if (key.startsWith('private:')) {
             next.triggers.speakerIds = [];
           }
-          // 防止 AI 永眠：无限期潜水必须至少有一个可触发条件
+          // ── 触发器全局冻结（2026-11-23 操作者拍板：私聊和群聊都不允许改）──
+          // 放在**所有归一化之后**：这样无论模型传什么，最终都是那一组固定值。
+          // 注意：她仍然可以改 mode / infinite / sleepMs / sleepUntil / batchWindowMs ——
+          // 被锁死的只有"什么事件能叫醒我"这一类，见 FIXED_WAKE_TRIGGERS 的说明。
+          next.triggers = applyFixedWakeTriggersV2(next.triggers);
+          // ── 防永眠：这道门**已经恒真**，保留只作兜底 ──────────────────
+          // 冻结后至少有三条恒为 true（atMention / nameMention / poke），
+          // 所以这里的 hasTrigger 永远成立。留着是防止以后有人改
+          // FIXED_WAKE_TRIGGERS 时把三条全关掉 —— 那时这里会立刻拦下来。
           if (next.infinite) {
             const tr = next.triggers ?? {};
             const hasTrigger = tr.atMention || tr.nameMention || tr.poke || (Array.isArray(tr.keywords) && tr.keywords.length > 0) || tr.question || tr.anyMessage || (Number(tr.probability) > 0) || (Array.isArray(tr.speakerIds) && tr.speakerIds.length > 0);
             if (!hasTrigger) {
-              sendJson({ ok: false, error: '无限期潜水必须至少保留一个唤醒条件（@/名字/拍一拍/关键词/提问/anyMessage/概率>0），否则 AI 可能永眠' }, 400);
+              sendJson({ ok: false, error: '无限期潜水必须至少保留一个唤醒条件（@/名字/拍一拍），否则 AI 可能永眠' }, 400);
               return;
             }
           }
@@ -5936,7 +6473,7 @@ async function main() {
             const uncoveredSeq = merged.reduce((mx, m) => Math.max(mx, Number(m.seq) || 0), 0);
             const now = Date.now();
             const label = chatLabelForV2(key);
-            const lines = merged.map((m) => renderOneMessageLine(compactModelMessage(m, { now }), { label }));
+            const lines = merged.map((m) => renderOneMessageLine(compactModelMessage(m, { now }), { label, timeStyle: 'both' }));
             const totalUnread = (st.unread || []).length;
             const seenCount = Math.max(0, totalUnread - uncovered.length);
             // 同上：贴出即视为看过，避免下一次调用重复贴同一批。
@@ -5982,20 +6519,41 @@ async function main() {
           //   · unreadCount —— **没用**：还有未读时根本走不到这个分支
           //     （上面的拦截分支会把正文直接贴给她），能走到这里就一定是 0
           // 她只需要知道"收尾成功了 + 现在是什么唤醒状态"。
-          const modeText = next.infinite ? '无限期潜水' : '有限期潜水';
-          const tr = next.triggers || {};
-          const onOff = (v) => (v ? '✓' : '✗');
-          const kwText = Array.isArray(tr.keywords) && tr.keywords.length
-            ? `[${tr.keywords.join('/')}]`
-            : '[无]';
-          const probPct = Math.round((Number(tr.probability) || 0) * 100);
-          const wakeSummary = `@${onOff(tr.atMention)} 名字${onOff(tr.nameMention)} 关键词${kwText} `
-            + `拍一拍${onOff(tr.poke)} 概率${probPct}%`
-            + (Array.isArray(tr.speakerIds) && tr.speakerIds.length ? ` 只等${tr.speakerIds.length}人` : '');
+          // 2026-11-24（操作者要求）：**回执只说"下次什么时候醒"，不提收尾**。
+          //
+          // 原来回的是「✅ 收尾完成：标记 N 条已读，无限期潜水，读到 #X。\n当前唤醒：@✓ 名字✓ …」
+          // 两个问题：
+          //   ① "收尾完成"是错的措辞 —— 这个工具不是收尾工具（收尾用 qq_mark_read）。
+          //      只有她**同时传了 throughSeq**才是顺带标了已读，那也只是附带动作。
+          //   ② 唤醒条件已冻结，逐项列 @、名字、关键词、拍一拍、概率 是纯噪音 ——
+          //      她没得选，知道了也不会改变行为。
+          //
+          // 现在只说结果：睡多久 + 什么时候醒。传了 throughSeq 才顺带提一句标了几条。
+          //
+          // ⚠️ next 里**没有 sleepMs 字段** —— 有限时长在 6348 行就已经换算成
+          // sleepUntil（ISO）了。所以这里只需看 infinite / sleepUntil。
+          const sleepText = (() => {
+            if (next.infinite) return '无限期潜水';
+            const until = Date.parse(String(next.sleepUntil ?? ''));
+            if (!Number.isFinite(until)) return '有限期潜水';
+            const localTime = new Date(until)
+              .toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+              .replace(/\//g, '-');
+            const mins = Math.round((until - Date.now()) / 60000);
+            const dur = mins >= 60 ? `${Math.round(mins / 60)} 小时` : `${Math.max(1, mins)} 分钟`;
+            return `睡到 ${localTime}（约 ${dur}后）`;
+          })();
+          // 2026-11-24（操作者二次要求）：**不再提 triggers**。
+          //
+          // 上一版会在她传了 triggers 时加一句「（唤醒条件是固定的，传 triggers 不生效）」。
+          // 操作者要求删掉 —— 这类"说明性文本"没有信息量：她传了也不会改变结果，
+          // 说了只会占字符、还可能让她以为"我得记住这回事"。
+          // MCP 层的 schema 已经剥掉了 triggers；桥接层的 FIXED_WAKE_TRIGGERS 兜底覆盖。
+          // 双保险都在，不需要再告诉她一遍。
+          const markedNote = markedCount > 0 ? `，顺带标记 ${markedCount} 条已读` : '';
           sendJson({
             ok: true,
-            text: `✅ 收尾完成：标记 ${markedCount} 条已读，${modeText}，读到 #${readThroughSeqV2(st)}。`
-              + `\n当前唤醒：${wakeSummary}`
+            text: `✅ ${sleepText}${markedNote}，读到 #${readThroughSeqV2(st)}。`
           });
           return;
         }
@@ -6222,7 +6780,7 @@ async function main() {
             let postSendObserve = null;
             if (sentMessages.length > 0) {
               // 用发送前的快照当基线：覆盖"逐条发送那几秒"的盲区。
-              postSendObserve = await paceAfterSendV2(st, key, Date.now(), { snapshotBeforeSend: preSendSnapshot, sendStartedAt });
+              postSendObserve = await paceAfterSendV2(st, key, Date.now(), { snapshotBeforeSend: preSendSnapshot, sendStartedAt, sentAt: sentMessages?.sentAt });
             }
             log(`[reserved2] 工具分条发送 ${key}: 成功 ${sentMessages.length}/${messages.length} 条`);
             appendActivity(`${key} [reserved2] 工具分条发送：成功 ${sentMessages.length}/${messages.length} 条`);
@@ -6278,6 +6836,9 @@ async function main() {
             : (isRawString ? [String(rawMessages).trim()].filter(Boolean) : []);
           const replyToMessageId = body.replyToMessageId;
           const atUserId = body.atUserId ?? null;
+          // 2026-11-21：她可以显式要求这条用语音发（voice:true）。
+          // 语音没开 / 带引用@ / 合成失败 都会自动退回文字，不影响消息送达。
+          const wantVoice = body.voice === true;
           // 二代不再按空格自动分条：字符串就是一条消息，数组模式原样使用调用方间隔。
           // 旧写法是 `(isRawString && messages.length > 1) ? 'auto' : ...` —— 上面 messages 的构造
           // 保证 isRawString 为真时 length 恒为 1，这个分支永远不可达，留着只会让人以为
@@ -6295,7 +6856,13 @@ async function main() {
             return;
           }
           if (req.headers['x-agent-token'] && !canSendToKey(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          // 白名单这一关对「主人令牌」放行：主人可以往非白名单聊天发话（只发不建），
+          // 具体是不是"只发不建"由下面的 sendOnly 判定；非主人的令牌仍然在这里被拒。
+          if (req.headers['x-agent-token'] && !v2SessionAllowed(key)
+            && !isOwnerAgentToken(req.headers['x-agent-token'])) {
+            sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403);
+            return;
+          }
           if (req.headers['x-agent-token'] && !v2ToolEnabled('sendMessage')) { sendJson({ ok: false, error: '工具未启用：qq_send_message' }, 403); return; }
           if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
           if (!req.headers['x-agent-token']) { sendJson({ ok: false, error: 'reserved2 模式发送必须携带 agent token' }, 403); return; }
@@ -6303,7 +6870,10 @@ async function main() {
           if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
           const kind = keyMatch[1];
           const id = Number(keyMatch[2]);
-          if (!Number.isFinite(id) || id <= 0 || !modeAllowed(key, kind, id, cfg, currentMode)) {
+          const allowedByPolicy = Number.isFinite(id) && id > 0 && modeAllowed(key, kind, id, cfg, currentMode);
+          // 主人令牌发往非白名单聊天：放行，但按「只发不建」处理（见 isSendOnlyBypass）。
+          const sendOnly = !allowedByPolicy && isSendOnlyBypass(key, req.headers['x-agent-token'], allowedByPolicy);
+          if (!allowedByPolicy && !sendOnly) {
             sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403);
             return;
           }
@@ -6339,7 +6909,11 @@ async function main() {
           }
           const delays = computeGapsV2(messages, gapMode, gapMs, gaps, sendCfg);
           // 先做发送频率检查并预占额度，再解析引用目标，避免未限流的引用查询打爆 OneBot。
-          const st = getSocialV2State(key);
+          // ⚠️ 「只发不建」：主人令牌发往非白名单聊天时**不能**调 getSocialV2State(key) ——
+          // 那个函数会懒创建一个完整会话状态（唤醒配置/未读队列/随机 token/定时器）并被
+          // saveSocialV2State() 持久化，等于「发一条 = 建一个会话」，正是需求要避免的。
+          // 这里给一个**内存态临时对象**：限频、引用解析照常可用，但永不进 conversations。
+          const st = sendOnly ? makeEphemeralSendState() : getSocialV2State(key);
           const now = Date.now();
           const maxPerMinute = Number(sendCfg.maxSendPerMinute) || 0;
           const maxPerHour = Number(sendCfg.maxSendPerHour) || 0;
@@ -6376,12 +6950,12 @@ async function main() {
             //（3 条数组要按 1~3 秒间隔逐条发，那 5~10 秒里对方的消息会漏）。
             const preSendSnapshot = snapshotUnreadBeforeSendV2(st);
             const sendStartedAt = Date.now();   // 总预算从这里开始算（含逐条发送耗时）
-            const sentMessages = await sendMessagesV2(key, messages, delays, actualReplyToMessageId, atUserId);
-            recordSentMessagesV2(key, sentMessages, sentMessages?.ids, sentMessages?.sentAt);
+            const sentMessages = await sendMessagesV2(key, messages, delays, actualReplyToMessageId, atUserId, { sendOnly, voice: wantVoice });
+            if (!sendOnly) recordSentMessagesV2(key, sentMessages, sentMessages?.ids, sentMessages?.sentAt);
             st.lastAiReplyAt = now;
             st.lastActionAt = now;
             st.wakeConfig.noActionCount = 0;
-            saveSocialV2State();
+            if (!sendOnly) saveSocialV2State();
             // 发送后空转：代替"节流拦截"，只让这次调用慢一点，不产生额外回合。
             // 发送后空转 + 观察新消息（2026-11-14）：
             // 空转期间有新消息就提前结束，把那几条按【本轮消息】同格式带回去，
@@ -6389,11 +6963,11 @@ async function main() {
             let postSendObserve = null;
             if (sentMessages.length > 0) {
               // 用发送前的快照当基线：覆盖"逐条发送那几秒"的盲区。
-              postSendObserve = await paceAfterSendV2(st, key, Date.now(), { snapshotBeforeSend: preSendSnapshot, sendStartedAt });
+              postSendObserve = await paceAfterSendV2(st, key, Date.now(), { snapshotBeforeSend: preSendSnapshot, sendStartedAt, sentAt: sentMessages?.sentAt });
             }
             log(`[reserved2] 工具统一发送 ${key}: 成功 ${sentMessages.length}/${messages.length} 条`);
             appendActivity(`${key} [reserved2] 工具统一发送：成功 ${sentMessages.length}/${messages.length} 条`);
-            if (sentMessages.length > 0) scheduleReplyCheckV2(key);
+            if (!sendOnly && sentMessages.length > 0) scheduleReplyCheckV2(key);
             // 同上（send-message 路径）：不再回发送后提示，见 send-burst 那处的说明。
             sendJson({ ok: true, key, ...(postSendObserve?.text ? { text: postSendObserve.text, arrived: true, arrivedCount: postSendObserve.count } : {}), sent: sentMessages.length, failed: messages.length - sentMessages.length, delays, quoted: quotedInfo });
           } catch (error) {
@@ -7301,7 +7875,7 @@ async function main() {
           // 现在与 get_unread 统一成同一套文本行，引导写进末尾。
           const nowMs = Date.now();
           const label = chatLabelForV2(key);
-          const lines = newMessages.map((m) => renderOneMessageLine(compactModelMessage(m, { now: nowMs }), { label }));
+          const lines = newMessages.map((m) => renderOneMessageLine(compactModelMessage(m, { now: nowMs }), { label, timeStyle: 'both' }));
           const head = newMessages.length
             ? `【等到了 ${newMessages.length} 条】，读到 #${readThroughSeq}`
             : `【没等到新消息】，读到 #${readThroughSeq}`;
@@ -7341,14 +7915,16 @@ async function main() {
             sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403);
             return;
           }
-          const flagMap = { sendGroup: 'sendGroup', sendPrivate: 'sendPrivate', reply: 'reply' };
+          // 2026-11-23：sendGroup / sendPrivate 已从 MCP 删除（现在只有二代模式，
+          // 发送统一走 qq_send_message / qq_reply），这里只剩 reply。
+          const flagMap = { reply: 'reply' };
           const flag = flagMap[tool];
           if (!flag) {
-            sendJson({ ok: false, error: 'tool 必须是 sendGroup/sendPrivate/reply' }, 400);
+            sendJson({ ok: false, error: 'tool 必须是 reply' }, 400);
             return;
           }
           if (!v2ToolEnabled(flag)) {
-            sendJson({ ok: false, error: `工具未启用：qq_${tool === 'sendGroup' ? 'send_group_message' : tool === 'sendPrivate' ? 'send_private_message' : 'reply'}` }, 403);
+            sendJson({ ok: false, error: '工具未启用：qq_reply' }, 403);
             return;
           }
           sendJson({ ok: true, key, tool });
@@ -7544,7 +8120,44 @@ async function main() {
             const textLen = String(info.text ?? '').length;
             const cappedByStore = textLen >= MESSAGE_STORE_PREVIEW_CHARS;
             info.textTruncated = cappedByStore || (Number.isFinite(fullLen) && fullLen > textLen);
-            sendJson({ ok: true, key, messageId, info });
+
+            // ★ 2026-11-25（操作者要求）：**改成和 unread / recent 一样的消息行文本**，
+            //   不再回 JSON。理由：
+            //     ① 她在别处看到的都是 `#201 谁·20:07（3分钟前）：内容`，
+            //        这里突然变成 JSON，格式不一致，她得多花一步去解析；
+            //     ② JSON 字段名（info / textTruncated / forwardIds…）每轮都进历史，白烧。
+            //   时间用 timeStyle:'both' —— 查详情就是翻历史，需要绝对时间。
+            //
+            // 拼装方式与 renderOneMessageLine 同一套字段，只是数据源是 info 而不是本地 row。
+            // info 里没有 time（QQ 侧返回的不带），所以从本地 found 里补。
+            const stamp = found && Number.isFinite(Number(found.time)) ? Number(found.time) : 0;
+            const view = compactModelMessage({
+              seq: info.seq,
+              sender: info.sender,
+              text: info.text,
+              time: stamp || undefined,
+              isSelf: false,
+              messageId: info.messageId,
+              hasForward: info.hasForward,
+              forwardIds: info.forwardIds
+            }, { now: Date.now() });
+            const lineText = renderOneMessageLine(view, { label: chatLabelForV2(key), timeStyle: 'both' });
+
+            // 附注只保留"确实需要她知道"的两条：
+            //   · 正文被截断 → 提示她用 qq_get_message_full 读全文
+            //   · 有转发 → 提示她用 qq_get_forward_msg 展开
+            const notes = [];
+            if (info.textTruncated) {
+              notes.push(`（正文被截断，读全文用 qq_get_message_full(messageId=${messageId})）`);
+            }
+            if (info.hasForward) {
+              const fid = Array.isArray(info.forwardIds) && info.forwardIds.length ? info.forwardIds[0] : '';
+              notes.push(fid
+                ? `（这是合并转发，展开用 qq_get_forward_msg(id=${fid})）`
+                : '（这是合并转发，展开用 qq_get_forward_msg）');
+            }
+            const outText = notes.length ? `${lineText}\n${notes.join('\n')}` : lineText;
+            sendJson({ ok: true, key, messageId, text: outText });
           } catch (error) {
             sendJson({ ok: false, error: `获取消息详情失败：${error?.message ?? error}` }, 500);
           }
@@ -7632,16 +8245,30 @@ async function main() {
               }
             }
             const fullText = parts.join('');
+            // ★ 2026-11-25（操作者要求）：和 message-detail 一样改成**消息行文本**。
+            //   原来是 `{ok,key,messageId,length,text,mediaKinds,note}` 的 JSON，
+            //   格式跟 unread/recent 完全不搭。
+            //
+            // 时间从本地记录补（QQ 的 get_msg 不返回时间）。
+            const hit = [...(stFull.recentMessages || []), ...(stFull.unread || [])]
+              .find((m) => m && String(m.messageId ?? '') === String(messageId));
+            const stampFull = hit && Number.isFinite(Number(hit.time)) ? Number(hit.time) : 0;
+            const viewFull = compactModelMessage({
+              seq: hit?.seq,
+              sender: hit?.sender || '',
+              text: fullText,
+              time: stampFull || undefined,
+              isSelf: false,
+              messageId
+            }, { now: Date.now() });
+            const lineFull = renderOneMessageLine(viewFull, { label: chatLabelForV2(key), timeStyle: 'both' });
+            // 媒体类型单独一行（她需要知道这条里有图/语音/文件，但拿不到路径）
+            const mediaNote = mediaKinds.length ? `\n（含：${mediaKinds.join('、')}）` : '';
             sendJson({
               ok: true,
               key,
               messageId,
-              length: fullText.length,
-              text: fullText,
-              ...(mediaKinds.length ? { mediaKinds } : {}),
-              note: fullText.length > 200
-                ? '这是 QQ 服务端的完整原文（本地存储只保留前 200 字）。'
-                : undefined
+              text: `${lineFull}${mediaNote}`
             });
           } catch (error) {
             sendJson({ ok: false, error: `读取完整原文失败：${error?.message ?? error}` }, 502);
@@ -8417,7 +9044,14 @@ async function main() {
                 }
                 const fromLabel = AFFINITY_STAGES.find((s) => s.id === prevStageId)?.label ?? prevStageId;
                 const toLabel = AFFINITY_STAGES.find((s) => s.id === nextStageId)?.label ?? nextStageId;
-                socialV2.affinityStageChanges[wantUser] = { from: fromLabel, to: toLabel, at: now };
+                // 2026-11-24：**带上发生在哪个会话**。
+                // 不带的话，A 群某人的档位一变，所有会话的唤醒词都会提示 ——
+                // 私聊里冒出一句"某某的好感度发生了变化"，而那个人根本没在私聊里出现过。
+                socialV2.affinityStageChanges[wantUser] = {
+                  // ⚠️ 用 wantKey（本端点里没有 key 这个变量）。写成 key 会抛 ReferenceError，
+                  //    而下面的 catch 会把它静默吞掉 —— 记录永远写不进去。
+                  from: fromLabel, to: toLabel, at: now, key: String(scopeGlobal ? '' : wantKey)
+                };
                 log(`[affinity] 控制台调整导致档位变化 ${wantUser}: ${fromLabel} → ${toLabel}（已记入唤醒提醒）`);
               } catch {}
             }
@@ -9038,7 +9672,7 @@ async function main() {
             // 同样用发送前的快照。
             let postSendObserve = null;
             if (sentMessages.length > 0) {
-              postSendObserve = await paceAfterSendV2(st, key, Date.now(), { snapshotBeforeSend: preSendSnapshot, sendStartedAt });
+              postSendObserve = await paceAfterSendV2(st, key, Date.now(), { snapshotBeforeSend: preSendSnapshot, sendStartedAt, sentAt: sentMessages?.sentAt });
             }
             log(`[send] ${url.pathname} ${key}: 成功 ${sentMessages.length}/1 条`);
             appendActivity(`${key} [send] 成功 ${sentMessages.length}/1 条：${message.slice(0, 80)}`);
@@ -9580,7 +10214,7 @@ async function main() {
 
 
   /**
-   * 纯语音模式：把一条文本合成为语音，返回可发送的 record 段。
+   * 语音模式：把一条文本合成为语音，返回可发送的 record 段。
    *
    * 为什么改在这里（onebotSend 是**所有**文本消息的唯一出口）：
    *   她照常调 qq_send_message 打字，语音这件事完全由桥接决定 ——
@@ -9606,7 +10240,9 @@ async function main() {
     }
   }
 
-  async function onebotSend(kind, id, message, replyToMessageId, atUserId = null) {
+  // ⚠️ wantVoice：2026-11-21 新增。只有她显式要求（qq_send_message 的 voice:true）
+  //   且语音许可开着时，才把文字换成语音条；否则一律打字。
+  async function onebotSend(kind, id, message, replyToMessageId, atUserId = null, wantVoice = false) {
     const segments = [];
     if (replyToMessageId !== undefined && replyToMessageId !== null && String(replyToMessageId).trim() !== '') {
       const rid = String(replyToMessageId).trim();
@@ -9625,10 +10261,16 @@ async function main() {
       log(`发送内容包含会话令牌，已阻止发送 (${kind}:${id})`);
       throw new Error('发送内容包含会话令牌，已阻止发送');
     }
-    // 纯语音：把文字换成语音条。带引用/@ 的消息不转（语音段放不下引用），
-    // 合成失败也自动降级回文字。
+    // 语音条：只有**她明确要求**（voice:true）且总开关开着时才转。
+    // 2026-11-21 改：原来是"开关开着就全部转语音"，等于她失去了打字能力；
+    //   现在默认打字，想发语音时显式传 voice:true。
+    // 三个例外，任一命中都退回文字（不报错、不吞消息）：
+    //   · 总开关没开（操作者没启用 TTS）
+    //   · 这条带引用/@（语音段放不下这些前置段）
+    //   · 合成失败（在 maybeSendAsVoice 里已降级）
     const voiceCfg = socialV2?.tts ?? null;
-    const canVoice = voiceCfg?.enabled === true
+    const canVoice = wantVoice === true
+      && voiceCfg?.enabled === true
       && (!segments.length)   // 没有引用/@ 前置段
       && kind;                // 群聊/私聊都支持
     const recordSegment = canVoice ? await maybeSendAsVoice(kind, id, rawMessage, voiceCfg) : null;
@@ -10281,6 +10923,7 @@ async function main() {
     );
   }
 
+
   async function paceAfterSendV2(st, key, now = Date.now(), opts = {}) {
     if (!st) return { arrived: false, waitedMs: 0, text: '', count: 0 };
     const observeMs = Math.max(0, Number(cfg.socialV2?.send?.observeAfterSendMs ?? 20000));
@@ -10398,7 +11041,7 @@ async function main() {
       if (fresh.length) {
         const label = chatLabelForV2(key);
         const nowMs = Date.now();
-        const rows = fresh.map((m) => renderOneMessageLine(compactModelMessage(m, { now: nowMs }), { label }));
+        const rows = fresh.map((m) => renderOneMessageLine(compactModelMessage(m, { now: nowMs }), { label, timeStyle: 'both' }));
         count = rows.length;
         // 格式与 qq_mark_read 的观望输出**完全一致**：`【N 条新消息】` + 消息行。
         // 两边用同一套排版，她不必为"这是哪个工具贴的"分神。
@@ -10446,8 +11089,8 @@ async function main() {
     return delays;
   }
 
-  function sendMessagesV2(key, messages, delays, replyToMessageId, atUserId = null) {
-    const assertSendAllowed = captureSendGuard(key);
+  function sendMessagesV2(key, messages, delays, replyToMessageId, atUserId = null, opts = {}) {
+    const assertSendAllowed = captureSendGuard(key, opts);
     const [kind, id] = key.split(':');
     const sent = [];
     const failed = [];
@@ -10470,7 +11113,8 @@ async function main() {
       sendChain = sendChain
         .then(async () => {
           assertSendAllowed();
-          const receipt = await onebotSend(kind, id, msg, useReply, useAt);
+          // 每条都传 voice：她调一次 send_message 带 voice:true，整批都用语音。
+          const receipt = await onebotSend(kind, id, msg, useReply, useAt, opts.voice === true);
           sent.push(msg);
           sentAt.push(Date.now());   // 真实发出时刻
           // OneBot 的发送回执形如 { message_id: 123 }；拿不到就记 null（不编造）。
@@ -10529,12 +11173,28 @@ async function main() {
   }
 
   // 入队校验无法约束排队等待期间的权限变化，每条消息临近实际发送时再次校验。
-  function captureSendGuard(key) {
+  /**
+   * @param {string} key 目标聊天 key
+   * @param {{sendOnly?: boolean}} [opts]
+   *   sendOnly=true  —— 「只发不建」路径（管理员令牌发往白名单外的聊天）。
+   *   这类目标本来就**不在**允许范围内，若照常做 isSessionAllowedInCurrentMode()
+   *   检查，最后一步必然抛「发送已取消」—— 实测就是这样：前面全放行，
+   *   到真正发出去时被这道守卫拦掉。所以这里对 sendOnly 放宽"白名单"这一项，
+   *   但**保留**模式变化与 sessionId 变化的检查（那是防串号的，不能丢）。
+   */
+  function captureSendGuard(key, opts = {}) {
+    const sendOnly = opts.sendOnly === true;
     const policy = sessionPolicy(key);
     const sessionId = state.sessions[key];
     return () => {
-      if (!isSessionAllowedInCurrentMode(key) || policy !== sessionPolicy(key)
-          || (sessionId && state.sessions[key] !== sessionId)) {
+      const policyChanged = policy !== sessionPolicy(key);
+      const sessionChanged = !!(sessionId && state.sessions[key] !== sessionId);
+      if (sendOnly) {
+        // 只发不建：不该存在真实会话，所以 sessionId 变化不影响；白名单也不看。
+        if (policyChanged) throw new Error('发送已取消：模式或权限档位已变化');
+        return;
+      }
+      if (!isSessionAllowedInCurrentMode(key) || policyChanged || sessionChanged) {
         throw new Error('发送已取消：会话、模式或白名单已变化');
       }
     };
@@ -10834,6 +11494,11 @@ async function main() {
   // 持久化、再由 qq_get_prompt 原样回给模型（每次请求都带着），等于给了一个
   // 「用 1MB 垃圾键把状态文件与每轮 prompt 撑大」的入口。
   const WAKE_TRIGGER_KEYS = Object.freeze(['atMention', 'nameMention', 'speakerIds', 'keywords', 'question', 'poke', 'anyMessage', 'probability']);
+
+  // ── 触发器冻结规则的声明在**模块层**（文件顶部，见 FIXED_WAKE_TRIGGERS）──
+  // 原因：wake-config 路由在文件前部就要用它，而 const 不会被提升。
+  // 挪到顶层的代价只是"离用途远一点"，换来的是不会 TDZ 炸掉。
+
   function pickWakeTriggersV2(source, fallback = {}) {
     const out = {};
     const src = source && typeof source === 'object' ? source : {};
@@ -10860,16 +11525,11 @@ async function main() {
       mode: defaultMode,
       infinite: defaultInfinite,
       sleepUntil: defaultInfinite ? null : new Date(Date.now() + Math.round(finiteMs)).toISOString(),
-      triggers: {
-        atMention: w.recommendedAtMention !== false,
-        nameMention: w.recommendedNameMention !== false,
-        speakerIds: [],
-        keywords: Array.isArray(w.recommendedKeywords) ? w.recommendedKeywords.map(String) : [],
-        question: w.recommendedQuestion !== false,
-        poke: w.recommendedPoke !== false,
-        anyMessage: defaultMode === 'active',
-        probability: Math.min(1, Math.max(0, Number(w.recommendedProbability) || 0)),
-      },
+      // 2026-11-23：默认值也走冻结表。
+      // 原来这里读 w.recommendedAtMention 之类，但那些配置项**从此不再生效**
+      // （冻结后模型改不动，默认值也不该另立一套）。留一份"默认≠冻结"的分叉
+      // 只会让人以为改 config 有用。
+      triggers: applyFixedWakeTriggersV2({}),
       batchWindowMs: Math.max(1000, Number(w.batchWindowMs) || 8000),
       lastWakeAt: 0,
       wakeCount: 0,
@@ -11095,9 +11755,9 @@ async function main() {
       })();
       const raw = readJsonSafe(SOCIAL_V2_FILE, null);
       socialV2.paused = raw?.paused === true;
-      // 纯语音配置：从文件读回（2026-11-13 补）。
+      // 语音配置：从文件读回（2026-11-13 补）。
       // 之前 saveSocialV2State 不写 tts、loadSocialV2State 也不读 ——
-      // 于是"纯语音开着的状态"活不过一次重启。现在两边都接上了。
+      // 于是"语音开着的状态"活不过一次重启。现在两边都接上了。
       if (raw && raw.tts && typeof raw.tts === 'object') {
         socialV2.tts = normalizeTtsConfig(raw.tts);
       }
@@ -11117,7 +11777,11 @@ async function main() {
               ...defaultWc,
               ...(val.wakeConfig ?? {}),
               // 加载时也按已知字段过滤：旧状态文件里可能残留任意键（见 WAKE_TRIGGER_KEYS）。
-              triggers: pickWakeTriggersV2((val.wakeConfig?.triggers) ?? {}, defaultWc.triggers)
+              // 2026-11-23：再拍回冻结值 —— 否则历史数据里的旧 triggers（比如
+              // 某个会话曾经被关掉 atMention）会一直生效，而模型以为改得动。
+              triggers: applyFixedWakeTriggersV2(
+                pickWakeTriggersV2((val.wakeConfig?.triggers) ?? {}, defaultWc.triggers)
+              )
             },
             recentMessages: Array.isArray(val.recentMessages) ? val.recentMessages : [],
             unread: Array.isArray(val.unread) ? val.unread : [],
@@ -11354,6 +12018,24 @@ async function main() {
           // 不给默认值会让第一轮把整库当"新变化"提示一遍。
           globalMemory.factFingerprint = String(rawGlobal.factFingerprint || '');
           globalMemory.factSeenIds = Array.isArray(rawGlobal.factSeenIds) ? rawGlobal.factSeenIds.slice(-200) : [];
+          // ★ 主动机会记账（2026-11-24）：从盘上恢复。
+          //   不恢复的话，重启后"当天已用过的理由"会清空，同一理由再说一遍；
+          //   `awaitingReplySince` 丢了下一次唤醒会误判"她没在等回复"。
+          if (rawGlobal.proactive && typeof rawGlobal.proactive === 'object') {
+            const rp = rawGlobal.proactive;
+            globalMemory.proactive = {
+              v: 1,
+              todayKey: String(rp.todayKey || ''),
+              todayCount: Number(rp.todayCount) || 0,
+              lastProactiveAt: Number(rp.lastProactiveAt) || 0,
+              lastRoute: String(rp.lastRoute || ''),
+              unanswered: rp.unanswered && typeof rp.unanswered === 'object' ? rp.unanswered : {},
+              awaitingReplySince: Number(rp.awaitingReplySince) || 0,
+              routeSentCounts: rp.routeSentCounts && typeof rp.routeSentCounts === 'object' ? rp.routeSentCounts : {},
+              quotaOfDay: rp.quotaOfDay ?? null,
+              sentCandidateIds: Array.isArray(rp.sentCandidateIds) ? rp.sentCandidateIds : []
+            };
+          }
           if (migratedImp || migratedNote) {
             log(`[memory] 已把旧数据迁移进全局记忆：印象 ${migratedImp} 条、selfNote ${migratedNote} 条`);
           }
@@ -11421,7 +12103,9 @@ async function main() {
             if (!v || typeof v !== 'object') continue;
             socialV2.affinityStageChanges[uid] = {
               from: String(v.from || ''), to: String(v.to || ''), at: Number(v.at) || 0,
-            };
+                // ⚠️ 必须保留 key：唤醒词按 key 过滤，漏了它重启后所有记录都失配。
+                ...(v.key ? { key: String(v.key) } : {}),
+              };
           }
           const total = Object.keys(socialV2.affinities).length;
           if (migrated > 0 || total > 0) {
@@ -11486,8 +12170,8 @@ async function main() {
         entries.sort((a, b) => (Number(b[1].lastAt) || 0) - (Number(a[1].lastAt) || 0));
         return Object.fromEntries(entries.slice(0, 500));
       })();
-      // ── 纯语音（TTS）配置：必须落盘，否则重启后开关被重置 ──────────────────
-      // 2026-11-13 修：以前这个字段压根没被保存，于是每次重启"纯语音"都变回关闭。
+      // ── 语音（TTS）配置：必须落盘，否则重启后开关被重置 ──────────────────
+      // 2026-11-13 修：以前这个字段压根没被保存，于是每次重启"语音"都变回关闭。
       //   之前一直当成"重启会重置开关"，其实是数据从来没写进文件。
       //   只存**开关 + 关键参数**，不存缓存路径之类的运行时东西。
       obj.tts = socialV2.tts && typeof socialV2.tts === 'object'
@@ -11536,7 +12220,33 @@ async function main() {
           .slice(-TODO_MAX),
         // 长期事实的「变化基线」：全局一份（事实本身也是全局的）。
         factFingerprint: String(globalMemory.factFingerprint || ''),
-        factSeenIds: Array.isArray(globalMemory.factSeenIds) ? globalMemory.factSeenIds.slice(-200) : []
+        factSeenIds: Array.isArray(globalMemory.factSeenIds) ? globalMemory.factSeenIds.slice(-200) : [],
+        // ★ 主动机会的记账（2026-11-24 补）：必须落盘。
+        //   其中 `sentCandidateIds` 是"当天哪几类理由已经用过了"——
+        //   不落盘的话，重启后她把"外面在下雨"再说一遍。
+        //   只留当天的：`proactiveDedupeSetOf` 按日期前缀过滤，写的时候顺手裁一次。
+        proactive: (() => {
+          const p = globalMemory.proactive && typeof globalMemory.proactive === 'object'
+            ? globalMemory.proactive : null;
+          if (!p) return null;
+          const today = (() => {
+            const d = new Date();
+            return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+          })();
+          return {
+            v: 1,
+            todayKey: String(p.todayKey || ''),
+            todayCount: Number(p.todayCount) || 0,
+            lastProactiveAt: Number(p.lastProactiveAt) || 0,
+            lastRoute: String(p.lastRoute || ''),
+            unanswered: p.unanswered && typeof p.unanswered === 'object' ? p.unanswered : {},
+            awaitingReplySince: Number(p.awaitingReplySince) || 0,
+            routeSentCounts: p.routeSentCounts && typeof p.routeSentCounts === 'object' ? p.routeSentCounts : {},
+            quotaOfDay: p.quotaOfDay ?? null,
+            sentCandidateIds: (Array.isArray(p.sentCandidateIds) ? p.sentCandidateIds : [])
+              .filter((id) => String(id).startsWith(today))
+          };
+        })()
       };
       for (const [key, st] of socialV2.conversations) {
         obj.conversations[key] = {
@@ -13201,6 +13911,22 @@ async function main() {
     };
     st.lastUnreadSeq = msg.seq;
     st.lastIncomingAt = Date.now();
+    // ── 真人回来了：她的"未回应"账清零（2026-11-23）─────────────────────
+    // 照 AstrBot 那句「按真实入站活动清零」——不是定时衰减。
+    // 定时衰减会让"她到底记不记得你没回"变成噪声：你明明回来了，
+    // 但衰减早把账清了，她的收敛就成了无根之木。
+    // 只对**别人发来的**消息清（isSelf 是她自己的，不能自己给自己背书）。
+    if (!msg.isSelf) {
+      // 2026-11-24：按 key 清零 —— 只清这个会话的账。
+      try { resetUnansweredV2(key); } catch (error) {
+        log(`[proactive] 未回应清零失败（已跳过）：${error?.message ?? error}`);
+      }
+      // ★ 2026-11-24：真人说话了 → 整个 follow-up 链作废。
+      //   这是"不回复=没读"的反面：一旦回了，就不该再按原计划追。
+      //   定时器自己也会在到点时复查一遍（lastIncomingAt > sentAt），
+      //   这里提前清是为了省掉一次无意义的唤醒判定。
+      try { clearFollowUpV2(key, '对方回话了'); } catch { /* 清失败不影响收消息 */ }
+    }
     // 用户开口了：这一轮对话重新开始，允许下一次「闲置边界」再压。
     // 关键语义 —— 压缩后如果不清这个标记，会话会永远停在「已压过」状态，
     // 之后聊多久都不会再压；清了也不会在同一轮里连压，因为判定要求安静
@@ -13246,11 +13972,31 @@ async function main() {
             }
             const fromLabel = AFFINITY_STAGES.find((s) => s.id === prevStageId)?.label ?? prevStageId;
             const toLabel = AFFINITY_STAGES.find((s) => s.id === nextStageId)?.label ?? nextStageId;
-            socialV2.affinityStageChanges[uid] = { from: fromLabel, to: toLabel, at: Date.now() };
+            // 2026-11-24：带上会话 key。见控制台调整那处的说明 —— 不带的话
+            // 群里某人的档位变化会跑到私聊的唤醒词里去。
+            socialV2.affinityStageChanges[uid] = {
+              from: fromLabel, to: toLabel, at: Date.now(), key: String(key || '')
+            };
             log(`[affinity] 档位变化 ${uid}: ${fromLabel} → ${toLabel}（已记入唤醒提醒）`);
           } catch {}
         }
         socialV2.affinities[uid] = next;
+        // ── 档位变化 → 私聊主动额度跟着变（2026-11-23）──────────────────
+        // tier 由档位决定（affinity.js 的 AFFINITY_TIER），所以档位一跨过去，
+        // 定时器该补排的补排、该撤的撤。不这么做的话：
+        //   · 从"平淡"升到"在意"：tier 0 → 1，但 scheduleProactiveCheckV2 早就
+        //     因为额度 0 而不排了，她永远等不到第一次主动；
+        //   · 从"在意"掉回"平淡"：tier 1 → 0，已经排着的定时器还会触发一次。
+        if (prevStageId !== nextStageId && String(key || '').startsWith('private:')) {
+          try {
+            const tier = proactiveTierOf(key);
+            log(`[affinity] 主动 tier 随档位更新 ${key}: ${prevStageId} → ${nextStageId} ⇒ tier ${tier}`);
+            if (tier > 0) scheduleProactiveCheckV2(key);
+            else cancelProactiveCheckV2(key);
+          } catch (error) {
+            log(`[affinity] 主动 tier 重排失败（已跳过）：${error?.message ?? error}`);
+          }
+        }
         // 顺手清掉会话里可能残留的旧副本，避免以后又被当成"另一份数据"读出来。
         try {
           if (st.affinities && typeof st.affinities === 'object' && st.affinities[uid]) {
@@ -14234,14 +14980,17 @@ async function main() {
     }
     return packet;
   }
-
-  /** 把 ageText 的 "52s"/"1m"/"2h"/"3d" 转成中文；模型读中文比读缩写稳。 */
+  /**
+   * 把 ageText 的 "52s"/"1m"/"2h"/"3d" 转成中文；模型读中文比读缩写稳。
+   *
+   * 2026-11-25：单条消息不再显示时间后，这里暂时没有调用点，但**保留** ——
+   * newestAgo 的头部渲染和"恢复逐条时间"都还要用它。删了等于给自己挖坑。
+   */
   function humanAgoV2(ago) {
     const m = /^(\d+)([smhd])$/.exec(String(ago ?? '').trim());
     if (!m) return '';
     return `${m[1]}${{ s: '秒', m: '分钟', h: '小时', d: '天' }[m[2]]}前`;
   }
-
   /**
    * 把唤醒快照渲染成**纯文本**给模型看。
    *
@@ -14275,7 +15024,14 @@ async function main() {
    *   · `media[]`  → 删（正文已有 `[图片]`/`[表情]`） 省约 80 字符
    */
   function renderOneMessageLine(m, opts = {}) {
-    const label = opts.label ? `[${opts.label}] ` : '';
+    // 2026-11-23（操作者要求）：**消息行不再带 `[私聊XXX]` / `[群]` 标签**。
+    //
+    // 理由：现在一个 DSH 会话只服务一个聊天（sessionSharing 已关闭），
+    // 每条消息前面都挂一遍标签是纯冗余 —— 会话级信息由【令牌】行给一次就够。
+    // 每条省 12~18 字符，一个会话上百行就是上千字符。
+    //
+    // opts.label 仍然收着（调用方不必改），只是不再渲染。
+    const label = '';
     const seq = Number.isSafeInteger(m?.seq) && m.seq > 0 ? `#${m.seq} ` : '';
     // sender 来自群名片/昵称，是**群友可控的**。实测有人在里面塞
     // `\n\u0005\u0012\u0003小\n\u0005\n\u0003刀\u0010\u0000`（控制字符 + 换行），
@@ -14290,10 +15046,30 @@ async function main() {
       .replace(/\s+/g, ' ')
       .trim();
     const text = raw.length > 300 ? `${raw.slice(0, 300)}…` : raw;
-    // at / ago 并列：`·16:34（1小时前）`。at 缺失时只给 ago，反之亦然。
+    // ── 时间：两种形态，按 opts.timeStyle 区分（2026-11-25 操作者要求）──────
+    //
+    // **唤醒词**（timeStyle='ago'，默认）：每条只带「（3分钟前）」，不带钟点。
+    //   理由：绝对时间已经在【现在】行给过一次，逐条再写 `·20:00` 是白烧字符；
+    //   但"这条有多旧"必须逐条给 —— 一组消息可能横跨几小时，
+    //   只看头部的"最新一条"分不出哪条更早。
+    //
+    // **工具返回**（timeStyle='both'）：`·20:00（3分钟前）` 都给。
+    //   理由：她在工具里翻的是**历史**，需要能对应到"那天那会儿"，
+    //   而且工具返回不进每轮上下文，多几个字符不影响成本。
+    //
+    // 空的当没取到：at 缺就只给 ago，ago 缺就只给 at，都缺就不带。
     const ago = humanAgoV2(m?.ago);
     const at = String(m?.at ?? '').trim();
-    const when = at && ago ? `·${at}（${ago}）` : at ? `·${at}` : ago ? `·${ago}` : '';
+    const style = opts.timeStyle === 'both' ? 'both' : 'ago';
+    let when = '';
+    if (style === 'both') {
+      if (at && ago) when = `·${at}（${ago}）`;
+      else if (at) when = `·${at}`;
+      else if (ago) when = `·${ago}`;
+    } else {
+      if (ago) when = `（${ago}）`;
+      else if (at) when = `·${at}`;   // 拿不到相对时间才退回钟点，总比没有强
+    }
     // 精确句柄只在真需要时给。
     const refs = [];
     if ((m?.hasMedia || (Array.isArray(m?.media) && m.media.length)) && m?.messageId) {
@@ -14395,6 +15171,9 @@ async function main() {
     const head = [];
     if (unread.length) head.push(`${unread.length} 条未读`);
     if (Number.isSafeInteger(snapshot.readThroughSeq)) head.push(`读到 #${snapshot.readThroughSeq}`);
+    // 2026-11-25：**不在头部写「最新一条是 X 前」**（操作者要求）。
+    //   每条消息自己带「（多久前）」，那已经够了；
+    //   头部再来一遍是同一件事说两遍，而且它天然滞后（渲染那一刻算的）。
     const out = [`【本轮消息】${head.join('，')}`];
     if (unread.length) for (const m of unread) out.push(one(m));
     else out.push('（本轮没有新消息）');
@@ -14475,6 +15254,822 @@ async function main() {
    * @param {string} roleName 角色名
    * @param {boolean} coldStart 是否新会话第一轮 / 刚压缩完
    */
+  // ══ 身体循环（饱腹 / 精力 / yu wang）2026-11-23 ═════════════════════════════
+  //
+  // 状态存在 state/life-circle.json，**单独一个文件**：
+  //   · 必须活过「清除上下文 / 重置二代状态」（那些只该清聊天，不该清她的身体）；
+  //   · 不能塞进 social-v2.json 的 conversations —— 那里每个 key 都是真实 QQ 聊天键。
+  //
+  // 进程内缓存 + 落盘：结算很便宜（一次几十次浮点），但读盘不便宜 ——
+  // 唤醒包每轮都要它，所以缓存住；写入走 atomicWriteJson。
+  let lifeCircleCache = null;
+
+  // 生理周期状态：{ anchorDay, cycleDays }。**只读**，没有任何端点或工具能改它 ——
+  // 操作者要求纯后端被动推算。要改就只能手改 state/life-cycle.json。
+  let lifeCycleCache = null;
+
+  /** 读周期状态；文件不存在就返回空（= 不知道她在哪一天，届时什么都不输出）。 */
+  function readLifeCycle() {
+    if (lifeCycleCache) return lifeCycleCache;
+    let raw = null;
+    try {
+      raw = readJsonSafe(LIFE_CYCLE_FILE, null);
+    } catch {
+      raw = null;
+    }
+    const anchorDay = Number(raw?.anchorDay) || 0;
+    const cycleDays = Number(raw?.cycleDays) || Number(cfg.life?.cycleDays) || DEFAULT_CYCLE_DAYS;
+    lifeCycleCache = { anchorDay, cycleDays };
+    return lifeCycleCache;
+  }
+
+  /**
+   * 「刚睡醒」那句话（进程内一次性）。
+   *
+   * 为什么不落盘：它是**当下的一句话**，只该出现在醒来的那一轮唤醒包里。
+   * 落盘的话，如果算出来之后整夜没人发消息，几天后再被读到就很怪。
+   * 桥接重启会丢掉它 —— 那正好，重启本身已经算一次"离线当睡眠"了。
+   */
+  let pendingSleepWake = null;
+
+  /**
+   * 「昨晚睡得怎样」——**一次性**，取一次就清（2026-11-24）。
+   *
+   * 和 pendingSleepWake 的区别：
+   *   · pendingSleepWake：她说"我睡了"→ 醒来时那一段完整的起床描述（精力回升多少）
+   *   · pendingSleepQuality：跨天自动结算出来的"睡得浅/睡得沉"，只补一句
+   * 两者都会在第一轮唤醒里被取走，之后不再出现。
+   */
+  let pendingSleepQuality = null;
+
+  /**
+   * 「昨晚梦见了什么」—— 一次性，取一次就清（2026-11-24）。
+   *
+   * 与 `pendingSleepQuality` 的区别：
+   *   · sleepQuality 说的是"睡得浅/沉"（质量）
+   *   · pendingDream  说的是"梦见了什么"（内容）
+   * **普通梦不唤醒她**，只是醒来后第一次被叫时贴一句。
+   * 噩梦（会真的把她弄醒）走 proactiveNightmare，不进这个通道。
+   */
+  let pendingDream = null;
+
+  /** 取走「昨晚睡得怎样」，取一次就清。超过 12 小时没读就丢掉（昨天的事不该今天下午还提）。 */
+  function takePendingSleepQuality() {
+    const rec = pendingSleepQuality;
+    pendingSleepQuality = null;
+    if (!rec) return '';
+    if (Date.now() - Number(rec.at || 0) > 12 * 3600 * 1000) return '';
+    return String(rec.text || '');
+  }
+
+  /**
+   * 离线判定阈值。
+   *
+   * 睡眠**不再按时钟猜**（2026-11-23 三次修订）：她睡没睡只由两件事决定 ——
+   * 她自己调工具说，以及桥接当时没在跑。所以这里只剩一个"多久算没在跑"的阈值。
+   */
+  function lifeOfflineThresholdMs() {
+    const v = Number(cfg.life?.offlineAsSleepMs);
+    return Number.isFinite(v) && v > 0 ? v : DEFAULT_OFFLINE_AS_SLEEP_MS;
+  }
+
+  /** 读（带进程内缓存）。文件坏了不崩，重建一份并留备份。 */
+  function readLifeCircle() {
+    if (lifeCircleCache) return lifeCircleCache;
+    let raw = null;
+    try {
+      raw = readJsonSafe(LIFE_CIRCLE_FILE, null);
+    } catch {
+      raw = null;
+    }
+    if (raw && typeof raw === 'object' && raw.v !== 1) {
+      // 未来版本：看不懂就备份 + 重建，别用旧代码解释新数据。
+      try { fs.renameSync(LIFE_CIRCLE_FILE, `${LIFE_CIRCLE_FILE}.v${raw.v}-unsupported-${Date.now()}`); } catch {}
+      raw = null;
+    }
+    lifeCircleCache = raw ? normalizeLifeCircle(raw) : defaultLifeCircle();
+    return lifeCircleCache;
+  }
+
+  function writeLifeCircle(next) {
+    lifeCircleCache = normalizeLifeCircle(next);
+    try {
+      atomicWriteJson(LIFE_CIRCLE_FILE, lifeCircleCache);
+    } catch (error) {
+      // 写失败不能影响唤醒：缓存里已经是新值，这一轮照常用。
+      log(`[life] 身体状态落盘失败（继续用内存值）：${error?.message ?? error}`);
+    }
+    return lifeCircleCache;
+  }
+
+  /**
+   * 结算并**只在真的变了时落盘**。
+   *
+   * 为什么不每次都写：唤醒包每轮都要读一次，而结算后时间戳一定变 ——
+   * 每轮都写盘等于每轮一次同步 IO。所以只有数值跨过整数档才写。
+   *
+   * ⚠️ 这里**不负责**捕获「刚睡醒」。
+   *   settleCircle 不改 asleep（只有 addToCircle 的 opts.asleep 会改），
+   *   而且它会把 lastTickedAt 推进 —— 在它之后判断"刚醒"，
+   *   睡眠时长和恢复量都只剩 0（踩过这个坑）。
+   *   醒来检测放在 `/api/socialV2/life-circle` 的 POST 分支里，
+   *   那里能拿到「结算前的原始快照」。
+   */
+  function settleLifeCircle() {
+    const cur = readLifeCircle();
+    const next = settleLifeCircleCore(cur);
+    const changed = ['satiety', 'energy', 'desire']
+      .some((dim) => Math.round(next[dim]) !== Math.round(cur[dim]));
+    if (!changed) {
+      // 只更新时间戳（内存里），不落盘。
+      lifeCircleCache = next;
+      return next;
+    }
+    return writeLifeCircle(next);
+  }
+
+  /**
+   * 算这一次「睡了多久、回了多少精力」，交给纯函数变成一句话。
+   *
+   * ⚠️ 关键时序（2026-11-23 踩过的坑，务必看懂再改）：
+   *
+   *   `didJustWakeUp(before, after)` 为真时，`settleCircle` **已经把这一觉结算完了**。
+   *   所以：
+   *     · after.energy 是**睡醒后**的值（中间还混了醒来后的一小段衰减）
+   *     · before.energy 是**入睡前**的值 ← 这才是我们要的基准
+   *
+   *   于是 recovered = after.energy − before.energy 是**"这一觉净回多少"**，
+   *   这正是要描述的量。第一次实现把它写成 before/after 顺序反了（用了
+   *   after 当 before），算出来恒为 0，句子里全是空的 —— 测试当场揪出来了。
+   *
+   *   maxRecover 用「睡眠时长 × 恢复速率」算理论上限，只用于把 recovered
+   *   归一成百分比，不参与能量计算本身。
+   */
+  function computeSleepWakeReport(before, after) {
+    const beforeTs = Number(before?.lastTickedAt) || 0;
+    const nowTs = Number(after?.lastTickedAt) || Date.now();
+    const hours = Math.max(0, (nowTs - beforeTs) / 3600000);
+    // 与 life-circle.js 保持一致：睡眠最多认 10 小时，每小时 +8。
+    const RECOVER_PER_HOUR = 8;
+    const MAX_RECOVER_HOURS = 10;
+    const maxRecover = Math.min(hours, MAX_RECOVER_HOURS) * RECOVER_PER_HOUR;
+    const energyBefore = Number(before?.energy);
+    const energyAfter = Number(after?.energy);
+    // 净回量：睡醒后减入睡前。负数（醒来后又掉了）按 0 处理。
+    const recovered = (Number.isFinite(energyBefore) && Number.isFinite(energyAfter))
+      ? Math.max(0, energyAfter - energyBefore)
+      : maxRecover;
+    const sleptAtHour = beforeTs > 0 ? new Date(beforeTs).getHours() : undefined;
+    const text = buildSleepWakeText({ hours, recovered, maxRecover, sleptAtHour });
+    return text ? { text, hours, recovered, maxRecover, at: nowTs } : null;
+  }
+
+  function settleLifeCircleCore(circle) {    // gapMs 就是"上次结算到现在过了多久" —— 超过阈值说明那段时间桥接没在跑，
+    // 她无从活动，按休息算（操作者要的「关机的时候算她在睡觉」）。
+    const gapMs = Date.now() - (Number(circle?.lastTickedAt) || 0);
+    return settleLifeCircleFn(circle, Date.now(), {
+      gapMs,
+      offlineThresholdMs: lifeOfflineThresholdMs()
+    });
+  }
+
+  /**
+   * 取走「刚睡醒」那句话。**取一次就清**，保证只贴一轮。
+   *
+   * 为什么要有 3 小时的过期：算出来了但一直没人来读（比如整夜没人发消息、
+   * 桥接在算完之后就重启了），几天后再冒出来一句"睡得踏实"会很怪。
+   */
+  function takePendingSleepWake() {
+    const rec = pendingSleepWake;
+    if (!rec) return '';
+    // 先取出再清空：顺序搞反会造成"读 null.text"（这里踩过一次）。
+    pendingSleepWake = null;
+    const ageMs = Date.now() - Number(rec.at || 0);
+    if (ageMs > 3 * 3600 * 1000) return '';
+    return String(rec.text || '');
+  }
+
+  /**
+   * 唤醒行里的短词。
+   *
+   * 群聊**不显示yu wang**（那是她自己的事，挂在群消息里既没必要也容易被人做文章）；
+   * 身体状态整体也能一键关掉（life.showCircleInGroup / life.circle）。
+   */
+  function buildLifeCircleExtrasV2(key) {
+    const isPrivate = String(key || '').startsWith('private:');
+    // ★ 2026-11-23：**先结算，再决定要不要显示**。
+    //
+    // 原来这两道开关（life.circle / showCircleInGroup）挡在 settleLifeCircle() 前面，
+    // 于是关掉显示之后「睡→醒」的转折就**永远捕获不到** —— 醒来那句话也就没了。
+    // 结算本身是纯计算（不落盘、无副作用），没有理由被显示开关挡。
+    //
+    // ★★ 2026-11-23 二次修订（操作者定）：**唤醒本身就是醒来**。
+    //
+    //   "唤醒就算她醒了，不用调 asleep=false" —— 她睡着时不会去调工具，
+    //   被叫醒才算真的醒了。所以醒来检测挂在这里：渲染唤醒词 = 一次唤醒 = 一次起床。
+    //
+    //   时序必须正确：`settleLifeCircle()` 会消费掉「上次结算→现在」这段时间并推进
+    //   lastTickedAt，所以在它**之后**判断"刚醒"，时长和恢复量都只剩 0。
+    //   这里先取原始快照当入睡基准，settle 之后再比较。
+    const rawBeforeSettle = (() => {
+      try { return readLifeCircle(); } catch { return null; }
+    })();
+    const wasAsleep = rawBeforeSettle?.asleep === true;
+    let settled = null;
+    try {
+      settled = settleLifeCircle();
+    } catch (error) {
+      log(`[life] 身体状态结算失败（已跳过）：${error?.message ?? error}`);
+    }
+    // ★ 醒来判定**不分会话**：身体只有一副，"她醒了"对群聊私聊是同一个事实。
+    //   但**消费那句话只在私聊**（见下面 takePendingSleepWake 的调用处）。
+    //
+    //   早先想只在私聊判定，那样群聊永远不把她翻成"醒"，asleep 会一直挂成 true，
+    //   私聊再渲染时又重复生成一遍 —— 状态机卡死。所以判定照做，只是不取。
+    if (wasAsleep && settled) {
+      // 唤醒即醒来：把 asleep 翻成 false 并落盘，同时生成起床状态。
+      // 不这么做的话，下次渲染还会认为她在睡、又生成一遍。
+      try {
+        const woken = { ...settled, asleep: false };
+        pendingSleepWake = computeSleepWakeReport(rawBeforeSettle, woken);
+        settled = writeLifeCircle(woken);
+      } catch (error) {
+        log(`[life] 起床状态计算失败（已跳过）：${error?.message ?? error}`);
+      }
+    }
+    if (cfg.life?.circle === false) return [];
+    // 群聊默认不显示（她的身体状态挂在群消息里既没必要也容易被人拿去做文章）。
+    if (!isPrivate && cfg.life?.showCircleInGroup === false) return [];
+    if (!settled) return [];
+    // ★ 第三项和生理期**只对管理员显示**（2026-11-23 操作者要求）。
+    //   判定用 sessionTier：只有 private + ownerQQ 精确匹配才算 owner，
+    //   群里有人 QQ 号等于 ownerQQ 也不会升档（见 sessionTier 的注释）。
+    const isOwner = (() => {
+      try { return sessionTier(key, currentMode, cfg) === 'owner'; } catch { return false; }
+    })();
+    try {
+      // 文案可配（config.life.statusText），默认在 life-circle.js 的 STATUS_TEXT。
+      const textCfg = cfg.life?.statusText;
+      // ★ 2026-11-24：先跑一遍 condition 维护（抽今天的不适/health/sleep，
+      //   并回收已到期的）。它是**幂等**的：同一天重复调用不会重复抽。
+      let conditions = [];
+      try {
+        conditions = maintainLifeConditionsV2(settled);
+      } catch (error) {
+        log(`[life] condition 维护失败（已跳过）：${error?.message ?? error}`);
+      }
+      // ── 精力叠加 ────────────────────────────────────────────────────
+      // 基础精力来自 circle（连续漂移），再叠加各 condition 的 delta。
+      // ⚠️ **不写回 circle.energy**：写进去就变成历史不可回溯，
+      //    条件过期后算不出原来的值（见 life-conditions.js 的规则①）。
+      const composed = composeEnergyValueV2(settled.energy, conditions);
+      // ── 生理期 ──────────────────────────────────────────────────────
+      // ★ 2026-11-24：**有具体不适时不再重复周期那段说明**。
+      //   原来会出现「今天有点痛经，小腹闷闷的不舒服」+「生理期到了，累、
+      //   容易烦躁、不太想说话」两句都在 —— 后者是笼统描述，前者是具体症状，
+      //   摆在一起既啰嗦又互相稀释。
+      //   规则：有 cycle_discomfort 就只说具体那条；没有才说阶段说明。
+      const hasDiscomfort = conditions.some((c) => c.kind === 'cycle_discomfort');
+      const cycleMark = (isOwner && !hasDiscomfort) ? buildCycleMarkV2(textCfg) : '';
+      const inPeriod = isOwner && isPeriodPhaseV2();
+
+      // ── 有负面状态时，不播报「精力：精神很好」（2026-11-24 修）───────
+      //
+      // 实测过的矛盾：精力基础值 98，扣掉感冒的 12 还剩 86 → 显示「精神很好」，
+      // 同一行里却有「心情：疲惫」。感冒的人不会说自己精神很好。
+      //
+      // 判据：**活跃条件里有没有扣精力的**。
+      //   · 生病 / 痛经 / 噩梦 / 没睡好 —— 都算
+      //   · 被关心（+4）、睡意回升（+8）—— 不算
+      // 只看 `energyDelta < 0` 而不看 kind 名单，是因为以后新加的负面条件
+      // 会自动被覆盖，不用回来改这张表。
+      const hasNegative = conditions.some((c) => Number(c.energyDelta) < 0);
+
+      // ── 饥饿只由一个来源出词（2026-11-25 修）─────────────────────────
+      //
+      // 有活跃的 meal condition 时，饥饿那件事**已经由它的 label 说了**
+      // （「饿了，想吃东西」比数值档位的「有点饿」更具体，还自带"午饭/晚饭"语境）。
+      // 这时传 hasMealCondition=true，让 circleExtras 跳过数值那条 ——
+      // 否则同一条唤醒词里会出现两遍"饿了"（实测过）。
+      const hasMealCondition = conditions.some(
+        (c) => c.kind === 'meal' && c.endTs > Date.now() && String(c.label || '').trim()
+      );
+      const out = lifeCircleExtras(
+        { ...settled, energy: composed },
+        {
+          includeDesire: isOwner && !inPeriod,
+          text: textCfg,
+          suppressHighEnergy: hasNegative,
+          hasMealCondition
+        }
+      );
+      // ── 心情（2026-11-24 补上）─────────────────────────────────────
+      // 这是之前**漏掉的一整块**：composeMood 写好了却没人调。
+      //
+      // 心情不是独立字段，是**从活着的 condition 里竞争出来的**：
+      // 取 intensity 最高的那个 mood。所以它必然和条件一致，
+      // 不会出现"痛经但心情很好"这种自相矛盾。
+      //
+      // ★ 阶段本身的 mood（经期"敏感"、排卵期"明朗"）也要参与竞争 ——
+      //   它是一个**隐式的 condition**，权重低（25）但一直在。
+      //   漏了它就会出现「经期但没心情」这种空档（实测踩过）。
+      const mood = isOwner ? composeMoodValueV2(conditions, phaseMoodOfV2()) : '';
+      if (mood) out.push(`心情：${mood}`);
+
+      // ── condition 的描述行（不进标签，直接一段文字）──────────────────
+      // 只贴**有 label 的**（默认平淡项 label 为空，不占字符）。
+      // 最多两条：再多会把这一行撑长，而唤醒词每轮都进历史。
+      const condLines = conditions
+        .filter((c) => c.endTs > Date.now())
+        .sort((a, b) => b.intensity - a.intensity)
+        .map((c) => c.label)
+        .filter(Boolean)
+        .slice(0, 2);
+      out.push(...condLines);
+      if (cycleMark) out.push(cycleMark);
+      // ── 「昨晚」合并成一段（2026-11-24 重做）───────────────────────
+      //
+      // 原来这里有三样东西各说各的，会同时出现且互相打架：
+      //   ① pendingSleepQuality（按**睡眠时长**判"睡得浅/沉"）
+      //   ② pendingSleepWake  （按**精力恢复量**判"睡得还行"，而且单独占一行）
+      //   ③ pendingDream      （梦的内容）
+      //
+      // 结果一条唤醒词里能出现「睡得有点浅」+「睡得还行」两句相反的话。
+      // 现在**合并成一句**，格式：
+      //
+      //   （醒了，睡得还行　梦见吃到很好吃的东西）
+      //   （醒了，睡得有点浅，夜里醒过几次）
+      //   （醒了，梦见从很高的地方掉下去，醒来心跳得厉害）   ← 噩梦惊醒
+      //
+      // 优先用 pendingSleepWake（按恢复量，比"时长"更准），
+      // 没有它才用 sleepQuality（时长判定）。梦接在后面。
+      // 只在管理员私聊出（和心情/周期同一条边界）。
+      if (isOwner) {
+        const wake = takePendingSleepWake();
+        const quality = takePendingSleepQuality();
+        const dream = takePendingDream();
+        // 三样都没有 → 不产生这一段（大多数轮次都是这样）
+        if (wake || quality || dream) {
+          const bits = [];
+          // ①② 二选一：有恢复量那句就用它，否则用时长那句
+          const sleepText = String(wake || quality || '').replace(/[。.]$/, '').trim();
+          if (sleepText) bits.push(sleepText);
+          if (dream) bits.push(String(dream).replace(/[。.]$/, '').trim());
+          if (bits.length) out.push(`（醒了，${bits.join('　')}）`);
+        }
+      }
+      return out;
+    } catch (error) {
+      log(`[life] 身体状态读取失败（已跳过）：${error?.message ?? error}`);
+      return [];
+    }
+  }
+
+  /** 昨天的睡眠结论（用于 health 的病因推断）。没有就返回空串 —— 不编。 */
+  function sleepLabelYesterdayV2() {
+    try {
+      const st = readLifeCond();
+      const yesterdayKey = lifeDayKeyV2(Date.now() - 86400000);
+      const hit = st.list.find((c) => c.kind === 'sleep' && c.id === `sleep-${yesterdayKey}`);
+      return hit ? String(hit.label || '') : '';
+    } catch {
+      return '';
+    }
+  }
+
+  /**
+   * 天气缓存（2026-11-24 接上）。
+   *
+   * 同步读缓存，异步刷新 —— 唤醒路径是同步的，不能等 HTTP。
+   * 拿不到就返回 null，调用方（buildHealthCauses）据此不编病因。
+   */
+  let weatherCacheRef = null;
+  function lifeWeatherCacheV2() {
+    try {
+      if (!weatherCacheRef) {
+        weatherCacheRef = createWeatherCache({
+          configOf: () => {
+            const loc = cfg.life?.location;
+            const lat = Number(loc?.lat);
+            const lon = Number(loc?.lon);
+            if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+            return { lat, lon, timezone: String(cfg.life?.timezone || 'Asia/Shanghai') };
+          },
+          fetchJson: async (url) => {
+            // safeFetch 的第二个参数是 maxChars（不是超时）；返回 { body: string }。
+            // 天气载荷只有几百字节，4096 足够。
+            const res = await safeFetch(url, 4096);
+            if (!res || res.statusCode < 200 || res.statusCode >= 300) {
+              throw new Error(`weather HTTP ${res?.statusCode}`);
+            }
+            return JSON.parse(res.body);
+          }
+        });
+      }
+      // 到点了就在后台刷一次，失败不影响本轮（保留旧值）。
+      if (weatherCacheRef.shouldRefresh()) {
+        void weatherCacheRef.refresh().catch(() => {});
+      }
+      return weatherCacheRef.peek();
+    } catch {
+      return null;
+    }
+  }
+
+  /** 精力 = circle 的连续值 + 活跃 condition 的 delta（夹 0~100）。 */
+  function composeEnergyValueV2(baseEnergy, conditions) {
+    try {
+      return composeEnergyDelta(baseEnergy, conditions, Date.now()).value;
+    } catch {
+      return Number(baseEnergy) || 0;
+    }
+  }
+
+  /** 心情 = 活跃 condition 里 intensity 最高的那个 mood（没就返回空串）。 */
+  function composeMoodValueV2(conditions, phaseMood = null) {
+    try {
+      // 阶段心情当**隐式 condition**：权重 25，比任何真实事件低。
+      // 这样"经期敏感"平时在，一旦痛经/被关心出现就被盖过去，符合直觉。
+      const virtual = phaseMood && phaseMood.mood
+        ? [{
+          id: '__phase__', kind: 'phase', label: '', mood: phaseMood.mood,
+          energyDelta: 0, intensity: 25, startTs: 0, endTs: Number.MAX_SAFE_INTEGER,
+          phase: '', onEndTransition: '', transitionDone: false
+        }]
+        : [];
+      const all = [...virtual, ...normalizeConds(conditions)];
+      return composeMoodPick(all, Date.now()).mood || '';
+    } catch {
+      return '';
+    }
+  }
+
+  /** 当前阶段自带的心情（经期"敏感"、排卵期"明朗"…）。 */
+  function phaseMoodOfV2() {
+    try {
+      const st = readLifeCycle();
+      if (!st.anchorDay) return null;
+      const tz = String(cfg.life?.timezone || 'Asia/Shanghai');
+      const info = phaseAt(st.anchorDay, floorDay(Date.now(), tz), st.cycleDays);
+      return phaseEffect(info, { text: cfg.life?.statusText });
+    } catch {
+      return null;
+    }
+  }
+
+  // ══ condition 维护（2026-11-24）══════════════════════════════════════════
+  //
+  // 一次调用做四件事，**全部幂等**（同一天重复跑不会重复抽）：
+  //   ① 回收已到期的，按 onEndTransition 生成恢复尾声
+  //   ② 经期不适：一天最多掷一次
+  //   ③ health：按环境病因掷，一天最多一次
+  //   ④ sleep：跨天后的第一轮，按实际睡眠时长给一条
+  //
+  // 为什么全放在"读唤醒词"这条路径上跑：它本来就要每轮执行一次，
+  // 而且**只有真的在说话的时候状态才需要准**。挂定时器反而多线程风险。
+  let lifeCondCache = null;      // { list, meta }
+  const LIFE_COND_FILE = path.join(STATE_DIR, 'life-conditions.json');
+
+  function readLifeCond() {
+    if (lifeCondCache) return lifeCondCache;
+    let raw = null;
+    try { raw = readJsonSafe(LIFE_COND_FILE, null); } catch { raw = null; }
+    lifeCondCache = {
+      list: normalizeConds(raw?.list),
+      meta: {
+        lastDiscomfortRoll: String(raw?.meta?.lastDiscomfortRoll || ''),
+        lastHealthRoll: String(raw?.meta?.lastHealthRoll || ''),
+        lastSleepDay: String(raw?.meta?.lastSleepDay || ''),
+        lastSleepHours: Number(raw?.meta?.lastSleepHours) || 0
+      }
+    };
+    return lifeCondCache;
+  }
+
+  function writeLifeCond(next) {
+    lifeCondCache = { list: normalizeConds(next.list), meta: { ...next.meta } };
+    try {
+      atomicWriteJson(LIFE_COND_FILE, lifeCondCache);
+    } catch (error) {
+      log(`[life] condition 落盘失败（继续用内存值）：${error?.message ?? error}`);
+    }
+    return lifeCondCache.list;
+  }
+
+  /** 今天的日期键（YYYY-MM-DD，按配置时区）。 */
+  function lifeDayKeyV2(now = Date.now()) {
+    const tz = String(cfg.life?.timezone || 'Asia/Shanghai');
+    const d = new Date(now);
+    try {
+      const fmt = new Intl.DateTimeFormat('en-CA', {
+        timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit'
+      });
+      const got = {};
+      for (const p of fmt.formatToParts(d)) if (p.type !== 'literal') got[p.type] = p.value;
+      return `${got.year}-${got.month}-${got.day}`;
+    } catch {
+      return d.toISOString().slice(0, 10);
+    }
+  }
+
+  function maintainLifeConditionsV2(settled) {
+    const now = Date.now();
+    const st = readLifeCond();
+    let list = st.list;
+    const meta = { ...st.meta };
+    let dirty = false;
+
+    // ① 回收：到期的按 onEndTransition 生成尾声。
+    //    尾巴只挂一层（makeAfterglow 产出的 onEndTransition 是空串），不会无限套娃。
+    const reaped = reapExpiredLife(list, now, (exp) => makeAfterglowV2(exp.onEndTransition, now));
+    if (reaped.created.length || reaped.list.length !== list.length) {
+      list = reaped.list;
+      dirty = true;
+      if (reaped.created.length) {
+        log(`[life] 生成恢复尾声 ${reaped.created.map((c) => c.phase).join(',')}`);
+      }
+    }
+
+    const todayKey = lifeDayKeyV2(now);
+
+    // ② 经期不适（仅管理员私聊才值得跑，但抽了也无害 —— 不为显示的会话不拉这条路径）
+    if (cfg.life?.cycle !== false && cfg.life?.discomfort !== false) {
+      try {
+        const cst = readLifeCycle();
+        if (cst.anchorDay) {
+          const tz = String(cfg.life?.timezone || 'Asia/Shanghai');
+          const info = phaseAt(cst.anchorDay, floorDay(now, tz), cst.cycleDays);
+          const hasActive = list.some((c) => c.kind === 'cycle_discomfort' && c.endTs > now);
+          const roll = rollDiscomfort({
+            phase: info.phase,
+            todayKey,
+            lastRollKey: meta.lastDiscomfortRoll,
+            hasActive,
+            chance: Number(cfg.life?.discomfortChance) || 55
+          });
+          if (roll.roll && roll.type && roll.spec) {
+            const spec = roll.spec;
+            list = upsertCondLife(list, makeConditionLife({
+              id: `discomfort-${todayKey}`,
+              kind: 'cycle_discomfort',
+              label: spec.label,
+              mood: spec.mood,
+              energyDelta: spec.energyDelta,
+              intensity: 70,
+              startTs: now,
+              durationHours: spec.durationHours,
+              phase: roll.type
+            }));
+            dirty = true;
+            log(`[life] 经期不适：${roll.type}`);
+          }
+          // 注意：**掷失败也要记日期**，否则当天会反复重掷，实际概率远高于设定。
+          if (roll.roll && meta.lastDiscomfortRoll !== todayKey) {
+            meta.lastDiscomfortRoll = todayKey;
+            dirty = true;
+          }
+        }
+      } catch (error) {
+        log(`[life] 经期不适抽取失败：${error?.message ?? error}`);
+      }
+    }
+
+    // ③ health：按环境病因掷，一天最多一次。
+    if (cfg.life?.health !== false && meta.lastHealthRoll !== todayKey) {
+      try {
+        const causes = buildHealthCauses({
+          sleepLabel: sleepLabelYesterdayV2(),
+          weatherText: lifeWeatherCacheV2()?.text || '',
+          tempC: lifeWeatherCacheV2()?.tempC
+        });
+        const chance = healthChance(causes.length, Number(cfg.life?.intensity) / 100 || 0.5);
+        const hasHealth = list.some((c) => c.kind === 'health' && c.endTs > now);
+        if (!hasHealth && Math.random() < chance) {
+          const spec = pickFromPool(HEALTH_POOL);
+          if (spec) {
+            list = upsertCondLife(list, makeConditionLife({
+              id: `health-${todayKey}`,
+              kind: 'health',
+              label: spec.label,
+              mood: spec.mood,
+              energyDelta: spec.energyDelta,
+              intensity: 65,
+              startTs: now,
+              durationHours: spec.hours,
+              // ★ 病好了留个尾巴 —— 不是简单归零，这是最像真人的一条。
+              onEndTransition: TRANSITIONS.HEALTH_RELIEF
+            }));
+            log(`[life] 今天不舒服（病因 ${causes.length} 条：${causes.join('/') || '无'}）`);
+          }
+        }
+        meta.lastHealthRoll = todayKey;
+        dirty = true;
+      } catch (error) {
+        log(`[life] health 抽取失败：${error?.message ?? error}`);
+      }
+    }
+
+    // ④ sleep：跨天后第一次唤醒，给一条**只贴一次**的起床状态。
+    //
+    // ★ 2026-11-24 修：原来这里生成一个 8 小时的 condition，
+    //   于是"睡得有点浅"从早上一直挂到下午 —— 那是**起床那一刻**才该说的话，
+    //   不是一整天的状态。人不会下午三点还说"我夜里醒过几次"。
+    //
+    //   现在走 `pendingSleepWake`（和"刚睡醒"那句话同一套机制）：
+    //   取一次就清，只出现在跨天后**第一轮**唤醒里。
+    //   ⚠️ 精力扣减仍然要生效（那确实影响一整天），所以 energyDelta 照样记，
+    //      只是文字不重复贴。
+    if (cfg.life?.sleep !== false && meta.lastSleepDay !== todayKey) {
+      try {
+        const hours = Number(meta.lastSleepHours) || 0;
+        const spec = sleepVerdict({ sleepHours: hours });
+        if (spec.label) {
+          // 文字走一次性通道；数值走整天有效的 condition（label 留空，不进唤醒词）。
+          pendingSleepQuality = { text: spec.label, mood: spec.mood, at: now };
+          list = upsertCondLife(list, makeConditionLife({
+            id: `sleep-${todayKey}`,
+            kind: 'sleep',
+            label: '',                 // ★ 空 label = 不进唤醒词，只贡献数值与心情
+            mood: spec.mood,
+            energyDelta: spec.energyDelta,
+            intensity: 55,
+            startTs: now,
+            durationHours: spec.hours,
+            onEndTransition: spec.energyDelta <= -8 ? TRANSITIONS.SLEEP_REBOUND : ''
+          }));
+          // ⑥ 睡意回升（正向）：睡得**够长**时补一条"轻盈"。
+          //    和上面那条是配套的：睡浅 → 迟钝 + 睡意反弹；睡足 → 轻松。
+          //    这是唯一的正向睡眠心情，之前完全缺失。
+          if (spec.energyDelta > 0 || (Number(hours) >= 7 && spec.energyDelta === 0)) {
+            list = upsertCondLife(list, makeConditionLife({
+              id: `sleep-glow-${todayKey}`,
+              kind: 'sleep_afterglow',
+              label: SLEEP_AFTERGLOW_SPEC.label,
+              mood: SLEEP_AFTERGLOW_SPEC.mood,
+              energyDelta: SLEEP_AFTERGLOW_SPEC.energyDelta,
+              intensity: 60,
+              startTs: now,
+              durationHours: SLEEP_AFTERGLOW_SPEC.hours
+            }));
+          }
+        }
+        meta.lastSleepDay = todayKey;
+        dirty = true;
+      } catch (error) {
+        log(`[life] sleep 判定失败：${error?.message ?? error}`);
+      }
+    }
+
+    // ⑤ 饭点心情（2026-11-24 补）——我们正向心情的主要来源。
+    //
+    // 按**钟点**给，不按饥饿值：午饭饿是"走神"、晚饭饿是"粘人"、
+    // 夜宵是"松散"、下午想吃甜的是"柔软"。同一个"饿"，不同时刻感觉不一样。
+    // 只有真的饿了才给（刚吃完就"走神"是假的），甜食窗口例外。
+    if (cfg.life?.meals !== false) {
+      try {
+        const tz = String(cfg.life?.timezone || 'Asia/Shanghai');
+        const p = (() => {
+          try {
+            const fmt = new Intl.DateTimeFormat('en-CA', { timeZone: tz, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+            const got = {};
+            for (const x of fmt.formatToParts(new Date(now))) if (x.type !== 'literal') got[x.type] = x.value;
+            return Number(got.hour) * 60 + Number(got.minute);
+          } catch { return null; }
+        })();
+        if (p !== null) {
+          const spec = mealMoodAt(p, { satiety: Number(settled?.satiety) });
+          if (spec) {
+            // id 带窗口名+日期：同一个窗口一天只生成一次；过了窗口自然过期。
+            const id = `meal-${spec.id}-${todayKey}`;
+            const exists = list.some((c) => c.id === id && c.endTs > now);
+            if (!exists) {
+              // ⚠️ 2026-11-24：**时长按"窗口剩余时间"截断，不用固定的 spec.hours**。
+              //
+              // 根因（实测 18:08 一条唤醒词里同时说「想吃甜的」和「饿了，想吃点热的」）：
+              //   下午茶窗口 15:00–17:00，但时长写死 2h
+              //   → 16:47 生成的那条活到 18:47
+              //   而晚饭窗口 17:30 就开始了
+              //   → 两条必然重叠。
+              //
+              // 光靠"新的取代旧的"只是治症状：重叠本来就不该发生。
+              // 正确语义 —— **"这一刻想吃什么"只在本窗口内有效**：
+              //   时长 = min(spec.hours, 距离本窗口结束还剩多少分钟)
+              // 16:47 那条于是 16:47→17:00 结束，晚饭进来时下午茶已经没了。
+              //
+              // 兜底：至少要活 1 分钟，否则窗口最后一秒生成的东西会立刻过期
+              // （等于白跑一趟，还会反复重建）。
+              const minutesLeft = (() => {
+                // spec 里带窗口起止（mealMoodAt 返回的是 MEAL_MOODS 的副本）
+                const endMin = Number(spec.endMin);
+                if (!Number.isFinite(endMin)) return Number(spec.hours) * 60;
+                return Math.max(0, endMin - p);
+              })();
+              const durationHours = Math.max(1 / 60, Math.min(Number(spec.hours) || 1, minutesLeft / 60));
+              // 仍然保留"新的取代旧的"作为双保险：
+              // 时钟漂移、手动改数据、配置写错时，最多只显示一条 meal。
+              list = list.filter((c) => !(c.kind === 'meal' && c.id !== id && c.endTs > now));
+              list = upsertCondLife(list, makeConditionLife({
+                id,
+                kind: 'meal',
+                label: spec.label,
+                mood: spec.mood,
+                energyDelta: spec.energyDelta,
+                intensity: 50,
+                startTs: now,
+                durationHours
+              }));
+              dirty = true;
+            }
+          }
+        }
+      } catch (error) {
+        log(`[life] 饭点心情失败：${error?.message || error}`);
+      }
+    }
+
+    // ⑦ 周期恢复（正向）：月经期刚结束的那一天给「松弛」。
+    //    条件：今天不在 menstrual，且昨天在 menstrual。
+    //    这是"不难受了但还没完全回到稳定"的那一两天，原作者有、我们缺。
+    if (cfg.life?.cycle !== false) {
+      try {
+        const cst = readLifeCycle();
+        if (cst.anchorDay) {
+          const tz = String(cfg.life?.timezone || 'Asia/Shanghai');
+          const todayInfo = phaseAt(cst.anchorDay, floorDay(now, tz), cst.cycleDays);
+          const yesterdayInfo = phaseAt(cst.anchorDay, floorDay(now - 86400000, tz), cst.cycleDays);
+          const justEnded = yesterdayInfo.phase === 'menstrual' && todayInfo.phase !== 'menstrual';
+          const id = `cycle-recovery-${todayKey}`;
+          if (justEnded && !list.some((c) => c.id === id && c.endTs > now)) {
+            list = upsertCondLife(list, makeConditionLife({
+              id,
+              kind: 'cycle_recovery',
+              label: CYCLE_RECOVERY_SPEC.label,
+              mood: CYCLE_RECOVERY_SPEC.mood,
+              energyDelta: CYCLE_RECOVERY_SPEC.energyDelta,
+              intensity: 48,
+              startTs: now,
+              durationHours: CYCLE_RECOVERY_SPEC.hours
+            }));
+            dirty = true;
+            log('[life] 周期恢复：月经期结束，给一天松弛');
+          }
+        }
+      } catch (error) {
+        log(`[life] 周期恢复判定失败：${error?.message || error}`);
+      }
+    }
+
+    if (dirty) writeLifeCond({ list, meta });
+    // 尾声可能同时生出两条（sleep_rebound + soft_afterglow）——
+    // 合成一条再返回，避免唤醒词里出现两句意思相近的废话。
+    return activeLife(dedupeByKind(list, ['afterglow']), now);
+  }
+
+  /** 当前是否处于经期阶段（只读推算，不落盘）。算不出来一律 false。 */
+  function isPeriodPhaseV2() {
+    if (cfg.life?.cycle === false) return false;
+    try {
+      const st = readLifeCycle();
+      if (!st.anchorDay) return false;
+      const tz = String(cfg.life?.timezone || 'Asia/Shanghai');
+      const info = phaseAt(st.anchorDay, floorDay(Date.now(), tz), st.cycleDays);
+      // ⚠️ 阶段名是 `menstrual` 不是 `period`。改成六期（2026-11-24）时
+      //    这里漏改了，于是经期永远返回 false —— 表现为"生理期到了"和
+      //    "性欲高涨"同时出现。这种改名漏改**不会报错**，只能靠实测发现。
+      return info.phase === 'menstrual';
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * 生理期标记：经期给"到了 + 什么表现"、经前给"快到了 + 什么表现"，
+   * 其余阶段返回空串（**完全不显示**，不出空格子）。
+   *
+   * 数据全部来自 state/life-cycle.json（只有 anchorDay + cycleDays 两个数），
+   * 阶段由 life-cycle.js 纯函数推出来 —— 不落盘任何"她现在在哪一天"的中间态，
+   * 所以重启、改周期长度都不会出现前后不一致。
+   *
+   * 为什么 note 要写表现而不是"到了"：光一个标签她无法演绎 ——
+   * 不知道该累、该烦、还是该照常。给她表现，她才演得出来。
+   */
+  function buildCycleMarkV2(textCfg) {
+    if (cfg.life?.cycle === false) return '';
+    try {
+      const st = readLifeCycle();
+      if (!st.anchorDay) return '';          // 从没记过：什么都不说，别编一个第 1 天
+      const tz = String(cfg.life?.timezone || 'Asia/Shanghai');
+      const today = floorDay(Date.now(), tz);
+      const info = phaseAt(st.anchorDay, today, st.cycleDays);
+      const effect = phaseEffect(info, { text: textCfg });
+      if (!effect.show || !effect.note) return '';
+      return `${effect.label}：${effect.note}`;
+    } catch (error) {
+      log(`[life] 周期推算失败（已跳过）：${error?.message ?? error}`);
+      return '';
+    }
+  }
+
   function buildRoleLineV2(roleName, coldStart = false) {
     const name = String(roleName || '').trim();
     if (!name) return '';
@@ -14485,11 +16080,14 @@ async function main() {
     if (hint && hint.length <= ROLE_INLINE_MAX_CHARS) {
       return `【当前角色】${name}\n${hint.trim()}\n\n`;
     }
-    // 大卡：冷启动必须点名去调；平时只报名字。
-    if (coldStart) {
-      return `【当前角色】${name}（你的完整人设不在上下文里 —— 开口前先调 qq_get_prompt 读一遍人格卡，它只返回人格卡正文。）\n\n`;
-    }
-    return `【当前角色】${name}（完整角色卡请调用 qq_get_prompt 查看）\n\n`;
+    // 大卡：2026-11-23（操作者要求）**括号内容删掉**，只留名字。
+    //
+    // 原来冷启动会写一长句「（你的完整人设不在上下文里 —— 开口前先调
+    // qq_get_prompt 读一遍人格卡…）」，平时写「（完整角色卡请调用
+    // qq_get_prompt 查看）」。两处都是每轮重复的提示，而「什么时候该拿人格卡」
+    // 已经写在预设的【新会话 / 刚压缩完：先拿这三样东西】那一节里，
+    // 唤醒词里再说一遍只是把历史撑长。
+    return `【当前角色】${name}\n\n`;
   }
 
   /**
@@ -14499,16 +16097,16 @@ async function main() {
    * 场景判断交给模型看【本轮消息】的标签自己决定 —— 那才是真正有信息量的地方。
    */
   function buildSceneLineV2(key) {
-    const canonical = canonicalV2Key(key) || key;
-    const group = shareGroupOf(canonical);
-    // 2026-11-10 起不再单独出这段：群聊标签已缩成「群」，私聊保持带 QQ 号，
-    // 而「标签 → key → 令牌」的三元组统一由 sessionTokenLineV2 给一次。
-    // 同一个映射写两遍（场景段给 key、令牌段再给 key+令牌）是纯重复。
-    // 【怎么回】那段也删了：消息行本身就带 `[群]` / `[私聊10001]` 前缀，
-    // 「想回哪个就把 key 填成对应的那个」属于一眼可推的推论。
-    if (group.length > 1) return '';
-    // 非共享组（只有一个聊天）保留一句最短定位，它没有"多聊天"的上下文可推。
-    return `【场景】${chatLabelForV2(canonical)}\n`;
+    // 2026-11-23（操作者要求）：**整段删除**。
+    //
+    // 原来非共享组会输出 `【场景】私聊84420221`。删掉的理由：
+    //   · 一个 DSH 会话只服务一个聊天（sessionSharing 已关闭），
+    //     「这是哪个聊天」在【令牌】行已经写明（`→ key "private:…"`）；
+    //   · 消息行也不再带 `[私聊XXX]` 标签（见 renderOneMessageLine），
+    //     两边一起删才不矛盾。
+    // 保留函数签名，避免调用点报错。
+    void key;
+    return '';
   }
 
   /**
@@ -14547,14 +16145,24 @@ async function main() {
   }
 
   function buildAffinityStageChangeLineV2(key) {
-    // 档位变化现在存在**全局** socialV2.affinityStageChanges（按 QQ 号），
-    // 不再按会话存 —— 所以这里不需要 key 也能读到，保留参数只是为了签名一致。
+    // 档位变化存在**全局** socialV2.affinityStageChanges（按 QQ 号），
+    // 但读取时**必须按会话过滤**（2026-11-24 修）。
+    //
+    // 原来的坑：不过滤。于是 A 群某人档位一变，B 群和私聊的唤醒词都会提示
+    // 「（某某 的好感度发生了变化，查一下某某的好感度）」——
+    // 而那个人可能在私聊里根本没出现过。操作者实测发现过这种情况。
+    //
+    // 现在每条变化都带 `key`（发生在哪个会话），只显示 key 匹配当前会话的。
+    // 老数据没有 key 字段 → 一律不显示（宁可少提一句，也不要提错人）。
     let st;
     try { st = getSocialV2State(key); } catch { st = null; }
     const changes = socialV2.affinityStageChanges && typeof socialV2.affinityStageChanges === 'object'
       ? socialV2.affinityStageChanges : null;
     if (!changes) return '';
-    const entries = Object.entries(changes).filter(([, v]) => v && v.to);
+    const curKey = canonicalV2Key(key) || String(key || '');
+    const entries = Object.entries(changes)
+      .filter(([, v]) => v && v.to)
+      .filter(([, v]) => String(v.key || '') === curKey);
     if (!entries.length) return '';
 
     // 名字：优先用这个会话最近消息里的群名片/昵称，取不到就退回 QQ 号。
@@ -14585,7 +16193,9 @@ async function main() {
     const action = names.length === 1
       ? `查一下${who}的好感度`
       : `查一下他们的好感度`;
-    return `（${who} 的好感度发生了变化，${action}）`;
+    // ⚠️ 名字后面**不要加空格**：原来是 `${who} 的好感度`，
+    //    于是输出成「阿三 的好感度发生了变化」。中文里这是多余的。
+    return `（${who}的好感度发生了变化，${action}）`;
   }
 
   // ══════════════════════════════════════════════════════════════════════════
@@ -14821,6 +16431,50 @@ async function main() {
     // 所以每轮都明确写一次"这是哪儿、谁是对方、地址该填什么"，这是不串号的第一道保障
     // （第二道是 turnKeyQueue 的回复路由）。
     const sceneLine = buildSceneLineV2(key);
+    // ── 【现在】行（2026-11-23 新增）────────────────────────────────────────
+    //
+    // 为什么加：persona 的【时间感】第一句一直写着「每轮提示里会给出【当前时间】」，
+    // 但桥接从来没输出过这一行（grep 全文只有一个注释提到"不再单独给一行"）。
+    // 结果模型手上只有每条消息的 ago（相对时间），**跨天或长时间沉睡后不知道现在几点**——
+    // 这正是"醒来把三小时前的旧账当刚发的话接"那条历史问题没被解决干净的一半。
+    //
+    // 放在**最前面**而不是 sceneLine 之后：这是模型读到的第一个上下文事实，
+    // 先知道"现在是什么时候"，后面的消息 age 才有参照。
+    //
+    // 当前只含纯本地计算的内容（日期/星期/时刻/节气/农历节日），零网络零状态。
+    // 天气、饥饿、精力后续往 buildNowLine 的 extras 里塞，格式位置已经留好。
+    //
+    // 前缀缓存：这行每轮都变，但它拼在 **user message** 里、且在这个会话本轮的最前面
+    // —— 前面的 system prompt 与历史前缀不受影响，所以不产生 cacheMiss。
+    const nowLine = cfg.life?.enabled === false
+      ? ''
+      : buildNowLineOf(Date.now(), {
+        timezone: String(cfg.life?.timezone || 'Asia/Shanghai'),
+        // 天气只进【现在】行（和时间一样是"客观事实"），
+        // 不进【状态】—— 状态是"她自己的身体"，两者性质不同。
+        weather: cfg.life?.weather === false ? '' : weatherShortText(lifeWeatherCacheV2()),
+        extras: buildLifeCircleExtrasV2(key)
+      });
+    // head = 【现在】行 + 场景行，所有唤醒分支共用，保证一行都不漏。
+    //
+    // ★ 2026-11-23：在【现在】之后追加**起床状态**（如果有）。
+    //
+    //   放在这里而不是某个"唤醒原因"分支里，是因为醒来这件事和"为什么叫醒你"无关：
+    //   可能是有人找她、可能是主动机会、也可能只是潜水到点 —— 三种情况她都是"刚醒"。
+    //
+    //   只贴群聊不给（`showSleepWakeInGroup: false` 默认）：睡得好不好是她自己的事，
+    //   挂在群消息里既没必要，也容易被拿去做文章（和yu wang同一条理由）。
+    //
+    //   takePendingSleepWake() **取一次就清空** —— 醒来那句话只该出现一轮。
+    //
+    // ⚠️ 2026-11-24 改：**它不再在唤醒词里单独占一行**。
+    //   原来拼成 `（睡得还行，起来还有点没缓过来。）\n` 挂在【现在】后面，
+    //   结果和【状态】里的"睡得有点浅，夜里醒过几次"打架 —— 同一件事两个来源、
+    //   两套判据（前者按精力恢复量、后者按睡眠时长）。
+    //   现在由 buildLifeCircleExtrasV2 的「昨晚」那一段统一消费、合并成一句。
+    //   **不要在这里再调一次 takePendingSleepWake()** —— 它有取完即清的副作用，
+    //   这里多取一次，那边就永远拿不到。
+    const head = nowLine + sceneLine;
     // 好感度**不再注入唤醒包**（2026-11-07 三次修订，操作者要求）。
     // 理由：任何每轮都出现的状态描述都会跟人格卡抢注意力，实测她开始用解释口吻回话。
     // 现在改成"她想起来才查"：流程写在 preset 里（发言前可先 qq_affinity 看一眼分寸），
@@ -14844,45 +16498,76 @@ async function main() {
       //     "组内已置位就降级"的判定。实测 18/48 个会话首轮没有引导。
       //   · 它只在第一轮出现一次，多这 100 字符对模型行为的实际影响很小。
       // 注意：**括号提示（factsLine）不受影响** —— 那段仍然只在冷启动/压缩后出现。
-      return `${sceneLine}${base}${selfText}`;
+      return `${head}${base}${selfText}`;
     }
     // 档位变化提醒：和「（有人拍了一拍。）」一样的口吻与位置。
     // 挂在末尾而不是开头，是因为它只是"补充说明"，不该抢走"为什么叫醒你"的位置。
     const stageChangeLine = buildAffinityStageChangeLineV2(key);
     const tail = stageChangeLine ? `\n${stageChangeLine}` : '';
-    if (reason === 'timeout') return `${sceneLine}${base}（你设的潜水时间到了。）${tail}`;
-    if (reason === 'replyCheck') return `${sceneLine}${base}（对方回你了。）${tail}`;
-    // 主动机会唤醒（2026-11-15 修）：**按会话类型分句**。
+    if (reason === 'timeout') return `${head}${base}（你设的潜水时间到了。）${tail}`;
+    if (reason === 'replyCheck') return `${head}${base}（对方回你了。）${tail}`;
+    // 主动机会唤醒（2026-11-24 重写）：**说动机，不说"定时器响了"**。
     //
-    // 原来不管群聊私聊都说「群里安静了一阵」。私聊收到这句时，她的处境其实是
-    // 「这个人有一阵没说话了，你要不要主动找他」，跟"群"没关系 ——
-    // 实测 15:50:37 私聊 proactiveCheck 唤醒了，但她看到"群里"就当成别人的事，
-    // 不开口。操作者的反馈正是「群聊的主动唤醒就有提示词，私聊的怎么没有」。
-    //
-    // 两句都保持和上面 `（对方回你了。）` 一样的短口吻：
-    // 只说"为什么叫醒你"，不写行动要求（那些在 preset 里）。
-    if (reason === 'proactiveCheck') {
-      const isPrivate = String(key).startsWith('private:');
-      const hint = isPrivate
-        ? '（这个人有阵子没说话了，想找他可以说。）'
-        : '（群里安静了一阵，想说什么可以说。）';
-      return `${sceneLine}${base}${hint}${tail}`;
+    // 历史：原来这里是「（这个人有阵子没说话了，想找他可以说。）」这类通用句。
+    // 2026-11-15 曾按会话类型分成"私聊/群聊"两句，但本质没变 ——
+    // 它跟当下状态无关，读起来就是"闹钟到点了"。
+    // 现在候选生成器（life-proactive.js）要么给出具体动机，
+    // 要么根本进不到这里 —— 没理由就不唤醒。
+    if (reason === 'proactiveCheck' || String(reason).startsWith('proactiveCheck:')) {
+      // ★ 2026-11-24：**通用提示已删除**。
+      //
+      //   候选带动机时把动机说出来，例如
+      //   「（昨晚没睡好，醒来还带着睡意，想先轻轻说声早安。）」——
+      //   有具体由头，她说出来的话才有内容。
+      //   现在候选生成器要么给出具体动机，要么根本进不到这里
+      //   （pickProactiveRouteV2 里没有候选就直接 return null）。
+      //
+      //   reason 形如 `proactiveCheck:昨晚没睡好，醒来还带着睡意…`
+      const motive = String(reason).slice('proactiveCheck'.length).replace(/^:/, '').trim();
+      if (!motive) {
+        // 理论上不该发生（没有动机就不会唤醒）。真发生了就退回默认分支，
+        // 让唤醒词保持"没有理由"的干净形态，而不是编一句通用话。
+        return `${head}${base}${tail}`;
+      }
+      // 去掉句尾的「。」，因为外面还要套括号。
+      const clean = motive.replace(/[。.]$/, '');
+      return `${head}${base}（${clean}。）${tail}`;
     }
-    if (reason === 'poke') return `${sceneLine}${base}（有人拍了一拍。）${tail}`;
+
+    // ── 群聊的主动机会（2026-11-24 保留原有文案）─────────────────────
+    //
+    // 候选生成器（life-proactive.js）只接在**私聊**那条路径上；
+    // 群聊仍然是原来的随机唤醒（见 scheduleProactiveCheckV2 的群聊分支）。
+    // 所以群聊这句通用提示**还得留着**，删了群聊就没话说了。
+    if (reason === 'proactiveGroupCheck') {
+      return `${head}${base}（群里安静了一阵，想说什么可以说。）${tail}`;
+    }
+    // 对话延续：她上一句没得到回应，现在可以再问一次。
+    // （原来这条 reason 没有渲染分支，会落到默认分支 —— 等于什么都没说。）
+    if (reason === 'proactiveContinuation') {
+      return `${head}${base}（你上一句还没等到回应，可以再问一句。）${tail}`;
+    }
+    // 做噩梦惊醒（2026-11-24）：睡着时唯一允许的主动唤醒理由。
+    // 它同时说了"为什么醒"和"为什么来消息"——两个问题一个由头。
+    if (reason === 'proactiveNightmare') {
+      return `${head}${base}（刚做了个不太好的梦，惊醒了。）${tail}`;
+    }
+    if (reason === 'poke') return `${head}${base}（有人拍了一拍。）${tail}`;
     // 待办到点：和「（有人拍了一拍。）」同样的位置和口吻，但要把是哪件事说出来 ——
     // 只写"有件事到点了"她还得自己去查记忆，等于多一次工具往返。
     // reason 形如 todo:明天讲那张卡片（写 todo 时把文本塞进子类型）。
     if (String(reason).startsWith('todo:')) {
       const what = String(reason).slice('todo:'.length).trim();
-      return `${sceneLine}${base}（待办到点了：${what}）${tail}`;
+      return `${head}${base}（待办到点了：${what}）${tail}`;
     }
-    if (reason === 'todo') return `${sceneLine}${base}（你有待办到点了。）${tail}`;
-    return `${sceneLine}${base}${tail}`;
+    if (reason === 'todo') return `${head}${base}（你有待办到点了。）${tail}`;
+    return `${head}${base}${tail}`;
   }
 
   function buildWakeReminderPromptV2(key) {
     const roleState = readRoleState();
-    const roleLine = roleState.role ? `【当前角色】${roleState.role}（完整角色卡请调用 qq_get_prompt 查看）\n\n` : '';
+    // 2026-11-23：括号内容删掉，只留名字。
+    const roleLine = roleState.role ? `【当前角色】${roleState.role}\n\n` : '';
     const identityLine = cfg.socialV2?.injectViaSystemPrompt === true ? '' : selfIdentityTextV2();
     const st = getSocialV2State(key);
     const tokenLine = cfg.socialV2?.injectViaSystemPrompt === true ? '' : `${sessionTokenLineV2(key, st.agentToken)}\n\n`;
@@ -14990,6 +16675,9 @@ async function main() {
     //     第二遍按原始 reason（bootstrap）重渲 ⇒ 同一会话里提示发两遍。
     // 现在渲染只在 deliverPromptNow 一处发生，这里只负责"叫醒"。
     log(`[reserved2] 唤醒 ${key}（${reason}）`);
+    // 2026-11-23：这次唤醒到底有没有真的投递出去。
+    // 主动唤醒靠它决定要不要记账 —— 定时器触发但被拒/异常，不叫"她找过他"。
+    let wakeDelivered = true;
     const rollbackWakeTime = () => {
       const idx = st.wakeTimes.lastIndexOf(wakeTime);
       if (idx >= 0) st.wakeTimes.splice(idx, 1);
@@ -15000,6 +16688,10 @@ async function main() {
       armPendingWakeLease(key);
       // promptText 传空串：deliverPromptNow 见到 wakeReason 会自己渲染（唯一渲染点）。
       const result = await deliverPrompt(key, '', { wakeReason: reason });
+      // 2026-11-23：把"真的投递出去了吗"回给调用方。
+      // 主动唤醒要拿它决定要不要记账（定时器触发 ≠ 他收到了）。
+      // ok === false 是被拒；queued === true 是入队（DSH 恢复后补投，也算投递成功）。
+      if (result && result.ok === false) wakeDelivered = false;
       const restoreFiniteSleep = () => {
         if (hadFiniteSleep) {
           st.wakeConfig.sleepUntil = prevSleepUntil;
@@ -15029,8 +16721,10 @@ async function main() {
         saveSocialV2State();
         setupSleepTimerV2(key);
       }
+      wakeDelivered = false;
       log(`[reserved2] 唤醒投递失败 ${key}: ${error?.message ?? error}`);
     }
+    return wakeDelivered;
   }
 
   function cancelReplyCheckV2(key) {
@@ -15135,6 +16829,25 @@ async function main() {
   async function compactSessionV2(key) {
     const sessionId = state.sessions[key];
     if (!sessionId) return { ok: false, error: '会话未建立' };
+    // ── 2026-11-25 硬性拒绝：默认不调 /compact ────────────────────────────
+    //
+    // DSH 的 compactNow() 里 retainTokens 是**硬编码 0**：
+    //   selectCompactableRange(session, measurement, 0)
+    // 后果是"除最后一条外全部压成摘要"——不是保留尾部 N 万。
+    // 实测让用户丢了 1000+ 条对话（上下文从 40 万掉到几千）。
+    //
+    // 所以默认拒绝走这条路。只有显式把
+    //   socialV2.compaction.allowDestructiveCompact 设为 true 才放行
+    // （留给"将来 DSH 修好了 / 用户明确想清空"的场景）。
+    if (cfg.socialV2?.compaction?.allowDestructiveCompact !== true) {
+      return {
+        ok: false,
+        error: '/compact 在 DSH 里把 retainTokens 硬编码成 0（会清空除最后一条外的全部历史），'
+          + '已默认拒绝。若要保留尾部，请依赖预设里的原生压缩（thresholdRatio / retainTokens）；'
+          + '确实想清空再设 socialV2.compaction.allowDestructiveCompact=true。',
+        refused: true,
+      };
+    }
     try {
       const res = await withTimeout(
         api.callUnary('commands/execute', { agentId: sessionId, line: '/compact', submittedAttachments: [] }),
@@ -15331,7 +17044,17 @@ async function main() {
   // 与「未读消息」无关的唤醒原因（定时器/引导）。这些原因在会话繁忙时被暂存后，
   // 不能用「unread 里还有没有对应 seq」来判断是否还要补发 —— 那一轮很可能已经把
   // 未读全部标读了，结果就是 timeout 定时器被静默丢掉、会话停在无定时器的静默态。
-  const TIMER_WAKE_REASONS = new Set(['timeout', 'replyCheck', 'proactiveCheck', 'bootstrap', 'admin', 'todo']);
+  //
+  // ⚠️ 2026-11-24：**主动唤醒的三个 reason 都要列进来**，
+  //    否则繁忙时被暂存后，补发前会去查 unread（而那时未读早被标读了）→ 静默丢弃。
+  //    `isTimerWakeReason` 按 `:` 前段比较，所以 `proactiveCheck:动机` 也能命中。
+  const TIMER_WAKE_REASONS = new Set([
+    'timeout', 'replyCheck', 'bootstrap', 'admin', 'todo',
+    'proactiveCheck',        // 私聊：候选动机
+    'proactiveGroupCheck',   // 群聊：随机唤醒
+    'proactiveContinuation', // 对话延续
+    'proactiveNightmare'     // 睡着时的噩梦惊醒
+  ]);
   function isTimerWakeReason(reason) {
     return TIMER_WAKE_REASONS.has(String(reason ?? '').split(':')[0]);
   }
@@ -15452,8 +17175,11 @@ async function main() {
       } else if (item.reason === 'replyCheck') {
         log(`[reserved2] ${key} 补排繁忙期间的回复检查`);
         scheduleReplyCheckV2(key);
-      } else if (item.reason === 'proactiveCheck') {
+      } else if (String(item.reason).startsWith('proactiveCheck')
+        || item.reason === 'proactiveGroupCheck' || item.reason === 'proactiveContinuation') {
         // 主动机会有周期性重排，错过一次可接受（也不该在回合结束时立刻补一刀）。
+        // ⚠️ 三种 reason 都要走这条「跳过」分支 —— 否则会落到下面的 `else`
+        //    去 scheduleWakeV2 补发一条已经过时的主动消息（比如三小时前的"早安"）。
         log(`[reserved2] ${key} 繁忙期间的主动机会已过期，跳过补发`);
       } else {
         log(`[reserved2] ${key} 补发繁忙期间积压的唤醒：${item.reason}`);
@@ -15604,6 +17330,1108 @@ async function main() {
     st.proactiveTimer = null;
   }
 
+  // ══ 主动唤醒：tier 额度制（2026-11-23）═══════════════════════════════════
+  //
+  // 改造动机（操作者拍板）：
+  //   原来是**纯概率**：每次检查 prob = 0.3，再乘一堆 0.5 / 0.3。
+  //   问题不是"太多"或"太少"，是**方差**：乘数永远为正 ⇒ 一天 48 次机会里，
+  //   可能一条都不冒，也可能连着蹦 5 条。真人不是这么运作的 —— 真人想的是
+  //   「我今天是不是已经烦他三次了」。
+  //
+  //   所以引入**额度**（上限），而不是继续调概率（期望）。
+  //   参考 AstrBot private_companion_v2 的 _PROACTIVE_QUOTA_TIER_POLICIES。
+  //
+  // 与他们的区别：
+  //   · 他们的 tier 是面板上用户手选的枚举档；
+  //   · 我们这儿的 tier **由好感度档位决定**（见 affinity.js 的 AFFINITY_TIER）。
+  //
+  // ── 2026-11-23 四次修订（操作者拍板）：额度搬去 affinity.js ─────────────
+  //
+  //   ★ 原话：「比如位于依赖档，就是他们做的 tier1，1-3，然后按百分比设置
+  //     1 还是 2 还是 3，0-33% 是 1，33%-66% 是 2，66% 到 100% 是 3」
+  //
+  //   所以额度不再是"档位 → 一个固定数"，而是：
+  //     **分数** → proactiveQuotaBandForScore() → 档内百分比 → 三等分取值。
+  //
+  //   这段逻辑全在 affinity.js（`proactiveQuotaBandForScore` + `TIER_QUOTA_RANGE`），
+  //   **不在这里再维护一份**：两张表迟早会漂移，而且额度本来就该跟"关系多深"
+  //   绑在一起算，不该跟"间隔参数"混在一张表里。
+  //
+  //   本表现在**只管间隔与未回应惩罚**：
+  //
+  //   minIntervalMs    两条主动之间的最小间隔。起点。
+  //   maxIntervalMs    间隔的**天花板**。没有它，被冷落会滑成"整天不再开口"，
+  //                    那是放弃不是节制。
+  //   graceMs          她开了口在等你，"等多久没回音才允许追"。
+  //
+  //   ── 未回应三件套（2026-11-24 改语义，务必看 proactiveGapMsOf 的说明）──
+  //   unansweredWeight         **折扣**（0–1），不是底数。
+  //                            1 = 未回应全额放大间隔，0 = 完全不在意。
+  //   unansweredSlowdownStart  第几次未回才开始放大（默认 2：第一次先不计）。
+  //   unansweredMaxMultiplier  线性放大的上限（默认 2.2 倍，不是指数爆炸）。
+  //
+  // ⚠️ **只作用于私聊**。群聊仍是原来的随机唤醒（群里的她只是群友之一）。
+  //
+  // ⚠️ 2026-11-23 三次修订：**三档**（不是四档），最高档 12/天封顶。
+  const PROACTIVE_TIERS = Object.freeze({
+    0: {
+      label: '不主动',
+      minIntervalMs: 0,
+      maxIntervalMs: 0,
+      graceMs: 0,
+      // tier0 不发主动，这几个字段不会被读到；给中性值只是为了让形状一致。
+      unansweredWeight: 0,
+      unansweredSlowdownStart: 2,
+      unansweredMaxMultiplier: 1,
+    },
+    // tier1 = 好感度「在意」档（100–300 分），额度 1–3 条/天
+    1: {
+      label: '依赖',
+      minIntervalMs: 240 * 60 * 1000,   // 4h
+      maxIntervalMs: 720 * 60 * 1000,   // 12h 封顶
+      graceMs: 90 * 60 * 1000,          // 她开了口，90 分钟没回音才追
+      // ── 未回应：语义改成**折扣**（2026-11-24）────────────────────────
+      // 旧版把它当底数（1.6^次数，指数爆炸）。新版照 AstrBot：
+      //   实际倍数 = 1 + (线性增长 - 1) × weight
+      // weight = 1.0 → 全额生效；0 → 完全不在意。
+      //
+      // ★ 我们的取值**和原作者相反**，是有意的：
+      //   原作者 tier1=1.0、tier5=0.0（关系越稳越不拿"没回"当回事）；
+      //   我们的设定是「越亲近越怕你不回」，所以 tier 越高 weight 越大。
+      unansweredWeight: 0.45,           // 依赖档：刚认识不久，没回不算大事
+      unansweredSlowdownStart: 2,       // 第 2 次没回才开始放大（第一次先不计）
+      unansweredMaxMultiplier: 2.2,     // 线性增长的上限
+    },
+    // tier2 = 「依赖」档（300–600 分），额度 4–7 条/天
+    2: {
+      label: '喜欢',
+      minIntervalMs: 150 * 60 * 1000,   // 2.5h
+      maxIntervalMs: 600 * 60 * 1000,   // 10h 封顶
+      graceMs: 90 * 60 * 1000,
+      unansweredWeight: 0.7,            // 喜欢档：开始在意了
+      unansweredSlowdownStart: 2,
+      unansweredMaxMultiplier: 2.2,
+    },
+    // tier3 = 「喜欢」+「偏爱」（600–1200 分），额度 4→8→12 条/天（连续插值）
+    3: {
+      label: '偏爱',
+      minIntervalMs: 90 * 60 * 1000,    // 1.5h
+      maxIntervalMs: 480 * 60 * 1000,   // 8h 封顶
+      graceMs: 90 * 60 * 1000,
+      unansweredWeight: 1.0,            // 偏爱档：最怕你不回，全额收敛
+      unansweredSlowdownStart: 2,
+      unansweredMaxMultiplier: 2.2,
+    }
+  });
+
+  /** tier 硬上限（照他们的 _PROACTIVE_DAILY_QUOTA_MAX）。 */
+  const PROACTIVE_DAILY_QUOTA_CEIL = 25;
+
+  /**
+   * 主动路由表。
+   *
+   * ★ expectation 是这套设计里最关键的一个字段（操作者认可）：
+   *     'expected' —— 她问的是话，对方没接，算她的账（未回应 +1）
+   *     'optional' —— 她只是想说一句，对方不回**不算她的账**
+   *   真人不会因为对方没回"天冷了加衣服"就觉得自己被拒绝，
+   *   但会因为在等一个回答而开始收敛。两者混成一个计数器就全乱了。
+   */
+  const PROACTIVE_ROUTES = Object.freeze({
+    continuation: {
+      label: '对话延续',
+      expectation: 'expected',
+      maxFollowUps: 1,        // ★ 只追一次，绝不追第二次
+    },
+    // 2026-11-24：删掉 relational（原靠 pendingThoughts）与 relatedTopic
+    // （原靠 activeTopics）—— 那两类记忆已从体系里移除。
+    curiosity: {
+      label: '自己想说的',
+      expectation: 'optional',
+      maxFollowUps: 0,
+    }
+  });
+
+  /** 本地日期键（YYYY-MM-DD），按 process 时区。额度按它切日。 */
+  function proactiveDayKey(now = Date.now()) {
+    const d = new Date(now);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  }
+
+  /** 取主动状态对象（懒初始化，兼容老文件里没有 proactive 的情况）。 */
+  function proactiveState() {
+    const g = globalMemoryOf();
+    if (!g.proactive || typeof g.proactive !== 'object') {
+      g.proactive = {
+        v: 2,
+        // ── 按人字段（2026-11-24 从全局改成 per-key）──────────────────────
+        // 原来这些都是单例，于是：
+        //   · todayCount 是全局 1 条 → 面板显示「鹿姐 1/12」，但那 1 条不是给她的
+        //   · lastProactiveAt 全局 → 给 A 发过之后，B 也要等同样的间隔
+        //   · sentCandidateIds 全局 → 私聊 A 说了"早安"，私聊 B 就说不出来
+        //   · unanswered / awaitingReplySince 全局 → 别人没回也影响她
+        // 现在全部按 key 存。
+        byKey: {},
+        // ── 仍是全局的字段（跨会话共享才有意义）──────────────────────────
+        // 时段分桶：判断"深夜已经发过一条"是全局事实，不分人
+        daypartCounts: null,
+        // 噩梦那晚的日期键（YYYY-MM-DD）。
+        // ★ 为什么**不**按会话：噩梦是**她身体**的事 —— 她只有一副身体、只睡一次觉。
+        //   如果按会话存，给 A 发过噩梦之后，给 B 还能再做一次噩梦，同一晚惊两次。
+        nightmareNight: ''
+      };
+    }
+    const p = g.proactive;
+    if (!p.byKey || typeof p.byKey !== 'object') p.byKey = {};
+    if (typeof p.nightmareNight !== 'string') p.nightmareNight = '';
+
+    // ── 老数据迁移（v1 → v2，2026-11-24）─────────────────────────────────
+    //
+    // v1 的主动状态是全局单例，v2 改成按 key。迁移规则：
+    //   · 老字段里有意义的（todayCount / lastProactiveAt / quotaOfDay …）
+    //     搬给**当时那个 lastRoute 所属的会话** —— 但我们不知道是哪个。
+    //   · 所以**不猜**：把老字段原样留在顶层（当只读历史），
+    //     byKey 从空开始。代价是"今天已发条数"会从 0 重算一次，
+    //     这一天的额度可能多发一两条 —— 比把 A 的账记到 B 头上好。
+    //   · 迁移只做一次（记 `migratedToV2`）。
+    if (Number(p.v) < 2) {
+      p.v = 2;
+      p.migratedToV2At = Date.now();
+      // 老 quotaOfDay 里的 quota 是错的（只按 tier 缓存、不看分数），
+      // 留着会让新逻辑继续复用错值 —— 直接清掉，让它按分数重算。
+      p.quotaOfDay = null;
+    }
+    return p;
+  }
+
+  /**
+   * 取某个会话的主动状态（按 key 隔离）。
+   *
+   * 这是 2026-11-24 改造后**唯一**该被调用的入口 —— 除 `daypartCounts` 外，
+   * 所有主动相关字段都是按人的。`proactiveState()` 只剩"拿到容器"的作用。
+   *
+   * @param {string} key 会话 key（`private:xxx` / `group:xxx`）
+   */
+  function proactiveStateOf(key) {
+    const p = proactiveState();
+    const k = String(key || '');
+    if (!k) return null;
+    let rec = p.byKey[k];
+    if (!rec || typeof rec !== 'object') {
+      rec = {
+        todayKey: '', todayCount: 0, lastProactiveAt: 0, lastRoute: '',
+        unanswered: {}, awaitingReplySince: 0, routeSentCounts: {},
+        quotaOfDay: null, sentCandidateIds: [],
+        // 抖动缓存：见 scheduleProactiveCheckV2 的说明
+        proactiveJitterFor: 0, proactiveJitter: 0
+      };
+      p.byKey[k] = rec;
+    }
+    if (!rec.unanswered || typeof rec.unanswered !== 'object') rec.unanswered = {};
+    if (!rec.routeSentCounts || typeof rec.routeSentCounts !== 'object') rec.routeSentCounts = {};
+    if (!Array.isArray(rec.sentCandidateIds)) rec.sentCandidateIds = [];
+    return rec;
+  }
+
+  /**
+   * 这个会话的私聊 tier。群聊一律返回 -1（表示"不归这套管，走原来的随机唤醒"）。
+   *
+   * 好感度按 QQ 号全局一份（socialV2.affinities），所以直接从 key 里取 userId。
+   */
+  function proactiveTierOf(key) {
+    if (!String(key).startsWith('private:')) return -1;
+    const uid = String(key).slice('private:'.length);
+    const rec = socialV2.affinities?.[uid];
+    return proactiveTierForScore(Number(rec?.score) || 0);
+  }
+
+  /** 该会话当前的主动额度（tier 额度与每日硬上限取小）。 */
+  /**
+   * 这个会话今天的主动额度（条/天）。
+   *
+   * ── 2026-11-23 四次修订（操作者拍板）────────────────────────────────────
+   *
+   * 额度**不再随机抽样**，而是由「分数在本档内的百分比」决定，规则是三等分：
+   *
+   *   依赖档（300–600 分），区间 4–7：
+   *     0%–33%   → 4 条
+   *     33%–66%  → 5 条
+   *     66%–100% → 6 条
+   *
+   *   操作者原话：「比如位于依赖档，就是他们做的 tier1，1-3，然后按百分比
+   *   设置 1 还是 2 还是 3，0-33% 是 1，33%-66% 是 2，66% 到 100% 是 3」
+   *
+   *   为什么这样比"随机抽样"好：
+   *     随机抽样让**同一个人在同一个分数**上每天额度不同 —— 分数涨了额度可能
+   *     反而掉了，玩家会觉得"我明明聊得更多了"。三等分是**确定性**的：
+   *     分数只升不降，额度也只升不降（跨档回落是另一回事，见 affinity.js）。
+   *
+   *   「喜欢」和「偏爱」两档用的是连续插值（600→4、1000→8、1200→12），
+   *   不是三等分 —— 理由见 affinity.js 的 TIER_QUOTA_RANGE 注释。
+   *
+   * 缓存：同一天同一档只算一次（存 quotaOfDay），避免同一天里因为分数微动
+   * 而反复重算。跨天 / 跨档才重算。
+   */
+  function proactiveQuotaOf(key) {
+    const tier = proactiveTierOf(key);
+    if (tier < 0) return { governed: false, tier: -1, policy: null, quota: Infinity };
+    const policy = PROACTIVE_TIERS[tier] ?? PROACTIVE_TIERS[0];
+    if (tier === 0) return { governed: true, tier, policy, quota: 0 };
+
+    const uid = String(key).slice('private:'.length);
+    const score = Number(socialV2.affinities?.[uid]?.score) || 0;
+    const band = proactiveQuotaBandForScore(score);
+
+    // 同一档 + 同一天 + **同分** → 复用已生成的值。
+    //
+    // ⚠️ 2026-11-24 修：原来只比较 `tier`，不比较分数。
+    //   偏爱档（beloved）的额度是**按分数连续插值**的（1000→8、1200→12），
+    //   所以分数从 1050 涨到 1186、tier 一直是 3，缓存却一直返回旧额度 9。
+    //   实测：鹿姐 1186 分（应 12 条）面板显示 1/9。
+    //
+    //   现在把 `score` 也存进缓存并参与比较 —— 分数一变就重算。
+    //
+    //   2026-11-24 再改：缓存**按 key 存**。原来全局一个 `quotaOfDay`，
+    //   鹿姐算完 12 条之后，别人来问命中的是**鹿姐那份**（tier 相同就当一样）。
+    const p = proactiveStateOf(key);
+    const today = proactiveDayKey();
+    const memo = p ? p.quotaOfDay : null;
+    if (memo && memo.date === today
+      && Number(memo.tier) === tier
+      && Number(memo.score) === score
+      && Number.isFinite(Number(memo.quota))) {
+      return { governed: true, tier, policy, quota: Number(memo.quota), band };
+    }
+
+    const quota = Math.min(PROACTIVE_DAILY_QUOTA_CEIL, quotaFromBand(band));
+    if (!p) return { governed: true, tier, policy, quota, band };
+
+    p.quotaOfDay = { date: today, tier, quota, score };
+    // 顺手把今日计数归零（若已跨天）—— 和 quota 一起落盘，避免两步之间被读到旧值。
+    proactiveTodayCount(key);
+    saveSocialV2State();
+    return { governed: true, tier, policy, quota, band };
+  }
+
+  /**
+   * 把「额度区间 + 档内百分比」算成一个具体条数。
+   *
+   * 纯函数（便于测试），不依赖任何状态。
+   *
+   * ── 规则（操作者原话，2026-11-23 五次修订）─────────────────────────────
+   *
+   *   「按百分比设置 1 还是 2 还是 3，0-33% 是 1，33%-66% 是 2，66% 到 100% 是 3」
+   *   「33%/66% 只是例子，**多一个就多切一部分**」
+   *
+   *   所以切几段 = 区间里有几个可取值，**每个值等分一份**：
+   *     1–3（3 个值）→ 1 占 0–33.3%，2 占 33.3–66.7%，3 占 66.7–100%
+   *     4–7（4 个值）→ 4/5/6/7 各占 25%
+   *     8–12（5 个值）→ 8/9/10/11/12 各占 20%
+   *
+   *   公式：idx = floor(r × 取值个数)，clamp 到 [0, count-1]。
+   *
+   * ⚠️ 早先版本踩过的坑（留档）：
+   *   版A 固定三段（< 1/3 → lo，< 2/3 → 中点，否则 hi）——
+   *       对 4–7 只给出 4/5/7，**6 永远取不到**。这是把"33/66 只是例子"
+   *       误当成了固定段数。区间有几个值就该切几段。
+   *
+   *   lo === hi 时（「喜欢」「偏爱」两档已经是连续插值出来的定值）直接返回。
+   */
+  function quotaFromBand(band) {
+    const lo = Math.max(0, Math.round(Number(band?.lo) || 0));
+    const hi = Math.max(lo, Math.round(Number(band?.hi) || 0));
+    if (hi <= lo) return lo;
+    const r = Math.min(1, Math.max(0, Number(band?.stageScoreRatio) || 0));
+    const count = hi - lo + 1;                  // 可取值个数（1–3 → 3 个，4–7 → 4 个）
+    const idx = Math.min(count - 1, Math.floor(r * count));
+    return lo + idx;
+  }
+
+  /**
+   * 今天这个会话已经发了几条（跨日自动归零，顺手把计数写回）。
+   *
+   * ⚠️ 2026-11-24：**按 key 计数**。原来全局一个计数器，
+   * 于是给 A 发一条，B 的面板也显示"今天 1 条"。
+   */
+  function proactiveTodayCount(key) {
+    const k = String(key || '');
+    const p = k ? proactiveStateOf(k) : proactiveState();
+    if (!p) return 0;
+    const today = proactiveDayKey();
+    if (p.todayKey !== today) {
+      p.todayKey = today;
+      p.todayCount = 0;
+    }
+    return Number(p.todayCount) || 0;
+  }
+
+  /** 未回应的**总量**（该会话内跨路由求和），用于放大间隔。 */
+  function proactiveUnansweredTotal(key) {
+    const p = key ? proactiveStateOf(key) : proactiveState();
+    if (!p || !p.unanswered) return 0;
+    let total = 0;
+    for (const item of Object.values(p.unanswered)) {
+      total += Math.max(0, Number(item?.count) || 0);
+    }
+    return total;
+  }
+
+  /** 某条路由当前挂着多少次未回应（按会话）。 */
+  function proactiveUnansweredOf(key, route) {
+    const p = key ? proactiveStateOf(key) : proactiveState();
+    return Math.max(0, Number(p?.unanswered?.[route]?.count) || 0);
+  }
+
+  /**
+   * 记一次主动发送。
+   *
+   * 调用点：真正把 'proactiveCheck' 唤醒投递出去之后（**不是**定时器触发时）。
+   * 理由：定时器触发了但被繁忙/限频挡下，那不叫"她找过他"。
+   */
+  function recordProactiveSentV2(key, route) {
+    const p = proactiveStateOf(key);
+    if (!p) return;
+    // 兜底改成 curiosity：relational 已删除，再拿它当默认会让
+    // `PROACTIVE_ROUTES[routeKey]` 在下一行变成 undefined（读 .expectation 直接抛）。
+    const routeKey = PROACTIVE_ROUTES[route] ? route : 'curiosity';
+    const now = Date.now();
+    proactiveTodayCount(key);          // 先过一遍跨日归零
+    p.todayCount = (Number(p.todayCount) || 0) + 1;
+    p.lastProactiveAt = now;
+    p.lastRoute = routeKey;
+    p.routeSentCounts[routeKey] = (Number(p.routeSentCounts[routeKey]) || 0) + 1;
+    // 2026-11-24：同时记一笔 daypart 计数（避免某时段扎堆）。
+    // ⚠️ 这一项**仍是全局**：判断"深夜已经发过一条"是跨会话的事实，
+    // 给 A 发过之后不该再给 B 发（否则整夜两个私聊各刷一条）。
+    try { bumpProactiveDaypartCount(now); } catch { /* 计数坏了不影响发送 */ }
+    // ★ 只有 expectation === 'expected' 的路由才开始"等回复"
+    if (PROACTIVE_ROUTES[routeKey].expectation === 'expected') {
+      p.awaitingReplySince = now;
+    }
+    saveSocialV2State();
+  }
+
+  /**
+   * 对方真的有入站消息 → 未回应计数清零。
+   *
+   * ★ 为什么是"真实入站活动"而不是定时衰减：
+   *   定时衰减会让"她到底记不记得你没回"变成噪声 —— 你明明回来了，
+   *   但衰减早把账清了，她的收敛就成了无根之木。
+   *   照着 AstrBot 那句话：「按真实入站活动清零」。
+   *
+   * ⚠️ 2026-11-24：**按会话清零**。原来清的是全局那份，
+   * 于是 A 私聊的人回来了，B 私聊的未回应计数也被清掉。
+   */
+  function resetUnansweredV2(key) {
+    const k = String(key || '');
+    if (!k) return;
+    const p = proactiveStateOf(k);
+    if (!p) return;
+    if (!p.awaitingReplySince && !proactiveUnansweredTotal(k)) return;
+    const route = p.lastRoute;
+    if (route && p.unanswered[route]) {
+      // 保留 since：控制台能显示"上次是什么时候接上的"，有叙事价值。
+      p.unanswered[route].since = Date.now();
+      p.unanswered[route].count = 0;
+    }
+    // 其他路由也清：对方回来了就是回来了，不分是哪条挂着的。
+    for (const item of Object.values(p.unanswered)) {
+      if (item && typeof item === 'object') item.count = 0;
+    }
+    p.awaitingReplySince = 0;
+    saveSocialV2State();
+  }
+
+  /**
+   * 当前应该留出的最小间隔（毫秒）。**定时器与判定共用这一个来源**。
+   *
+   * ── 2026-11-24 重写（对齐 AstrBot 的真实算法）───────────────────────────
+   *
+   * 旧实现是 `base × weight^次数`（指数），问题：
+   *   1.6^4 ≈ 6.6 —— 四次没回，间隔翻 6 倍多。太陡，容易一步滑到"整天不开口"。
+   *
+   * 现在的算法分三段，全部**线性 + 有上限**（照 _unanswered_interval_multiplier）：
+   *
+   *   ① 未回应放大（线性，不是指数）
+   *        raw     = min(2.2, 1 + slowdownCount × 0.35)
+   *        factor  = 1 + (raw - 1) × min(1, tier的unansweredWeight)
+   *      其中 slowdownCount = max(0, 未回应次数 - start + 1)，start 默认 2
+   *      ——「第一次没回先不计」，避免她刚说完一句就自己吓自己。
+   *
+   *      ★ 这里的「tier的unansweredWeight」和旧版**语义完全不同**：
+   *        旧版当底数（越大涨得越多）；新版当**折扣**（越小越不在意）。
+   *        原作者 tier1=1.0 / tier5=0.0 —— 关系越稳，越不拿"没回"当回事。
+   *        我们的 tier 反过来（越亲近越怕丢），所以值要重新定，见 PROACTIVE_TIERS。
+   *
+   *   ② 剩余额度放大（「还剩多少」驱动，不是「过了多久」驱动）
+   *        今天剩得多 → 间隔短（趁早多聊）
+   *        今天剩得少 → 间隔长（省着用）
+   *      实现在 quotaPressureFactor()。
+   *
+   *   ③ 时段权重（一天 24 小时各有一个"想不想说话"的权重）
+   *      深夜、凌晨压低，早晚高峰抬高。见 HOUR_ACTIVITY_WEIGHT。
+   *
+   * 最后再被 maxIntervalMs 封顶 —— 没有它，"被冷落"会滑成"整天不开口"，
+   * 那是放弃，不是节制。
+   */
+  // ⚠️ 2026-11-24：`unanswered` **不再有默认值**。
+  //    原来默认是 `proactiveUnansweredTotal()`（全局），现在那个函数需要 key，
+  //    而这里没有 key 上下文。强制调用方显式传 —— 忘了传会得到 undefined，
+  //    走 `Number(undefined) || 0` → 0，即"不放大"，比拿别人的数字安全。
+  function proactiveGapMsOf(policy, unanswered = 0, opts = {}) {
+    if (!policy) return 0;
+    const base = Math.max(0, Number(policy.minIntervalMs) || 0);
+    const cap = Math.max(0, Number(policy.maxIntervalMs) || 0);
+    if (base <= 0) return 0;
+
+    // ① 未回应：线性 + 封顶
+    const start = Math.max(1, Number(policy.unansweredSlowdownStart) || 2);
+    const slowdownCount = Math.max(0, (Math.max(0, Number(unanswered) || 0)) - start + 1);
+    const rawMultiplier = Math.min(
+      Math.max(1, Number(policy.unansweredMaxMultiplier) || 2.2),
+      1 + slowdownCount * 0.35
+    );
+    // weight 当**折扣**用：0 = 完全不在意，1 = 全额生效。
+    const weight = Math.min(1, Math.max(0, Number(policy.unansweredWeight) || 0));
+    const unansweredFactor = 1 + Math.max(0, rawMultiplier - 1) * weight;
+
+    // ② 剩余额度：剩得多 → 间隔短
+    const quotaFactor = quotaPressureFactor(policy, opts);
+
+    // ③ 时段权重
+    const hour = Number.isFinite(Number(opts.hour)) ? Number(opts.hour) : new Date().getHours();
+    const hourFactor = hourActivityFactor(hour);
+
+    const gap = base * unansweredFactor * quotaFactor * hourFactor;
+    return cap > 0 ? Math.min(cap, gap) : gap;
+  }
+
+  /**
+   * 一天 24 小时的「想不想说话」权重（1.0 = 正常）。
+   *
+   * ── 2026-11-24 新增，对齐 AstrBot 的 _proactive_hour_activity_weights ──
+   *
+   * 它替代了原来那一句 `if (hour >= 23 || hour < 8) prob *= 0.3` ——
+   * 那句话把 9 个小时一刀切成同一档，而实际上 23 点和 3 点、7 点和 8 点
+   * 完全不是一回事。
+   *
+   * 取值逻辑（**系数越小 → 间隔越长 → 越不想说话**）：
+   *   深夜 2–5   = 2.6  几乎不开口
+   *   凌晨 0–1   = 2.0
+   *   早晨 6–7   = 1.5  还没醒透
+   *   上午 8–11  = 0.85 一天里最想说话
+   *   午间 12–13 = 1.1  吃饭休息
+   *   下午 14–17 = 0.95
+   *   傍晚 18–20 = 0.8  最活跃
+   *   晚间 21–22 = 1.0
+   *
+   * ⚠️ 这些数字是**起手值**，不是实测出来的。操作者明确说「可能她发消息的频率
+   *   过低我还要改」—— 所以调参入口留在这里，改这一个数组就能整体调松调紧。
+   */
+  const HOUR_ACTIVITY_WEIGHT = Object.freeze([
+    2.0, 2.0, 2.6, 2.6, 2.6, 2.4, 1.5, 1.5,   // 0–7
+    0.85, 0.85, 0.85, 0.85, 1.1, 1.1, 0.95, 0.95,   // 8–15
+    0.95, 0.95, 0.8, 0.8, 0.8, 1.0, 1.0, 1.4     // 16–23
+  ]);
+
+  /** 取某小时的权重（越界夹回 0–23，坏值当 1.0）。 */
+  function hourActivityFactor(hour) {
+    const h = Number(hour);
+    if (!Number.isFinite(h)) return 1.0;
+    const idx = ((Math.round(h) % 24) + 24) % 24;
+    const v = Number(HOUR_ACTIVITY_WEIGHT[idx]);
+    return Number.isFinite(v) && v > 0 ? v : 1.0;
+  }
+
+  /**
+   * 剩余额度对间隔的影响（「还剩多少」驱动）。
+   *
+   * ── 2026-11-24 新增，对齐 AstrBot 的 _fallback_proactive_delay_hours ──
+   *
+   * 原作者按「今天还剩几条」查表，剩得多就隔得短（趁早多聊）、剩得少就隔得长。
+   * 这比"只看过了多久"聪明：同样过了 3 小时，早上还剩 5 条时她会再来说，
+   * 晚上只剩 1 条时她该省着。
+   *
+   * 我们用连续函数而不是查表（避免时段 × 剩余额度两维表格爆炸）：
+   *
+   *   剩余比例 r = 剩余额度 / 今日总额度
+   *     r ≥ 0.75 → 0.8   还有大半空间，多说点
+   *     r ≥ 0.50 → 0.9
+   *     r ≥ 0.25 → 1.0   正常
+   *     r ≥ 0.10 → 1.3   快用完了，省着
+   *     r <  0.10 → 1.8   只剩最后一条，隔久一点再放
+   *
+   * 剩 0 条时由额度闸直接拦下（返回 null），不会走到这里。
+   */
+  function quotaPressureFactor(policy, opts = {}) {
+    const quota = Number(opts.quota);
+    const used = Number(opts.usedToday);
+    if (!Number.isFinite(quota) || quota <= 0) return 1.0;
+    const remaining = Math.max(0, quota - (Number.isFinite(used) ? used : 0));
+    const r = remaining / quota;
+    if (r >= 0.75) return 0.8;
+    if (r >= 0.50) return 0.9;
+    if (r >= 0.25) return 1.0;
+    if (r >= 0.10) return 1.3;
+    return 1.8;
+  }
+
+  /**
+   * 今天的 daypart 计数（避免"某个时段过于集中"）。
+   *
+   * ── 2026-11-24 新增，对齐 AstrBot 的 _today_proactive_daypart_counts ──
+   *
+   * 痛点：光有总额度不够。8 条额度如果在中午一口气说完，
+   * 下午晚上就彻底没动静了 —— 总量对，节奏错。
+   *
+   * 原作者在 _fallback_proactive_delay_hours 里的两条硬规则：
+   *   深夜时段已经发过 1 条 → 间隔拉到 7.5–10.5 小时
+   *   晚上已发过 + 只剩 ≤2 条 → 间隔 3–5 小时
+   *
+   * 这两条直接搬（见 daypartGapOverride）。
+   */
+  const DAYPARTS = Object.freeze([
+    { key: 'late_night', label: '深夜', from: 21 * 60, to: 6 * 60 },   // 跨午夜
+    { key: 'morning', label: '早晨', from: 6 * 60, to: 11 * 60 },
+    { key: 'noon', label: '中午', from: 11 * 60, to: 14 * 60 + 30 },
+    { key: 'afternoon', label: '下午', from: 14 * 60 + 30, to: 18 * 60 },
+    { key: 'evening', label: '晚上', from: 18 * 60, to: 21 * 60 }
+  ]);
+
+  /** 分钟数 → daypart key。 */
+  function daypartOfMinute(minute) {
+    const m = ((Math.round(Number(minute)) % 1440) + 1440) % 1440;
+    for (const part of DAYPARTS) {
+      if (part.from <= part.to) {
+        if (m >= part.from && m < part.to) return part.key;
+      } else if (m >= part.from || m < part.to) {
+        // 跨午夜那段
+        return part.key;
+      }
+    }
+    return 'evening';
+  }
+
+  /**
+   * 今天各时段发了几条。
+   *
+   * 数据来源：proactiveState().daypartCounts = { date, counts: { late_night: 2, ... } }
+   * 跨天自动归零。
+   */
+  function proactiveDaypartCounts() {
+    const p = proactiveState();
+    const today = proactiveDayKey();
+    if (!p.daypartCounts || p.daypartCounts.date !== today) {
+      p.daypartCounts = { date: today, counts: {} };
+    }
+    if (!p.daypartCounts.counts || typeof p.daypartCounts.counts !== 'object') {
+      p.daypartCounts.counts = {};
+    }
+    return p.daypartCounts.counts;
+  }
+
+  function bumpProactiveDaypartCount(atMs = Date.now()) {
+    const counts = proactiveDaypartCounts();
+    const d = new Date(atMs);
+    const key = daypartOfMinute(d.getHours() * 60 + d.getMinutes());
+    counts[key] = (Number(counts[key]) || 0) + 1;
+    return key;
+  }
+
+  /**
+   * 时段相关的间隔硬覆盖（照抄原作者那两条规则）。
+   *
+   * @returns {number} 毫秒；0 = 不覆盖
+   */
+  function daypartGapOverride(policy, opts = {}) {
+    const hour = Number.isFinite(Number(opts.hour)) ? Number(opts.hour) : new Date().getHours();
+    const minute = Number.isFinite(Number(opts.minute)) ? Number(opts.minute) : new Date().getMinutes();
+    const bucket = daypartOfMinute(hour * 60 + minute);
+    const counts = proactiveDaypartCounts();
+    const quota = Number(opts.quota);
+    const used = Number.isFinite(Number(opts.usedToday)) ? Number(opts.usedToday) : 0;
+    const remaining = Number.isFinite(quota) && quota > 0 ? Math.max(0, quota - used) : Infinity;
+
+    // 规则①：深夜已经说过一次 → 拉到 7.5–10.5 小时，别整夜刷
+    if (bucket === 'late_night' && (Number(counts.late_night) || 0) >= 1) {
+      return randBetween(7.5, 10.5);
+    }
+    // 规则②：晚上已说过 + 只剩 ≤2 条 → 3–5 小时，留一条给后半夜或明早
+    if (bucket === 'evening' && (Number(counts.evening) || 0) >= 1 && remaining <= 2) {
+      return randBetween(3.0, 5.0);
+    }
+    return 0;
+  }
+
+  /** [min,max] 小时 → 毫秒（随机）。 */
+  function randBetween(minH, maxH) {
+    const lo = Math.max(0, Number(minH) || 0);
+    const hi = Math.max(lo, Number(maxH) || lo);
+    return Math.round((lo + Math.random() * (hi - lo)) * 3600 * 1000);
+  }
+
+  /**
+   * 她现在是不是睡着（读盘 + 内存缓存）。
+   *
+   * 注意不调 settleLifeCircle() —— 那个会写盘，而这里只是"要不要叫醒她"的
+   * 一个只读判断，不该产生副作用。所以要拿最新的 asleep，必须自己算。
+   */
+  function isLifeAsleepNow() {
+    try {
+      const c = readLifeCircle();
+      return c && c.asleep === true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * 睡够了就自动醒（2026-11-24）。
+   *
+   * 为什么需要：加了"睡觉时不主动唤醒"之后，她就**永远醒不过来**了 ——
+   * 除非有人找她、或她自己说醒了。所以要有个兜底：睡满一定时长自动算醒。
+   *
+   * 时长取 `life.autoWakeHours`（默认 8 小时）。为什么是 8 而不是"精力回满"：
+   *   精力恢复有 `ENERGY_RECOVER_MAX_HOURS = 10` 的封顶，睡到 10 小时就不再涨，
+   *   用"精力回满"作判据会**永远不触发**。
+   *
+   * 副作用：醒来时把 lastTickedAt 对齐到"睡满那一刻"，超出的时间按醒着算 ——
+   * 否则她睡了 12 小时还会补算 12 小时的恢复量，显得像睡了个饱觉。
+   *
+   * @returns {boolean} 这次调用是否把她叫醒了
+   */
+  function maybeAutoWakeUpV2() {
+    try {
+      const c = readLifeCircle();
+      if (!c || c.asleep !== true) return false;
+      const hours = Math.max(1, Math.min(24, Number(cfg.life?.autoWakeHours) || 8));
+      const sleptMs = Date.now() - (Number(c.lastTickedAt) || 0);
+      if (sleptMs < hours * 3600 * 1000) return false;
+      // 结算到"睡满那一刻"，再翻成醒 —— 超出部分不该算作睡眠收益。
+      const wakeAt = (Number(c.lastTickedAt) || Date.now()) + hours * 3600 * 1000;
+      const settledAtWake = settleLifeCircleFn(
+        { ...c, lastTickedAt: c.lastTickedAt },
+        wakeAt,
+        { gapMs: 30 * 60 * 1000, offlineThresholdMs: lifeOfflineThresholdMs(), asleep: true }
+      );
+      const woken = { ...settledAtWake, asleep: false, lastTickedAt: wakeAt };
+      writeLifeCircle(woken);
+      pendingSleepWake = null;   // 自动醒不产生"起床那句话"（没人看到她醒）
+      // 但她可能做了个梦 —— 醒来之后第一次被叫时贴一句（不唤醒，只是给她看）。
+      rollDreamOnWakeV2('auto-wake');
+      log(`[life] 睡满 ${hours} 小时，自动醒来（精力 ${Math.round(woken.energy)}）`);
+      return true;
+    } catch (error) {
+      log(`[life] 自动醒来失败（已跳过）：${error?.message ?? error}`);
+      return false;
+    }
+  }
+
+  /**
+   * 醒来时掷一个梦（2026-11-24）。
+   *
+   * **普通梦不唤醒她** —— 只把结果存进 `pendingDream`，
+   * 等她下次被真正叫到时贴一句"昨晚梦见了什么"。
+   * 噩梦不在这里：它走主动唤醒那条路（会真的把她弄醒）。
+   *
+   * 两段式抽取（照原作者 `pick`）：先掷"今晚有没有记住梦"（17.5%），
+   * 掷中了才从 `DREAM_POOL[1:]` 里均分。所以**大多数夜晚什么都没有**——
+   * 这是对的，人不是每晚都记得梦。
+   *
+   * @param {string} source 只用于日志（'auto-wake' / 'self-wake'）
+   */
+  function rollDreamOnWakeV2(source = '') {
+    try {
+      // ★ 2026-11-24 修：**今晚已经做过噩梦就不再掷普通梦**。
+      //
+      // 原来的坑：两条路径完全独立 —— 半夜噩梦惊醒写了一条 nightmare condition，
+      // 早上自动醒时又抽一条普通梦，于是同一条唤醒词里出现
+      //   （醒了，睡得还行　梦见吃到很好吃的东西）
+      //   （刚做了个不太好的梦，惊醒了。）
+      // 一夜既做好梦又做噩梦还都记得，这不对。
+      // 判据用 `p.nightmareNight`（噩梦那边写的是当天日期键）。
+      const p = proactiveState();
+      const todayKey = todayKeyOf(Date.now());
+      if (String(p.nightmareNight || '') === todayKey) {
+        log(`[life] 跳过普通梦（${source}）：今晚已经做过噩梦`);
+        return;
+      }
+
+      const picked = pickWithDefault(DREAM_POOL, {
+        specialChance: Number(cfg.life?.dreamSpecialChance) || 0.35,
+        intensity: Number(cfg.life?.intensity) / 100
+      });
+      if (picked.isDefault || !picked.spec || !picked.spec.label) return;
+      pendingDream = { text: picked.spec.label, mood: picked.spec.mood, at: Date.now() };
+      log(`[life] 昨晚做梦（${source}）：${picked.spec.label}`);
+    } catch (error) {
+      log(`[life] 梦抽取失败（已跳过）：${error?.message ?? error}`);
+    }
+  }
+
+  /** 取走「昨晚梦见了什么」，取一次就清。超过 14 小时没读就丢掉。 */
+  function takePendingDream() {
+    const rec = pendingDream;
+    pendingDream = null;
+    if (!rec) return '';
+    if (Date.now() - Number(rec.at || 0) > 14 * 3600 * 1000) return '';
+    return String(rec.text || '');
+  }
+
+  /**
+   * 本次该不该开口 + 走哪条路由。返回 null = 不说。
+   *
+   * 顺序刻意照 AstrBot 的准入链精神：**先闸后选**，闸不通过直接返回，
+   * 不消耗任何东西（也不改额度）。
+   */
+  function pickProactiveRouteV2(key) {
+    // 2026-11-24：所有主动状态现在按 key 存，空 key 会让 proactiveStateOf 返回 null。
+    // 集群入口都带了 key，这里只做防御 —— 宁可不说，也不要拿错人的账。
+    if (!String(key || '').trim()) return null;
+    const st = getSocialV2State(key);
+    const now = Date.now();
+    const { governed, policy, quota } = proactiveQuotaOf(key);
+    // 群聊 / 或 tier 0：不归这套管。tier 0 直接 false（连定时器都不该排）。
+    if (!governed) return null;
+    if (!(quota > 0)) return null;
+
+    // ⓪ 她在睡觉 → **只允许"做噩梦惊醒"这一种理由**（2026-11-24 定）。
+    //
+    // 演变过程（别改回去，每条都是踩过的）：
+    //   ① 最初：睡觉只影响精力恢复速率，不影响能不能叫 ——
+    //      于是"她说去睡了，10 分钟后主动机会把她叫起来"，asleep 撑不过一轮。
+    //   ② 后来：加了"睡觉时一律不主动" —— 结果她**永远醒不过来**，
+    //      除非有人找她或自己说醒了，精力一路掉到 0。
+    //   ③ 现在：**允许唤醒，但必须做噩梦** ——
+    //      睡着时的唤醒都走 `proactiveNightmare`，有一个说得过去的由头，
+    //      同时它天然解释了"为什么她会醒"，asleep 有了出口。
+    //
+    // 注意睡前"有没有做噩梦"是概率事件（走 randomFallbackProbability），
+    // 不是每次唤醒都做 —— 否则她一夜醒五次，那比不睡还累。
+    if (isLifeAsleepNow()) {
+      maybeAutoWakeUpV2();
+      // 睡满了就不算睡了，往下正常走。
+      if (!isLifeAsleepNow()) {
+        // fallthrough：已经醒了，继续后面的闸门
+      } else {
+        // 还在睡：只有"做噩梦"这一条路。
+        //
+        // ⚠️ 2026-11-24 模拟校准（别拍脑袋调，下面是实跑数据）：
+        //   最早 nightmareProbability = 0.25、每 30 分钟抽一次 → 一晚 16 次机会，
+        //   实测**平均 2.7 次噩梦、99% 的夜晚至少醒一次**。一晚惊三次不是人。
+        //
+        //   现在照原作者的两段式（`pickWithDefault`）：
+        //     ① 先掷"今晚有没有事"（17.5%）
+        //     ② 有事才从噩梦池里均分
+        //   再叠两道硬闸：
+        //     ③ **一夜最多一次**（惊醒再睡，不该被同一机制反复弄醒）
+        //     ④ 睡够 1 小时才可能做梦（刚躺下就惊醒说不通）
+        const nightmareNightKey = todayKeyOf(now);
+        const p = proactiveState();
+        const alreadyNightmared = String(p.nightmareNight || '') === nightmareNightKey;
+        const sleptMs = now - (Number(readLifeCircle().lastTickedAt) || now);
+        if (alreadyNightmared || sleptMs < 60 * 60 * 1000) return null;
+
+        const picked = pickWithDefault(NIGHTMARE_POOL, {
+          specialChance: Number(cfg.socialV2?.proactive?.nightmareSpecialChance),
+          intensity: Number(cfg.life?.intensity) / 100
+        });
+        if (picked.isDefault || !picked.spec) return null;
+
+        // 掷中了：生成一条噩梦 condition，她能记住"刚才做了什么梦"，
+        // 接下来两三小时 mood 会带一点慌张/不安。
+        try {
+          const spec = picked.spec;
+          const lc = readLifeCond();
+          writeLifeCond({
+            list: upsertCondLife(lc.list, makeConditionLife({
+              id: `nightmare-${nightmareNightKey}`,
+              kind: 'nightmare',
+              label: spec.label,
+              mood: spec.mood,
+              energyDelta: spec.energyDelta,
+              intensity: 62,
+              startTs: now,
+              durationHours: spec.hours
+            })),
+            meta: lc.meta
+          });
+          // 记下"今晚已经做过噩梦"—— 一夜只此一次。
+          p.nightmareNight = nightmareNightKey;
+          // ★ 反向互斥：如果之前已经抽到了普通梦（先睡着→自动醒→抽梦→又睡→噩梦），
+          //   把它丢掉。否则会出现「梦见吃到很好吃的东西」+「刚做了个不太好的梦」并存。
+          if (pendingDream) {
+            pendingDream = null;
+            log('[life] 丢弃已抽到的普通梦（今晚改为噩梦）');
+          }
+        } catch (error) {
+          log(`[life] 噩梦 condition 写入失败（已跳过）：${error?.message ?? error}`);
+        }
+        return { route: 'curiosity', reason: 'proactiveNightmare' };
+      }
+    }
+
+    // ① 额度（硬上限，不是概率）
+    if (proactiveTodayCount(key) >= quota) return null;
+
+    // ② 间隔门（唯一来源：proactiveGapMsOf）
+    //
+    // 早先这里自己算了一遍 min/max，和定时器那边的算法是两套 ——
+    // 现在统一走 proactiveGapMsOf，改公式只改一处。
+    //
+    // 2026-11-24：多传了 hour / quota / usedToday 三个上下文，
+    // 让间隔能反映「现在几点」和「今天还剩几条」。
+    // 状态**按 key 取** —— 下面读 lastProactiveAt / awaitingReplySince 都是这个会话的账。
+    const p = proactiveStateOf(key);
+    const unanswered = proactiveUnansweredTotal(key);
+    const nowDate = new Date(now);
+    const usedToday = proactiveTodayCount(key);
+    const gapOpts = { hour: nowDate.getHours(), minute: nowDate.getMinutes(), quota, usedToday };
+    // 时段硬覆盖优先（深夜说过一次 → 直接拉到 7.5–10.5h）
+    const override = daypartGapOverride(policy, gapOpts);
+    const gap = override > 0 ? override : proactiveGapMsOf(policy, unanswered, gapOpts);
+    if (p.lastProactiveAt && now - Number(p.lastProactiveAt) < gap) return null;
+
+    // ③ 静默门槛：对方刚刚才说过话，就别"主动"了（那不是主动，是抢话）
+    const idleThreshold = Number(cfg.socialV2?.proactive?.idleThresholdMs) || 15 * 60 * 1000;
+    if (now - (Number(st.lastIncomingAt) || 0) < idleThreshold) return null;
+
+    // ④ 刚回过话也不主动（她刚说完，再开口就是刷屏）
+    if (st.lastAiReplyAt && now - Number(st.lastAiReplyAt) < 30 * 60 * 1000) return null;
+
+    // ⑤ 还没到追的时机
+    if (p.awaitingReplySince) {
+      const grace = Number(policy.graceMs) || 0;
+      if (now - Number(p.awaitingReplySince) < grace) return null;
+    }
+
+    // ── 选路由（按优先级取第一条可用的）──
+    // 1) 对话延续：她开过口没回音，且还没追满
+    //
+    // 2026-11-24（操作者决定）：**删掉原来的第 2、3 条路由**
+    //   （relational 靠 pendingThoughts、relatedTopic 靠 activeTopics）。
+    //   实测依据：这两类记忆全库累计只有 5 条，而且写进去之后她**从不回头查** ——
+    //   等于两个永久空转的分支。删掉后路由只剩「对话延续」和「随机」，
+    //   行为更可预测，也去掉了一份没人读的状态。
+    if (p.awaitingReplySince && unanswered > 0
+      && unanswered <= (PROACTIVE_ROUTES.continuation.maxFollowUps || 0)) {
+      return { route: 'continuation', reason: 'proactiveContinuation' };
+    }
+
+    // 2) 按状态造候选（2026-11-24 接入，抄原作者的结构）——
+    //    **这是随机概率的替代品**：她开口必须有个理由，而不是"概率到了"。
+    //    理由可能是：昨晚没睡好、外面在下雨、中午犯困、下午想问问你在干嘛。
+    //    一个都造不出来 = 这次真的没有理由 → 不主动（不再退回随机）。
+    const candidates = buildProactiveCandidatesForV2(key, st);
+    if (candidates.length) {
+      const top = candidates[0];
+      return {
+        route: 'curiosity',
+        reason: top.reason,
+        candidate: top,
+        // 同一类理由一天只发一次：靠 id 前缀 + 当日记录去重。
+        dedupeId: `${todayKeyOf(now)}:${top.id}`
+      };
+    }
+
+    // 3) 兜底：概率抽样。
+    //    仍然保留，但**概率压得很低** —— 它只是在"没有任何具体理由"
+    //    时给一点点随机性，避免她成了必须有事才开口的机器。
+    //
+    // ⚠️ 2026-11-24：曾试过改成"做噩梦惊醒"，操作者否了 —— 保持原样。
+    const probBase = Number(cfg.socialV2?.proactive?.randomFallbackProbability);
+    const prob = Math.min(1, Math.max(0, Number.isFinite(probBase) ? probBase : 0.08));
+    if (Math.random() < prob) {
+      return { route: 'curiosity', reason: 'proactiveCheck' };
+    }
+    return null;
+  }
+
+  /** 当日键（YYYY-MM-DD），用于候选去重。 */
+  function todayKeyOf(ms) {
+    const d = new Date(Number(ms) || Date.now());
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  }
+
+  /**
+   * 收集并过滤主动候选。
+   *
+   * 过滤只做一件事：**同一类理由当天已经用过就跳过**（避免一天说两次"外面在下雨"）。
+   * 其余准入（额度/间隔/静默/宽限）已经在 pickProactiveRouteV2 前面判过了，
+   * 不在这里重复。
+   */
+  function buildProactiveCandidatesForV2(key, st) {
+    try {
+      const now = Date.now();
+      const tz = String(cfg.life?.timezone || 'Asia/Shanghai');
+      // 当前分钟数（按配置时区）
+      const minuteOfDay = (() => {
+        try {
+          const fmt = new Intl.DateTimeFormat('en-CA', { timeZone: tz, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+          const got = {};
+          for (const x of fmt.formatToParts(new Date(now))) if (x.type !== 'literal') got[x.type] = x.value;
+          return Number(got.hour) * 60 + Number(got.minute);
+        } catch {
+          const d = new Date(now);
+          return d.getHours() * 60 + d.getMinutes();
+        }
+      })();
+      // 精力用**叠加后**的值（含经期/生病/没睡好），这样"累了一天"才判得准。
+      let energy = 70;
+      try {
+        const circle = readLifeCircle();
+        const conds = readLifeCond().list;
+        energy = composeEnergyValueV2(circle.energy, conds);
+      } catch { /* 拿不到就用默认 */ }
+      // 昨晚睡了多久：用 conditions 里 sleep 那条的 id（sleep-YYYY-MM-DD）反推。
+      let sleepHours = 0;
+      try {
+        const yKey = todayKeyOf(now - 86400000);
+        const hit = readLifeCond().list.find((c) => c.id === `sleep-${yKey}`);
+        if (hit) sleepHours = Math.max(0, (Number(hit.endTs) - Number(hit.startTs)) / 3600000);
+      } catch { /* 没有就算了 */ }
+      const weatherText = lifeWeatherCacheV2()?.text || '';
+      // 2026-11-24：去重**按会话**。原来全局一份，
+      // 于是"早上在私聊 A 说了早安"，私聊 B 当天就再也说不出来。
+      const used = proactiveDedupeSetOf(key);
+      const all = buildProactiveCandidates({
+        now,
+        minuteOfDay,
+        energy,
+        sleepHours,
+        lastNightRestless: sleepHours > 0 && sleepHours < 6.5,
+        weatherText
+      });
+      // 当天用过的 id 前缀过滤掉
+      return all.filter((c) => !used.has(`${todayKeyOf(now)}:${c.id}`));
+    } catch (error) {
+      log(`[proactive] 候选生成失败（已跳过）：${error?.message ?? error}`);
+      return [];
+    }
+  }
+
+  /** 当天这个会话已经发过的候选 id（按会话存，跨重启保留）。 */
+  function proactiveDedupeSetOf(key) {
+    try {
+      const p = key ? proactiveStateOf(key) : null;
+      if (!p) return new Set();
+      const arr = Array.isArray(p.sentCandidateIds) ? p.sentCandidateIds : [];
+      const today = todayKeyOf(Date.now());
+      return new Set(arr.filter((id) => String(id).startsWith(today)));
+    } catch {
+      return new Set();
+    }
+  }
+
+  /** 记下一条候选已用掉（按会话）。 */
+  function recordProactiveCandidateUsedV2(key, dedupeId) {
+    try {
+      const p = key ? proactiveStateOf(key) : null;
+      if (!p) return;
+      const today = todayKeyOf(Date.now());
+      const arr = (Array.isArray(p.sentCandidateIds) ? p.sentCandidateIds : [])
+        .filter((id) => String(id).startsWith(today));   // 只留当天的，自动跨天清空
+      if (!arr.includes(dedupeId)) arr.push(dedupeId);
+      p.sentCandidateIds = arr;
+    } catch { /* 去重失败不影响发送 */ }
+  }
+
+  // ══ follow-up 链的调度（2026-11-24）══════════════════════════════════════
+  //
+  // 照原作者的做法：候选带 chain，发出去之后按 `after_minutes` 排下一次追击。
+  //   chain[0] = name_only_opener  （第一句本身，不需要单独排）
+  //   chain[1] = if_no_reply        （没回 → 排这个）
+  //   chain[2] = if_still_no_reply  （再没回 → 排这个）
+  //
+  // **最多三级，绝不纠缠。** 判定用"没有新消息"＝没读（操作者确认的口径）：
+  // 到点时如果对方在这之后说过话，就认为接上了，整个链作废。
+  //
+  // 为什么用独立的定时器而不是复用 proactiveTimer：
+  //   proactiveTimer 是"下一次主动机会"的单例，而 follow-up 是"这一条消息的后续"，
+  //   两者可能同时存在（比如她刚追完一次，主动机会也到点了）。
+  const followUpTimers = new Map();   // key → { timer, candidateId }
+
+  /** 清掉某个会话的 follow-up 定时器（发新消息、对方回话、会话清理时调用）。 */
+  function clearFollowUpV2(key, why = '') {
+    const rec = followUpTimers.get(key);
+    if (!rec) return false;
+    clearTimeout(rec.timer);
+    followUpTimers.delete(key);
+    if (why) log(`[proactive] 清除 follow-up ${key}（${why}）`);
+    return true;
+  }
+
+  /**
+   * 按候选的 chain 排下一步。
+   *
+   * @param {string} key
+   * @param {object} candidate 候选（带 chain）
+   * @param {number} stepIndex 要执行 chain 的哪一步（1 = if_no_reply，2 = if_still_no_reply）
+   */
+  function scheduleFollowUpV2(key, candidate, stepIndex) {
+    try {
+      if (cfg.socialV2?.proactive?.followUp !== true) return;   // 默认关闭，需显式开启
+      if (!candidate || !Array.isArray(candidate.chain)) return;
+      const step = candidate.chain[stepIndex];
+      if (!step || step.kind === 'name_only_opener') return;
+      const afterMin = Number(step.after_minutes);
+      if (!Number.isFinite(afterMin) || afterMin <= 0) return;
+      // 先清旧的：同一条链不该有两个待执行的步骤。
+      clearFollowUpV2(key, 'replaced');
+      const delayMs = Math.min(afterMin, 24 * 60) * 60 * 1000;   // 上限 24h，防配置写错
+      const st = getSocialV2State(key);
+      const sentAt = Date.now();
+      const timer = setTimeout(() => {
+        followUpTimers.delete(key);
+        try {
+          // ① 对方在这之后说过话 → 接上了，链作废。
+          const lastIn = Number(st.lastIncomingAt) || 0;
+          if (lastIn > sentAt) {
+            log(`[proactive] follow-up 跳过 ${key}：对方已经回过了`);
+            return;
+          }
+          // ② 她自己又主动说过话 → 不该再追（那会变成连发）。
+          const p = proactiveStateOf(key);
+          if (Number(p?.lastProactiveAt) > sentAt) {
+            log(`[proactive] follow-up 跳过 ${key}：这期间她已经主动说过话`);
+            return;
+          }
+          // ③ 额度用完了 → 不追。
+          const { quota } = proactiveQuotaOf(key);
+          if (proactiveTodayCount(key) >= quota) {
+            log(`[proactive] follow-up 跳过 ${key}：今日额度已用完`);
+            return;
+          }
+          // ④ 会话语境不允许（切了模式/白名单变了）→ 不追。
+          if (!isSessionAllowedInCurrentMode(key)) return;
+          if (st.proactiveDisabled === true) return;
+          if (isConversationBusyV2(key, st)) {
+            // 忙就顺延一次（不递归排第二个定时器，直接放弃这一级）。
+            log(`[proactive] follow-up 跳过 ${key}：会话繁忙`);
+            return;
+          }
+          const motive = String(step.motive || '').trim();
+          const reason = motive ? `proactiveCheck:${motive}` : 'proactiveCheck';
+          log(`[proactive] follow-up 第 ${stepIndex} 级 ${key}：${step.topic || step.kind}`);
+          void sendWakePromptV2(key, reason).then((delivered) => {
+            if (delivered === false) return;
+            recordProactiveSentV2(key, 'continuation');
+            // 还有下一级就继续排。
+            if (candidate.chain[stepIndex + 1]) {
+              scheduleFollowUpV2(key, candidate, stepIndex + 1);
+            }
+          }).catch((error) => log(`[proactive] follow-up 发送异常 ${key}:`, error?.message ?? error));
+        } catch (error) {
+          log(`[proactive] follow-up 执行异常 ${key}:`, error?.message ?? error);
+        }
+      }, delayMs);
+      timer.unref?.();
+      followUpTimers.set(key, { timer, candidateId: candidate.id, stepIndex });
+      log(`[proactive] 已排 follow-up ${key} 第 ${stepIndex} 级，约 ${afterMin} 分钟后（${step.topic || step.kind}）`);
+    } catch (error) {
+      log(`[proactive] follow-up 排程失败 ${key}:`, error?.message ?? error);
+    }
+  }
+
   function scheduleProactiveCheckV2(key) {
     if (cfg.socialV2?.proactive?.enabled === false) return;
     if (socialV2.paused || currentMode !== 'reserved2') return;
@@ -15624,6 +18452,95 @@ async function main() {
     }
     if (st.proactiveTimer) return;
     const p = cfg.socialV2?.proactive ?? {};
+
+    // ── 私聊：额度制（2026-11-23）───────────────────────────────────────
+    //
+    // tier 由好感度档位决定（见 affinity.js 的 AFFINITY_TIER）。
+    // 档位 0（疏远/平淡）= **连定时器都不排** —— 不是排了再拒绝，
+    // 那样每 30 分钟白跑一次判定，还可能在日志里刷"已安排"误导排查。
+    // 好感度涨上去了由 bumpAffinity 那边重新调 scheduleProactiveCheckV2 补排。
+    if (String(key).startsWith('private:')) {
+      const { quota, policy } = proactiveQuotaOf(key);
+      if (!(quota > 0)) {
+        if (st.proactiveTimer) { clearTimeout(st.proactiveTimer); st.proactiveTimer = null; }
+        st.proactiveNextCheckAt = 0;
+        return;
+      }
+      // ── 检查时刻 = "最早可能允许开口的那一刻"，不是另抽一个随机区间 ──
+      //
+      // 2026-11-23 二次修订：原来这里用 delayMin/delayMax 随机一个区间，
+      // 而 pickProactiveRouteV2 里又有一道 min/maxInterval 的**间隔门** ——
+      // 两道门各说各话：定时器可能比间隔门早醒（白跑一次判定），
+      // 也可能比它晚醒（明明能说却一直等）。
+      //
+      // 现在**只保留一道门**：定时器直接排到 earliest = lastProactive + gap，
+      // 到点那一刻如果还差（比如静默门槛没过），下次就顺延。
+      // 随机性只保留 ±10% 抖动，避免多个会话在同一秒同时醒。
+      //
+      // 2026-11-24：gap 现在也吃 hour / quota / usedToday —— 定时器和判定
+      // 必须用**同一组参数**，否则两边的数字对不上（这正是之前两道门打架的根因）。
+      const nowTmp = new Date();
+      const gapOptsTmp = {
+        hour: nowTmp.getHours(), minute: nowTmp.getMinutes(),
+        quota, usedToday: proactiveTodayCount(key)
+      };
+      const overrideTmp = daypartGapOverride(policy, gapOptsTmp);
+      const gap = overrideTmp > 0 ? overrideTmp : proactiveGapMsOf(policy, undefined, gapOptsTmp);
+      const base = Number(proactiveStateOf(key).lastProactiveAt) || 0;
+      const earliest = base > 0 ? base + gap : Date.now() + 60 * 1000;
+      // ── 抖动：**同一轮调度只摇一次**（2026-11-24 修）──────────────────
+      //
+      // 原来是 `jitter = gap * 0.1 * (Math.random()*2-1)`，每次进这个函数都摇。
+      // 后果：面板点「刷新」时如果恰好触发了一次重排（比如定时器刚触发、
+      // 或某个 setter 顺手重排），显示的"下次检查还有 X"就变了 ——
+      // 用户看到的是"点一下刷新，间隔就变"，像是 bug。
+      //
+      // 现在把抖动值**存进 st**，并在同一轮调度里复用：
+      //   · `st.proactiveJitterFor` 记这个抖动是给哪个 `earliest` 算的
+      //   · `earliest` 没变就复用旧抖动，变了（说明真的进入下一轮）才重摇
+      // 这样刷新多少次，同一个间隔期内看到的数字都一样。
+      if (st.proactiveJitterFor !== earliest) {
+        st.proactiveJitterFor = earliest;
+        st.proactiveJitter = gap * 0.1 * (Math.random() * 2 - 1);
+      }
+      const jitter = Number(st.proactiveJitter) || 0;
+      const delay = Math.max(60 * 1000, Math.round(earliest - Date.now() + jitter));
+      st.proactiveNextCheckAt = Date.now() + delay;
+      st.proactiveTimer = setTimeout(() => {
+        st.proactiveTimer = null;
+        st.proactiveNextCheckAt = 0;
+        ensureWakeableV2(st, { key });
+        const picked = pickProactiveRouteV2(key);
+        if (picked && !isConversationBusyV2(key, st)) {
+          log(`[proactive] ${key} tier=${proactiveTierOf(key)} route=${picked.route} `
+            + `today=${proactiveTodayCount(key)}/${proactiveQuotaOf(key).quota}`);
+          // 候选带动机时把动机拼进 reason（渲染端按 `proactiveCheck:动机` 解析）。
+          const wakeReason = picked.candidate?.motive
+            ? `proactiveCheck:${picked.candidate.motive}`
+            : picked.reason;
+          void sendWakePromptV2(key, wakeReason)
+            .then((delivered) => {
+              // ★ 只在**真的投递出去**之后记账。
+              // 定时器触发但被繁忙/限频挡下，不叫"她找过他"。
+              if (delivered !== false) {
+                recordProactiveSentV2(key, picked.route);
+                // 候选去重也只在真发出去之后记 —— 被挡下的那次不算用掉。
+                if (picked.dedupeId) recordProactiveCandidateUsedV2(key, picked.dedupeId);
+                // ★ 2026-11-24：有 follow-up 链的候选，排后续追击。
+                //   只在真发出去之后排 —— 没发出去就不该追。
+                if (picked.candidate) scheduleFollowUpV2(key, picked.candidate, 1);
+              }
+            })
+            .catch((error) => log(`[reserved2] proactive 唤醒异常 ${key}:`, error?.message ?? error));
+        }
+        scheduleProactiveCheckV2(key);
+      }, delay);
+      st.proactiveTimer.unref?.();
+      log(`[reserved2] 已安排主动机会检查 ${key}（tier ${proactiveTierOf(key)}），约 ${Math.round(delay / 60000)}min 后`);
+      return;
+    }
+
+    // ── 群聊：原来的随机唤醒（保持不变）────────────────────────────────
     const min = Math.max(60 * 1000, Number(p.checkIntervalMinMs) || 30 * 60 * 1000);
     const max = Math.max(min, Number(p.checkIntervalMaxMs) || 90 * 60 * 1000);
     const delay = Math.floor(min + Math.random() * (max - min));
@@ -15638,16 +18555,28 @@ async function main() {
       const idle = Date.now() - (st.lastIncomingAt || 0);
       const probBase = Number(p.probability);
       let prob = Math.min(1, Math.max(0, Number.isFinite(probBase) ? probBase : 0.4));
-      const pendingThoughts = Array.isArray(st.pendingThoughts) ? st.pendingThoughts.filter((t) => t && (!t.expiresAt || Date.now() < Number(t.expiresAt))).length : 0;
-      if (pendingThoughts > 0) prob = Math.min(1, prob * 1.4);
+      // 2026-11-24：原来这里有个 `pendingThoughts > 0 → prob * 1.4` 的加成，
+      // 但 pendingThoughts 已从记忆体系删除（全库累计只有 1 条，她从不回头查），
+      // 这段等于永久不生效的死代码，一并删掉。
       if (st.lastAiReplyAt && Date.now() - Number(st.lastAiReplyAt) < 30 * 60 * 1000) prob *= 0.5;
+      // ── 时段权重（2026-11-24）────────────────────────────────────────
+      // 原来是一刀切 `if (hour >= 23 || hour < 8) prob *= 0.3`，
+      // 把 23 点和 3 点、7 点和 8 点当成一回事。
+      // 现在按 24 小时曲线折算成概率 —— 但**方向要取倒数**：
+      //   HOUR_ACTIVITY_WEIGHT 是「间隔倍数」（越大越不想说话），
+      //   而这里乘的是概率（越大越容易说）。所以用 1/weight。
+      //   分母夹在 [0.6, 2.6]，避免概率被推到 0 或炸到 1。
       const hour = new Date().getHours();
-      if (hour >= 23 || hour < 8) prob *= 0.3;
+      const hourFactor = hourActivityFactor(hour);
+      const probFactor = Math.min(1.6, Math.max(0.4, 1 / Math.max(0.3, hourFactor)));
+      prob = Math.min(1, Math.max(0, prob * probFactor));
       const recent = Array.isArray(st.recentMessages) ? st.recentMessages : [];
       const aiCount = recent.filter((m) => m && m.isSelf && Date.now() - Number(m.time || 0) < 60 * 60 * 1000).length;
       if (aiCount >= 5) prob *= 0.3;
       if (idle >= idleThreshold && Math.random() < prob && !isConversationBusyV2(key, st)) {
-        void sendWakePromptV2(key, 'proactiveCheck').catch((error) => log(`[reserved2] proactive 唤醒异常 ${key}:`, error?.message ?? error));
+        // 2026-11-24：群聊走独立的 reason，和私聊的候选动机分开 ——
+        // 私聊那条收到的是 `proactiveCheck:动机`，群聊没有动机，用自己那句。
+        void sendWakePromptV2(key, 'proactiveGroupCheck').catch((error) => log(`[reserved2] proactive 唤醒异常 ${key}:`, error?.message ?? error));
       }
       scheduleProactiveCheckV2(key);
     }, delay);
@@ -15657,6 +18586,9 @@ async function main() {
 
   function clearSocialV2Timers(key) {
     const st = socialV2.conversations.get(key);
+    // follow-up 定时器也要清 —— 它不在 st 上，漏了会留下一个孤儿定时器，
+    // 到点仍会唤醒一个已经被清空的会话。
+    try { clearFollowUpV2(key, '会话清理'); } catch { /* 没有就算了 */ }
     if (!st) return;
     if (st.pendingWakeTimer) {
       clearTimeout(st.pendingWakeTimer);

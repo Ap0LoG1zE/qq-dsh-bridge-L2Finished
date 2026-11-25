@@ -20,7 +20,12 @@ const P = 'private:10001';
 const G = 'group:20001';
 // 那两句提示各自的判据标记。
 const MEM_HINT = /qq_memory_query/;
-const ROLE_HINT = /你的完整人设不在上下文里/;
+// 2026-11-23（操作者要求）：唤醒词里的**人格卡提示整段删掉**了 ——
+// 「什么时候该拿人格卡」写在预设的【新会话 / 刚压缩完：先拿这三样东西】里，
+// 唤醒词再说一遍只是把历史撑长。现在每轮只给一行【当前角色】名字。
+// 所以这里钉两件事：角色行在、人格卡提示不在（而不是某句已经删掉的文案）。
+const ROLE_LINE = /【当前角色】角色A/;
+const PERSONA_HINT = /qq_get_prompt/;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -79,7 +84,8 @@ test('新会话第一轮：两句提示都要真的投递出去', async () => {
     const r = await wake(h, sid, G, 'anyMessage');
     assert.ok(r.delivered, '第一轮必须投递');
     assert.match(r.text, MEM_HINT, '记忆提示要出现在真正投递的正文里');
-    assert.match(r.text, ROLE_HINT, '人格卡提示要出现在真正投递的正文里');
+    assert.match(r.text, ROLE_LINE, '角色行要出现在真正投递的正文里');
+    assert.doesNotMatch(r.text, PERSONA_HINT, '人格卡怎么拿由预设负责，唤醒词不再重复');
   });
 });
 
@@ -91,7 +97,8 @@ test('新会话之后：同一个会话不再重复提示（这是压缩后必�
       const r = await wake(h, sid, G, reason);
       assert.ok(r.delivered, `${reason} 这一轮应当照常投递`);
       assert.doesNotMatch(r.text, MEM_HINT, `${reason} 不该再带记忆提示`);
-      assert.doesNotMatch(r.text, ROLE_HINT, `${reason} 不该再带人格卡提示`);
+      assert.doesNotMatch(r.text, PERSONA_HINT, `${reason} 不该再带人格卡提示`);
+      assert.match(r.text, ROLE_LINE, `${reason} 角色行照旧（只给名字）`);
     }
   });
 });
@@ -103,7 +110,7 @@ test('共用会话：私聊入口不会把冷启动提示再发一遍（按 DSH 
     const r = await wake(h, sid, P, 'private');
     assert.ok(r.delivered, '私聊这一轮必须投递（只是不带冷启动提示）');
     assert.doesNotMatch(r.text, MEM_HINT, '群那一轮已经提示过了，私聊不该再来一遍');
-    assert.doesNotMatch(r.text, ROLE_HINT);
+    assert.doesNotMatch(r.text, PERSONA_HINT);
   });
 });
 
@@ -117,11 +124,12 @@ test('刚压缩过：下一轮投递里必须有那两句，且只此一轮', as
     const afterCompact = await wake(h, sid, G, 'timeout');
     assert.ok(afterCompact.delivered);
     assert.match(afterCompact.text, MEM_HINT, '压缩后必须提示去查记忆（旧实现这里永远是空的）');
-    assert.match(afterCompact.text, ROLE_HINT, '压缩后必须提示重读人格卡');
+    assert.match(afterCompact.text, ROLE_LINE, '压缩后角色行仍在');
+    assert.doesNotMatch(afterCompact.text, PERSONA_HINT, '压缩后也不在唤醒词里教她拿人格卡');
 
     const next = await wake(h, sid, G, 'anyMessage');
     assert.doesNotMatch(next.text, MEM_HINT, '压缩提示只发一轮');
-    assert.doesNotMatch(next.text, ROLE_HINT);
+    assert.doesNotMatch(next.text, PERSONA_HINT);
   });
 });
 
@@ -159,8 +167,8 @@ test('记忆库为空：不点名 qq_memory_query（点名了她会白调一次�
     const r = await wake(h, sid, G, 'anyMessage');
     assert.match(r.text, /新会话或上下文刚压缩过/, '通用那句还是要给');
     assert.doesNotMatch(r.text, MEM_HINT, '库里没东西时不该点名工具');
-    // 人格卡提示与记忆库无关，任何冷启动都该有。
-    assert.match(r.text, ROLE_HINT);
+    // 角色行与记忆库无关，任何冷启动都该有。
+    assert.match(r.text, ROLE_LINE);
   });
 });
 
@@ -171,6 +179,6 @@ test('没有登记过的会话：一个字都不提示（判据只认登记表�
     // reason 写成 bootstrap 也没用 —— 提示不由 reason 决定。
     const r = await wake(h, sid, G, 'bootstrap');
     assert.doesNotMatch(r.text, MEM_HINT, 'reason=bootstrap 不是发提示的理由');
-    assert.doesNotMatch(r.text, ROLE_HINT);
+    assert.doesNotMatch(r.text, PERSONA_HINT);
   });
 });

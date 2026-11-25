@@ -16,14 +16,16 @@ let pass = 0
 const ok = (name) => { pass += 1; console.log(`✅ ${name}`) }
 
 // 1. 六档阈值
+// 2026-11-23：门槛重新分配，宽度改为严格递增（100/200/300/400）。
+// 旧断言写死 29/30/89/90/399/400/999/1000，已随门槛同步。
 assert.equal(stageOf(-5).id, 'distant')
 assert.equal(stageOf(0).id, 'neutral')
-assert.equal(stageOf(29).id, 'neutral')
-assert.equal(stageOf(30).id, 'caring')
-assert.equal(stageOf(89).id, 'caring')
-assert.equal(stageOf(90).id, 'reliant')
-assert.equal(stageOf(399).id, 'reliant')
-assert.equal(stageOf(400).id, 'lover')
+assert.equal(stageOf(99).id, 'neutral')
+assert.equal(stageOf(100).id, 'caring')
+assert.equal(stageOf(299).id, 'caring')
+assert.equal(stageOf(300).id, 'reliant')
+assert.equal(stageOf(599).id, 'reliant')
+assert.equal(stageOf(600).id, 'lover')
 assert.equal(stageOf(999).id, 'lover')
 assert.equal(stageOf(1000).id, 'beloved')
 assert.equal(stageOf(SCORE_MAX).id, 'beloved')
@@ -99,11 +101,13 @@ ok('加分有上限（刷屏不会爆分）')
 
 // 10. 从平淡升到在意（这条固定的是「分数→档位」的换算，与初始值无关，
 //     所以起点显式给 0，而不是拿 INITIAL_SCORE —— 后者现在是负数）
+// 2026-11-23：门槛提到 100，所以要 100 次互动（原来 30）。
+//             不是"随便聊两句就升档"，这正是不均分修正的目的之一。
 let r2 = { score: 0, count: 0, lastAt: Date.now() }
 assert.equal(stageOf(r2.score).id, 'neutral')
-for (let i = 0; i < 30; i += 1) r2 = bumpAffinity(r2, 1)
+for (let i = 0; i < 100; i += 1) r2 = bumpAffinity(r2, 1)
 assert.equal(stageOf(r2.score).id, 'caring')
-ok('积累 30 次互动由平淡升到在意')
+ok('积累 100 次互动由平淡升到在意')
 
 // 11. 衰减：21 天内不掉
 const now = Date.now()
@@ -122,7 +126,7 @@ assert.ok(decayAffinity(ancient, now).score >= -20, '衰减有下限')
 ok('衰减有下限（不会掉成无限负）')
 
 // 14. 渲染包含档位中文名与对方称呼
-const line = renderAffinityLine({ score: 50 }, '主人')
+const line = renderAffinityLine({ score: 150 }, '主人')
 assert.ok(line.includes('在意'), `应含"在意"，实际：${line}`)
 assert.ok(line.includes('主人'), '应含对方称呼')
 ok('渲染输出含档位与称呼')
@@ -133,7 +137,7 @@ ok(`注入行足够短（${line.length} 字符）`)
 
 // 14c. describeAffinity 给工具的详细视图
 // 2026-11-10 精简之后只保留：谁 + 档位、状态描述、互动次数。
-const detail = describeAffinity({ score: 50, count: 12, lastAt: Date.now() - 2 * 86400000, createdAt: Date.now() - 30 * 86400000 }, '群友A', Date.now())
+const detail = describeAffinity({ score: 150, count: 12, lastAt: Date.now() - 2 * 86400000, createdAt: Date.now() - 30 * 86400000 }, '群友A', Date.now())
 assert.ok(detail.includes('群友A'), '详细视图应含对方称呼')
 assert.ok(detail.includes('在意'), '详细视图应含档位')
 assert.ok(detail.includes('12'), '详细视图应含互动次数')
@@ -268,7 +272,8 @@ for (const pair of ['疏远=冷漠', '平淡=观察', '在意=朋友', '依赖=�
 // 2026-11-17：删掉了「防线更少一点」那句 —— 它与档名索引同义，工具返回还逐档写了状态。
 // 改成检查保留下来的两条核心：档名索引、以及"好感度是参考不是命令"这个定位。
 assert.ok(/档名索引/.test(presetSrc), '预设应保留档名索引（硫远=冷漠 … 偏爱=只对他一个人这样）')
-assert.ok(/好感度是\*\*参考\*\*，不是命令/.test(presetSrc), '预设应保留"好感度是参考，不是命令"这个定位')
+// 2026-11-23：预设去掉了 Markdown 星号（QQ 上不渲染），断言跟着去星号。
+assert.ok(/好感度是参考，不是命令/.test(presetSrc), '预设应保留"好感度是参考，不是命令"这个定位')
 // 精简的红线：预设里**不该**再逐档展开那五段长描述（它们归工具返回管）。
 // 只要有一档的长描述回来了，就说明有人又把重复内容抄了回去。
 const verboseStageMarkers = [
@@ -459,10 +464,11 @@ assert.ok(presetSrc.includes('不必') || presetSrc.includes('不用') || preset
 assert.ok(presetSrc.includes('硬性前置'), '预设应把「没查过这个人」写成硬性前置')
 assert.ok(presetSrc.includes('从没查过'), '预设应说清"从没查过这个人"这一种情况')
 assert.ok(presetSrc.includes('发生了变化'), '预设应提到唤醒词里的「好感度发生了变化」提示')
-// 第三种：拿不准的时候也查（2026-11-12 新增，且要和"从没查过"一样加粗）
+// 第三种：拿不准的时候也查（2026-11-12 新增）
+// 2026-11-23：预设去掉 Markdown 星号（QQ 不渲染），断言跟着去星号。
 assert.ok(
-  presetSrc.includes('你**拿不准怎么回**的时候'),
-  '预设应包含「你**拿不准怎么回**的时候」，且按操作者要求加粗',
+  presetSrc.includes('你拿不准怎么回的时候'),
+  '预设应包含「你拿不准怎么回的时候」',
 )
 // 0.5 条压缩后只做"总则 + 指路"，不该再把三种情况列一遍（那是【开口前】的职责）
 const zeroFiveLine = presetSrc.split('\n').find((l) => l.trim().startsWith('0.5 ')) || ''
@@ -526,6 +532,35 @@ assert.equal(stageOfA, stageOfB, '同档内涨分不应算档位变化（当前�
     '手工调整应按「档位 id 是否变化」判断，不能在每次保存时都记一条'
   )
 }
+// 回归（2026-11-25）：写档位变化时不许用未定义变量。
+// 曾经写成 `key: String(key || '')`，而这个端点里只有 wantKey ——
+// ReferenceError 被外层 try/catch 静默吞掉，记录永远写不进去，日志也没有。
+{
+  const bs5 = readFileSync(new URL('../src/bridge.js', import.meta.url), 'utf8')
+  // 定位手工调整端点里的 affinityStageChanges 写入
+  // ⚠️ GET 和 POST 共用同一个 pathname 字符串，直接 indexOf 会命中 GET 那处。
+  //    必须带上 method 判断才能找到手工调整那个端点。
+  const needle5 = "url.pathname === '/api/socialV2/affinity'"
+  let i5 = -1
+  let from5 = 0
+  while (true) {
+    const k5 = bs5.indexOf(needle5, from5)
+    if (k5 < 0) break
+    if (bs5.slice(Math.max(0, k5 - 40), k5).includes("'POST'")) { i5 = k5; break }
+    from5 = k5 + 1
+  }
+  assert.ok(i5 > 0, '找不到 POST /api/socialV2/affinity 端点')
+  const region5 = bs5.slice(i5, i5 + 12000)
+  assert.ok(
+    !/key:\s*String\(key\s*\|\|/.test(region5),
+    '手工调整端点里不能写 String(key || ...) —— 该作用域没有 key，会抛 ReferenceError 并被静默吞掉',
+  )
+  assert.ok(
+    /key:\s*String\(scopeGlobal \? '' : wantKey\)/.test(region5),
+    '应用 wantKey 作为档位变化的来源会话',
+  )
+}
+ok('档位变化写入用 wantKey（不用未定义的 key）')
 ok('手工调整好感度也会记录档位变化（拖滑条进新档位能触发唤醒提示）')
 
 // 关键回归（2026-11-13）：qq_affinity 单人查询必须读 data.text。
@@ -561,7 +596,9 @@ ok('手工调整好感度也会记录档位变化（拖滑条进新档位能触�
   }
 
   // ② 该留的（这版的核心）
-  for (const keep of ['听得懂', '不会顺着说下去', '笨蛋', '不冷静']) {
+  // 2026-11-22 重写：去掉了「不会顺着说下去」（它和"又忍不住接"自相矛盾）。
+  // 新版的骨架是：听得懂 → 嘴硬 → 撑不住 → 还是接了。
+  for (const keep of ['听得懂', '嘴硬', '笨蛋', '不冷静']) {
     assert.ok(beloved.includes(keep), `偏爱档应保留「${keep}」`)
     assert.ok(htmlSrc.includes(keep), `控制台应保留「${keep}」，否则和模型拿到的不一致`)
   }
@@ -593,14 +630,17 @@ ok('手工调整好感度也会记录档位变化（拖滑条进新档位能触�
     '代码里不该再有 want && !talkingToOwner（注释里说明可以）',
   )
   // 工具描述别自相矛盾
+  // 2026-11-21：描述改成「语音许可」口径（开着才允许发语音条）。
+  // 2026-11-21 二次精简：描述改成「发语音条之前要先打开」，不再用许可式措辞。
   assert.ok(
-    mcpSrc3.includes('开关都只有主人能'),
-    'qq_set_voice 的工具描述应写开关都只有主人能动，和预设一致',
+    /qq_set_voice[\s\S]{0,600}?发语音条/.test(mcpSrc3) || mcpSrc3.includes('要带 `voice:true` 发语音条时'),
+    'qq_set_voice 的工具描述应说明「发语音条之前要先打开它」',
   )
   // 预设里也是这个说法
+  // 2026-11-21 二次精简：操作者要求「不用权限限制了」，预设只讲怎么用。
   assert.ok(
-    presetSrc3.includes('只有主人能开关'),
-    '预设应写「只有主人能开关」，和桥接一致',
+    presetSrc3.includes('先在 qq_set_voice 里打开语音'),
+    '预设应说明「先打开语音，再带 voice:true」',
   )
 }
 // 回归（2026-11-13）：qq_affinity 必须支持**按名字**查。
