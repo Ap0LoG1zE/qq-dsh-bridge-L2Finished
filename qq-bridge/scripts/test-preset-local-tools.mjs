@@ -29,7 +29,7 @@ const MERGED_PRESET = 'qq-chat-agent';
  * 真正装进 DSH 的是 bundle 里这一份（见该壳文件的注释）。测试直接打权威实现，
  * 避免两边漂移。
  */
-const GUARD_SOURCE = path.join(ROOT, 'plugins', 'qq-agent-presets', 'qq-tool-restrict.mjs');
+const GUARD_SOURCE = path.join(ROOT, '..', 'dsh-plugins', 'dsh-qq-companion', 'tool-restrict.mjs');
 
 /** 封闭 agent 的 preset：按设计**允许**完整本地工具面。 */
 const CLOSED_AGENT_PRESETS = ['qsh-closed'];

@@ -127,10 +127,9 @@ const tests = [
   // 发文件（qq_send_file）：路径安全层（扩展名白名单 / 敏感路径黑名单 / 体积 / 普通文件）
   // + 真实路由闸门（只有 Owner 档能发出去；群聊 / 白名单 / 陌生会话一律 403 且不碰网关）。
   'test-send-file.mjs',
-  // qq-mode-console 的 settings 契约：0.2.0 删除了 ctx.settings.register()，
-  // 命名空间改为由 loader entry id + 导出的 Config 推导。断言三点前提都在，
-  // 并且那条已删除的 API 不会被照旧注释加回来。
-  'test-qq-mode-plugin.mjs',
+  // 2026-11-25：qq-mode-console 已删除（四个插件合并成 dsh-qq-companion；
+  // 模式只剩 reserved2，控制台面板已隐藏，那个设置命名空间读到的值永远不变）。
+  // 它的契约测试随之删除；合并后的包由 dsh-plugins/dsh-qq-companion/scripts/smoke.mjs 覆盖。
   // SnowLuma 上游健康（被误诊成「qq-bridge 注入失败」的那个失败形态）：
   //   · good 必须取自心跳 status.good / get_status —— 取自 get_login_info 会**静默失效**
   //     （SDK 不校验 data 载荷，good 会永远停在 null，整条权威信号变成死分支）；

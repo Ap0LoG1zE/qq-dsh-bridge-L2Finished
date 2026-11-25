@@ -1,4 +1,4 @@
-﻿// 端到端验证：面板改值 → 桥接配置 → 实际行为。
+// 端到端验证：面板改值 → 桥接配置 → 实际行为。
 //
 // 操作者问：「验证一下小面板里改的数据能确实影响到实际的设置」
 //
@@ -19,7 +19,8 @@ import { bridgeHarness } from './audit-bridge-harness.mjs';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 const KEY = 'group:456';
-const PANEL = path.join(ROOT, '..', 'dsh-plugins', 'qq-dsh-panel', 'lib', 'client.js');
+// 2026-11-25：四个插件合并成 dsh-qq-companion，面板 client 搬到它的 lib/ 下。
+const PANEL = path.join(ROOT, '..', 'dsh-plugins', 'dsh-qq-companion', 'lib', 'client.js');
 
 let pass = 0;
 let fail = 0;

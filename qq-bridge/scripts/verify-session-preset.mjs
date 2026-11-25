@@ -63,7 +63,7 @@ let bad = 0;
 // ── 先看装配源：patch 文件（DSH 每轮从它重新装配）──────────────────────────
 // 这一项比"会话里最新那条"更重要：会话里的是**上一次装配的结果**，
 // 而 patch 才是"下一轮会用到的"。
-const PATCH = 'plugins/qq-agent-presets/presets/qq-chat-agent.patch.yml';
+const PATCH = 'dsh-plugins/dsh-qq-companion/presets/qq-chat-agent.patch.yml';
 let patchText = '';
 try {
   patchText = fs.readFileSync(PATCH, 'utf8');

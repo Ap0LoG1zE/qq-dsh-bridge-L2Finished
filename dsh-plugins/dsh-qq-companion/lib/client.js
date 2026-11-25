@@ -15,7 +15,7 @@
  * lib/features/<id>.js on the host side. The panel renders whatever it finds.
  */
 window.__ModuleLoader__.load({
-  id: 'qq-dsh-panel',
+  id: 'dsh-qq-companion',
   factory: function (require) {
     var module = { exports: {} }
     var exports = module.exports
@@ -69,9 +69,9 @@ window.__ModuleLoader__.load({
       title: 'QQ 大肥鱼',
       hint: '把 DeepSeek 部署到 QQ 群',
       icon: ICON_FISH,
-      api: '/qq-dsh-panel/qq-bigfish',
+      api: '/dsh-qq-companion/qq-bigfish',
       // 开关走独立端点：桥接用 socialV2.paused 表示「下线」，语义与 enabled 不同。
-      toggle: { path: '/qq-dsh-panel/qq-bigfish/toggle', key: 'online', statusKey: 'online' },
+      toggle: { path: '/dsh-qq-companion/qq-bigfish/toggle', key: 'online', statusKey: 'online' },
       offText: '已下线',
       settings: true,
       state: { enabled: true },
@@ -882,9 +882,9 @@ window.__ModuleLoader__.load({
   // 这个开关不归桥接管：状态由 qq-dsh-panel 插件自己写进 ~/.dsh/.dsh-thinking-zh.json，
   // 所以读写都走插件自己的路由，而不是走 QQ 大肥鱼代理的 f.api。
   // 浮游球小面板里原本那一行已撤掉，入口统一收在「状态」页签里。
-  var THINK_STATE_API = '/qq-dsh-panel/state'
+  var THINK_STATE_API = '/dsh-qq-companion/state'
   // 工作区清单由宿主侧从 ~/.dsh/storages/workspace.json 读出，页面不直接碰文件。
-  var THINK_WORKSPACES_API = '/qq-dsh-panel/workspaces'
+  var THINK_WORKSPACES_API = '/dsh-qq-companion/workspaces'
   // 顺序即展示顺序：zh 是最"彻底"的一档，放最前面。
   var THINK_MODE_LIST = [
     { id: 'zh', label: '中文', hint: '思考链主干全中文，术语/代码保留英文' },
@@ -3516,14 +3516,14 @@ window.__ModuleLoader__.load({
     }
   }
 
-  exports.name = 'qq-dsh-panel'
+  exports.name = 'dsh-qq-companion'
   exports.inject = []
   exports.apply = apply
 
   // 版本戳：刷新页面后在控制台看到这行，说明浏览器加载的是**这一版** client.js。
   // 看不到就是拿到了缓存/旧模块，需要 Ctrl+F5 或重启 DSH。
   try {
-    console.info('[qq-dsh-panel] client build status-thinking-5 · tabs=' + TABS.length
+    console.info('[dsh-qq-companion] client build status-thinking-5 · tabs=' + TABS.length
       + ' · hasSelf=' + (typeof renderSelfTab === 'function'))
   } catch (err) {}
 

@@ -84,7 +84,10 @@ function backupBeforeOverwrite(file, keep = 5) {
 //          ① 把 qq-agent-presets bundle 注册进 profile（link: 依赖 + bundles + junction）；
 //          ② 从仓库权威源（dsh/agent-presets/<preset>/）重新生成 patch 文件。
 //        旧目录不再写入、也不删除（见 reportLegacyPresetDir）。
-const BUNDLE_NAMES = ['qq-mode-console', 'qq-agent-presets'];
+// 2026-11-25：qq-agent-context / qq-agent-presets / qq-mode-console / qq-dsh-panel
+// 四个插件已合并成唯一的 `dsh-qq-companion`（在仓库的 dsh-plugins/ 下）。
+// qq-mode-console 直接丢弃（模式只剩 reserved2，控制台面板已隐藏）。
+const BUNDLE_NAMES = ['dsh-qq-companion'];
 
 /** 从仓库源重新生成 bundle 里的 patch 文件（人格正文/工具面改了就必须重跑）。 */
 function regeneratePresetPatches() {
@@ -264,7 +267,11 @@ function ensureDirLink(linkPath, targetDir, label) {
  * （qq-agent-presets/qq-tool-restrict.mjs），缺了它 preset 会整条挂载失败。
  */
 function ensureBundle(name) {
-  const repoDir = name === 'qq-agent-presets' ? BUNDLE_DIR : path.join(REPO_ROOT, 'plugins', name);
+  // 2026-11-25 合并后：dsh-qq-companion 在仓库根的 dsh-plugins/ 下
+  // （不再有 plugins/qq-agent-presets 那种布局）。
+  const repoDir = name === 'dsh-qq-companion'
+    ? path.join(REPO_ROOT, '..', 'dsh-plugins', 'dsh-qq-companion')
+    : path.join(REPO_ROOT, 'plugins', name);
   const linkDir = ensureDirLink(path.join(DSH_HOME, 'plugins', name), repoDir, `bundle ${name} link`);
   ensureDirLink(path.join(DSH_HOME, 'profiles', PROFILE, 'node_modules', name), linkDir, `bundle ${name} node_modules link`);
   return linkDir;

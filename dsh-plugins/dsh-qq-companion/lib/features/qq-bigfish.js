@@ -29,7 +29,7 @@ const LOCAL_STATE_FILE = path.join(DSH_HOME, '.dsh-qq-bigfish.json')
 export const id = 'qq-bigfish'
 export const title = 'QQ 大肥鱼'
 export const hint = '把 DeepSeek 部署到 QQ 群'
-export const routePath = '/qq-dsh-panel/qq-bigfish'
+export const routePath = '/dsh-qq-companion/qq-bigfish'
 
 /** 子路由：client 半按需调用，全部是精确路径（与 thinking-zh 同一套注册方式）。 */
 export const ROUTES = {
@@ -99,19 +99,46 @@ async function readJsonBody(req) {
   return text ? JSON.parse(text) : {}
 }
 
-/** 定位 qq-bridge 目录（优先环境变量，其次 ~/.dsh/plugins 下的 junction）。 */
+/** 从某个起点往上逐级找「含 config.json 的目录」或「含 qq-bridge/config.json 的仓库根」。 */
+function findBridgeUpward(start) {
+  let cur = start
+  for (let depth = 0; depth < 6; depth += 1) {
+    // ① 这一级本身就是桥接目录
+    if (fs.existsSync(path.join(cur, 'config.json'))) return cur
+    // ② 这一级是仓库根，桥接在其下的 qq-bridge/
+    const nested = path.join(cur, 'qq-bridge')
+    if (fs.existsSync(path.join(nested, 'config.json'))) return nested
+    const parent = path.dirname(cur)
+    if (parent === cur) break
+    cur = parent
+  }
+  return null
+}
+
+/**
+ * 定位 qq-bridge 目录（优先环境变量，其次 ~/.dsh/plugins 下的 junction）。
+ *
+ * 2026-11-25 合并成 dsh-qq-companion 后修：
+ *   原来写死 `['qq-mode-console', 'qq-agent-presets']` 两个 junction 名，
+ *   再 `dirname(dirname(real))` 上退两级。合并后：
+ *     · 那个 junction 名没了（qq-mode-console 已丢弃）
+ *     · 本包在仓库的 dsh-plugins/ 下，深度与原来不同 —— 硬退两级会少一层
+ *   所以改成「从 junction 的真实路径逐级往上找 config.json」，
+ *   同时兼容「桥接目录本身」和「仓库根（下有 qq-bridge/）」两种布局。
+ *   旧包名保留在候选里，方便没升级的人。
+ */
 function findBridgeDir() {
   const fromEnv = process.env.QQ_BRIDGE_DIR
   if (fromEnv) {
     const dir = path.resolve(fromEnv)
     if (fs.existsSync(path.join(dir, 'config.json'))) return dir
   }
-  for (const name of ['qq-mode-console', 'qq-agent-presets']) {
+  for (const name of ['dsh-qq-companion', 'qq-agent-presets', 'qq-mode-console']) {
     try {
       // realpathSync 会解析 Windows junction / 符号链接，得到仓库里的真实目录
       const real = fs.realpathSync(path.join(DSH_HOME, 'plugins', name))
-      const dir = path.dirname(path.dirname(real))
-      if (fs.existsSync(path.join(dir, 'config.json'))) return dir
+      const dir = findBridgeUpward(real)
+      if (dir) return dir
     } catch { /* 链接不存在或不可解析，试下一个 */ }
   }
   return null
@@ -122,7 +149,8 @@ function bridgeEnv() {
   if (!dir) {
     return {
       ok: false,
-      error: '找不到 qq-bridge。~/.dsh/plugins 下没有 qq-mode-console 链接；请先在 qq-bridge 目录里跑 node scripts/setup-dsh.mjs',
+      error: '找不到 qq-bridge。~/.dsh/plugins 下没有可解析的插件链接；'
+        + '请先在 qq-bridge 目录里跑 node scripts/setup-dsh.mjs，或设环境变量 QQ_BRIDGE_DIR 指向桥接目录',
     }
   }
   // 读 config.json。**必须先吃掉 UTF-8 BOM**，否则 JSON.parse 会抛

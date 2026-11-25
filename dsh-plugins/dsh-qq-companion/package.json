@@ -1,0 +1,60 @@
+{
+  "name": "dsh-qq-companion",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "DSH 的 QQ 伴侣套件（四合一）：浮游球面板（思考链中文 + QQ 大肥鱼 11 个页签）、QQ 会话身份/令牌注入、qq-chat-agent 预设与只读工具守卫、以及按「保留尾部 N token」压缩的 /compact_chat 命令。",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./tool-restrict.mjs": "./tool-restrict.mjs",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "lib",
+    "presets",
+    "locale",
+    "tool-restrict.mjs",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "dsh-bundle",
+    "qq",
+    "qq-bridge",
+    "companion",
+    "floatdock",
+    "compaction",
+    "agent-preset"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": [
+        "./cordis.patch.yml",
+        "./presets/qq-chat-agent.patch.yml"
+      ]
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": []
+    }
+  },
+  "scripts": {
+    "test": "node scripts/smoke.mjs"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": "~3.19.0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/schemastery": {
+      "optional": true
+    }
+  },
+  "license": "MIT"
+}

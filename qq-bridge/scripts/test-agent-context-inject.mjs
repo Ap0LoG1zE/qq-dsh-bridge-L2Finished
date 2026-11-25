@@ -21,7 +21,9 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
-const PLUGIN = path.join(ROOT, 'plugins', 'qq-agent-context', 'index.js');
+// 2026-11-25：合并进 dsh-qq-companion 后，身份注入的实现搬到它的 lib/agent-context.js。
+// 这里的契约测试只关心那个模块本身（name / inject / apply），所以直接指向它。
+const PLUGIN = path.join(ROOT, '..', 'dsh-plugins', 'dsh-qq-companion', 'lib', 'agent-context.js');
 
 const TOKEN = 'abc123def4567890';
 const CONTEXT_TEXT = `【你的身份】QQ 3346197751，昵称 mutsumi。\n\n【令牌】私聊84420221（主人） → key "private:84420221"，token ${TOKEN}`;

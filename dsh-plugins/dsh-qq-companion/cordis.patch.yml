@@ -1,0 +1,30 @@
+# dsh-qq-companion 的 bundle patch。
+#
+# 四条职责收在一个包里：
+#   ① 浮游球面板（思考链中文 + QQ 大肥鱼）   → lib/index.js 里的 FEATURES
+#   ② QQ 会话身份/令牌注入系统提示词        → lib/agent-context.js
+#   ③ qq-chat-agent 预设 + 只读工具守卫      → presets/qq-chat-agent.patch.yml
+#   ④ /compact_chat 命令                    → lib/compact-chat.js
+#
+# ── 注意 entry 的 id ──────────────────────────────────────────────────────
+#
+# `id: dsh-qq-companion` 是插件行自身的 id，随意取名。
+# 预设行（preset-qq-chat-agent）由 presets/ 下那份 patch 注入，不在这里。
+#
+# 原来的 qq-mode-console 已被丢弃（2026-11-25）：模式只剩 reserved2 一种，
+# 桥接控制台的模式面板也已隐藏，那个设置命名空间读到的值永远不变。
+# 桥接对 qq-mode 的读取包在 try/catch 里，读不到会自动回退到 state/mode.json。
+#
+# ── config ────────────────────────────────────────────────────────────────
+#   bridgeUrl  桥接控制台地址（身份注入插件用它拉会话上下文）
+#   tokenFile  控制台令牌文件；留空走 index.js 里的默认推导
+#   compactRetainTokens  /compact_chat 保留的尾部 token（默认 200000）
+#   compactMaxTokens     /compact_chat 摘要调用的输出上限（默认 8192）
+
+- insert:
+    - id: dsh-qq-companion
+      name: dsh-qq-companion
+      config:
+        bridgeUrl: 'http://127.0.0.1:3100'
+        compactRetainTokens: 200000
+        compactMaxTokens: 8192

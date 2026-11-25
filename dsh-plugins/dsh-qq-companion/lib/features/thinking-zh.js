@@ -29,8 +29,8 @@ const MAX_WORKSPACES = 50
 export const id = 'thinking-zh'
 export const title = '思考链中文'
 export const hint = '模型从源头用中文推理，术语保留英文'
-export const routePath = '/qq-dsh-panel/state'
-export const workspacesPath = '/qq-dsh-panel/workspaces'
+export const routePath = '/dsh-qq-companion/state'
+export const workspacesPath = '/dsh-qq-companion/workspaces'
 
 const PROMPTS = {
   zh: [

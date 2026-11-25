@@ -113,7 +113,7 @@ for (const p of ['qq-chat', 'qq-chat-v2']) {
 }
 
 // 守卫脚本必须是 fail-closed 的：非法工具名要被拒绝，而不是放行（权威实现只有一份）。
-const canonicalGuardPath = path.join(ROOT, 'plugins', 'qq-agent-presets', 'qq-tool-restrict.mjs');
+const canonicalGuardPath = path.join(ROOT, '..', 'dsh-plugins', 'dsh-qq-companion', 'tool-restrict.mjs');
 const guard = fs.readFileSync(canonicalGuardPath, 'utf8');
 // 断言只看**可执行代码**：守卫的注释里会写「cordis_define/… 在 0.1.7 已被删除」做历史说明，
 // 直接扫原文会把这段说明误判成「还在使用旧工具名」（实测误报）。必须**先剥块注释**
@@ -128,7 +128,7 @@ check('守卫：不额外放行 web_search/web_fetch', !/'(?:web_search|web_fetc
 check('守卫：拒绝 0.1.7 已删除的 cordis 旧工具名（避免静默失效）', !/cordis_(?:define|undefine|run|stop)/.test(guardCode));
 
 // 0.2.0 工具面重新对账的结果（扫描器与守卫必须一致）。
-// 三类必须覆盖，来源见 plugins/qq-agent-presets/qq-tool-restrict.mjs 的长注释：
+// 三类必须覆盖，来源见 dsh-plugins/dsh-qq-companion/tool-restrict.mjs 的长注释：
 //   ① 全局层默认启用、仿真会话真的会继承的 MCP 资源工具
 //   ② 派生 agent / 执行外部代码
 //   ③ 插件装载权（= 任意代码执行）与无人值守的自我调度
@@ -184,9 +184,9 @@ check('mcp 路径指向本仓库', mcpIds.every((id) => {
 }));
 
 const pkg = JSON.parse(fs.readFileSync(path.join(DSH_HOME, 'profiles/web/package.json'), 'utf8'));
-check('profile bundles 含 qq-mode-console', pkg.dsh.profile.bundles.includes('qq-mode-console'));
-check('qq-mode-console link 依赖已注册', String(pkg.dependencies['qq-mode-console'] ?? '').startsWith('link:'));
-check('qq-mode-console 已 link 进 node_modules', fs.existsSync(path.join(DSH_HOME, 'profiles/web/node_modules/qq-mode-console')));
+check('profile bundles 含 dsh-qq-companion', pkg.dsh.profile.bundles.includes('dsh-qq-companion'));
+check('dsh-qq-companion link 依赖已注册', String(pkg.dependencies['dsh-qq-companion'] ?? '').startsWith('link:'));
+check('dsh-qq-companion 已 link 进 node_modules', fs.existsSync(path.join(DSH_HOME, 'profiles/web/node_modules/dsh-qq-companion')));
 
 // ── 3. 仓库配置：模型 ───────────────────────────────────────────────────────
 const cfg = JSON.parse(fs.readFileSync(path.join(ROOT, 'config.json'), 'utf8'));
@@ -221,10 +221,11 @@ check('群聊模式不再重试「无 preset」建会话', /strictPreset \? \[tr
 // 复发，这里把「所有对外自称的版本号必须等于 package.json」固定下来。
 const pkgJson = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
 const lockJson = JSON.parse(fs.readFileSync(path.join(ROOT, 'package-lock.json'), 'utf8'));
-const pluginPkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'plugins/qq-mode-console/package.json'), 'utf8'));
+// 2026-11-25：四个插件合并成 dsh-qq-companion（在仓库根的 dsh-plugins/ 下）
+const pluginPkg = JSON.parse(fs.readFileSync(path.join(ROOT, '..', 'dsh-plugins', 'dsh-qq-companion', 'package.json'), 'utf8'));
 check('package-lock.json 顶层 version 与 package.json 一致', lockJson.version === pkgJson.version, `lock=${lockJson.version} pkg=${pkgJson.version}`);
 check('package-lock.json packages[""] version 与 package.json 一致', lockJson.packages?.['']?.version === pkgJson.version, `lock=${lockJson.packages?.['']?.version}`);
-check('qq-mode-console 插件版本与主包一致', pluginPkg.version === pkgJson.version, `plugin=${pluginPkg.version}`);
+check('dsh-qq-companion 插件版本与主包一致', pluginPkg.version === pkgJson.version, `plugin=${pluginPkg.version}`);
 for (const f of ['src/mcp-snowluma-safe.js', 'src/mcp-host-server.js', 'src/mcp-web-search-safe.js']) {
   const m = /new McpServer\(\{[^}]*version:\s*'([^']+)'/.exec(fs.readFileSync(path.join(ROOT, f), 'utf8'));
   check(`${f} 的 MCP serverInfo.version 与主包一致`, m?.[1] === pkgJson.version, `声明=${m?.[1]} 主包=${pkgJson.version}`);

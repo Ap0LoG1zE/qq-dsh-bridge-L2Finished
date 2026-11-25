@@ -16,7 +16,7 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const PLUGIN = path.join(ROOT, 'plugins', 'qq-agent-presets', 'qq-tool-restrict.mjs');
+const PLUGIN = path.join(ROOT, '..', 'dsh-plugins', 'dsh-qq-companion', 'tool-restrict.mjs');
 
 let failures = 0;
 let tests = 0;

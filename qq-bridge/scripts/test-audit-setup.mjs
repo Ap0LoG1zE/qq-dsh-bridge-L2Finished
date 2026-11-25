@@ -1,4 +1,4 @@
-// Offline integration tests. Every setup invocation receives its own repository and DSH_HOME.
+﻿// Offline integration tests. Every setup invocation receives its own repository and DSH_HOME.
 // QQ_BRIDGE_TEST_YAML_ROOT is only useful when auditing with an intentionally read-only
 // node_modules tree; normal installs resolve the declared js-yaml dependency directly.
 import assert from 'node:assert/strict';
@@ -65,7 +65,7 @@ try {
     }
     const pkg = JSON.parse(fs.readFileSync(path.join(f.home, 'profiles/web/package.json')));
     assert.equal(pkg.dependencies.existing, '1.0.0');
-    assert.deepEqual(pkg.dsh.profile.bundles, ['existing', 'qq-mode-console', 'qq-agent-presets']);
+    assert.deepEqual(pkg.dsh.profile.bundles, ['existing', 'dsh-qq-companion']);
   });
 
   test('legacy root [] is repaired without altering literal strings', () => {
@@ -101,10 +101,10 @@ try {
     assert.equal(result.status, 0, result.stderr);
     assert.equal(fs.readFileSync(path.join(f.repo, 'state/mode.json'), 'utf8'), mode);
     const blocker = fixture('plugin-conflict', '[]\n');
-    fs.mkdirSync(path.join(blocker.home, 'plugins/qq-mode-console'), { recursive: true });
-    fs.writeFileSync(path.join(blocker.home, 'plugins/qq-mode-console/keep.txt'), 'keep');
+    fs.mkdirSync(path.join(blocker.home, 'plugins/dsh-qq-companion'), { recursive: true });
+    fs.writeFileSync(path.join(blocker.home, 'plugins/dsh-qq-companion/keep.txt'), 'keep');
     assert.notEqual(blocker.run().status, 0);
-    assert.equal(fs.readFileSync(path.join(blocker.home, 'plugins/qq-mode-console/keep.txt'), 'utf8'), 'keep');
+    assert.equal(fs.readFileSync(path.join(blocker.home, 'plugins/dsh-qq-companion/keep.txt'), 'utf8'), 'keep');
   });
 
   if (process.platform === 'win32') test('Windows runs the npm .cmd shim with literal profile arguments', () => {
