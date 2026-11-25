@@ -169,11 +169,14 @@
     },
     "compaction": {
       "enabled": true,
-      "onlyPrivate": true,
+      "onlyPrivate": false,
       "idleMs": 1800000,
-      "thresholdTokens": 300000,
+      "thresholdTokens": 400000,
       "checkIntervalMs": 60000,
-      "summarize": true
+      "summarize": true,
+      "command": "/compact_chat",
+      "allowDestructiveCompact": false,
+      "_note": "闲置压缩：40万 token + 安静30分钟触发，执行 /compact_chat（保留尾部20万）。⚠️ 别改成 /compact —— DSH 的 compactNow 把 retainTokens 硬编码成 0，会清空除最后一条外的全部历史。"
     },
     "send": {
       "burstEnabled": true,

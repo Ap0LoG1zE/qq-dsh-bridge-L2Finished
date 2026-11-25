@@ -1213,6 +1213,12 @@ function loadConfig() {
         idleMs: 1800000,          // 30 分钟没有**用户**消息（模型自己的动作不重置计时）
         thresholdTokens: 300000,  // 上下文超过 30 万 token 才值得压（1M 窗口的 30%）
         checkIntervalMs: 60000,   // 每分钟扫一次
+        // 闲置压缩执行哪条命令。默认 /compact_chat（自写插件，保留尾部 20 万）。
+        // ⚠️ 别改成 /compact：DSH 的 compactNow 把 retainTokens 硬编码成 0，
+        //    会清空除最后一条外的全部历史（实测丢过 1000+ 条对话）。
+        command: '/compact_chat',
+        // 只有显式设 true 才允许走会清空历史的 /compact。
+        allowDestructiveCompact: false,
         // 2026-11-10：压缩前「记忆整理」投递已删除（summarize 开关随之失效）。
         // 旧行为是压缩前投递一次模型调用，让她把要点写进记忆库；现在长期记忆由她
         // 自己在聊天中用 qq_memory_append(category='longTerm') 写，压缩不再额外调模型。
@@ -16829,30 +16835,37 @@ async function main() {
   async function compactSessionV2(key) {
     const sessionId = state.sessions[key];
     if (!sessionId) return { ok: false, error: '会话未建立' };
-    // ── 2026-11-25 硬性拒绝：默认不调 /compact ────────────────────────────
+
+    // ── 用哪条命令（2026-11-25 定）─────────────────────────────────────────
     //
-    // DSH 的 compactNow() 里 retainTokens 是**硬编码 0**：
-    //   selectCompactableRange(session, measurement, 0)
-    // 后果是"除最后一条外全部压成摘要"——不是保留尾部 N 万。
-    // 实测让用户丢了 1000+ 条对话（上下文从 40 万掉到几千）。
+    // 默认走 `/compact_chat` —— 那是 @local/dsh-command-compact-chat 注册的命令，
+    // 它自己算「保留尾部 N token」再调 compactRegion，**真正保留尾部**。
     //
-    // 所以默认拒绝走这条路。只有显式把
-    //   socialV2.compaction.allowDestructiveCompact 设为 true 才放行
-    // （留给"将来 DSH 修好了 / 用户明确想清空"的场景）。
-    if (cfg.socialV2?.compaction?.allowDestructiveCompact !== true) {
+    // 绝不默认走 DSH 自带的 `/compact`：它的 compactNow() 里 retainTokens 是
+    // **硬编码 0**（selectCompactableRange(session, measurement, 0)），
+    // 后果是「除最后一条外全部压成摘要」。实测让用户丢了 1000+ 条对话
+    // （上下文从 40 万掉到几千）。这条只有显式设
+    //   socialV2.compaction.allowDestructiveCompact = true
+    // 才放行，留给「就是要清空」的场景。
+    const configured = String(cfg.socialV2?.compaction?.command ?? '').trim();
+    const command = configured || '/compact_chat';
+    const destructive = command === '/compact';
+
+    if (destructive && cfg.socialV2?.compaction?.allowDestructiveCompact !== true) {
       return {
         ok: false,
         error: '/compact 在 DSH 里把 retainTokens 硬编码成 0（会清空除最后一条外的全部历史），'
-          + '已默认拒绝。若要保留尾部，请依赖预设里的原生压缩（thresholdRatio / retainTokens）；'
+          + '已拒绝。闲置压缩默认应走 /compact_chat（会保留尾部）；'
           + '确实想清空再设 socialV2.compaction.allowDestructiveCompact=true。',
         refused: true,
       };
     }
+
     try {
       const res = await withTimeout(
-        api.callUnary('commands/execute', { agentId: sessionId, line: '/compact', submittedAttachments: [] }),
+        api.callUnary('commands/execute', { agentId: sessionId, line: command, submittedAttachments: [] }),
         COMPACT_TIMEOUT_MS,
-        'commands/execute(/compact)'
+        `commands/execute(${command})`
       );
       // callUnary 返回 { rpcId, result }，而 result 本身是 RPC 信封 { ok, value }，
       // 真正的命令结算结果在 value 里：{ commandId, result: { kind, text } }。
@@ -16865,8 +16878,8 @@ async function main() {
       const text = settled?.result?.text ?? '';
       if (!settled || !kind) {
         // execute 在「命令解析不出来 / 命令表里没这个命令」时返回 undefined。
-        // 说明这个 DSH 版本没挂 command-compact —— 必须显式失败，绝不假装成功。
-        return { ok: false, error: 'DSH 未识别 /compact（preset 里可能没挂 command-compact）' };
+        // 说明这个 DSH 版本没挂对应命令 —— 必须显式失败，绝不假装成功。
+        return { ok: false, error: `DSH 未识别 ${command}（先确认插件 @local/dsh-command-compact-chat 已装并重启过 DSH）` };
       }
       return { ok: kind === 'success', kind, text, commandId: settled.commandId ?? null };
     } catch (error) {
@@ -16879,8 +16892,7 @@ async function main() {
     st.idleCompactingAt = Date.now();
     saveSocialV2State();
     const mins = Math.round(decision.idleMs / 60000);
-    log(`[compaction] 闲置边界：${key} 已安静 ${mins} 分钟、上下文约 ${Math.round(decision.ctxTokens / 1000)}k token，开始压缩`);
-    try {
+    log(`[compaction] 闲置边界：${key} 已安静 ${mins} 分钟、上下文约 ${Math.round(decision.ctxTokens / 1000)}k token，开始压缩`);    try {
       // ① 原地压缩：会话 id 和桥接映射都不变，只是 DSH 把历史压成摘要 + 保留尾部。
       //    （2026-11-10：压缩前的「记忆整理」投递已删除 —— 那是一次模型调用，
       //     现在长期记忆由她自己在聊天中用 qq_memory_append(category='longTerm') 写。）
@@ -16937,7 +16949,7 @@ async function main() {
       }
     }, every);
     idleCompactionTimer.unref?.();
-    log(`[compaction] 闲置压缩已启用：安静 ${Math.round((Number(c.idleMs) || 1800000) / 60000)} 分钟且上下文超过 ${Math.round((Number(c.thresholdTokens) || 200000) / 1000)}k token 时触发`);
+    log(`[compaction] 闲置压缩已启用：安静 ${Math.round((Number(c.idleMs) || 1800000) / 60000)} 分钟且上下文超过 ${Math.round((Number(c.thresholdTokens) || 200000) / 1000)}k token 时触发，执行 ${String(c.command ?? '').trim() || '/compact_chat'}`);
   }
 
   function scheduleReplyCheckV2(key) {
