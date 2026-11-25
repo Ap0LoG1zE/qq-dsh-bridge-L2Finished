@@ -18710,6 +18710,13 @@ async function main() {
       return;
     }
     if (delay > MAX_TIMEOUT_MS) {
+      // ★ 2026-11-26 修：**分段续期时也要把 wakeUpAt 记上**。
+      //
+      //   原来这个分支只排了 setTimeout 就 return，没写 `st.wakeUpAt` ——
+      //   而面板读的正是 `wakeUpAt`。于是"她睡着、醒来时刻已排好"这件事
+      //   在面板上显示成 `wakeUpAt: null`，看起来像"根本没排"。
+      //   （实测：重启后端点返回 wakeUpAt=null，但 timer 其实在跑。）
+      st.wakeUpAt = at;
       st.wakeUpTimer = setTimeout(() => {
         st.wakeUpTimer = null;
         scheduleWakeUpTimerV2(key);
