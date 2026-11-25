@@ -1,4 +1,4 @@
-// 把 qq-compact-v2 插件挂进 DSH profile（desktop）。
+﻿// 把 qq-compact-v2 插件挂进 DSH profile（desktop）。
 //
 // ── 只需两步（2026-11-25 更正）──────────────────────────────────────────────
 //
@@ -7,7 +7,7 @@
 //      （dependencies + dsh.profile.bundles）
 //
 // ⚠️ **不要**再往 profile 的 cordis.patch.yml 追加 insert —— 本脚本上一版
-//    这么做过，结果 /compactV2 根本没出现。原因是该插件自带
+//    这么做过，结果 /compact-v2 根本没出现。原因是该插件自带
 //    `cordis.patch.yml`（package.json 的 dsh.bundle.patch 指向它），
 //    bundle 机制会自己注入；再手写一份等于**重复注册同一个 id**，
 //    DSH 那边直接不加载（对比：能正常工作的 qq-agent-context 在 profile 的
@@ -99,7 +99,7 @@ function cleanupPatchEntry() {
   const raw = fs.readFileSync(PATCH, 'utf8');
   if (!raw.includes(NAME)) { log('✅ profile patch 里没有本插件的条目（正确状态）'); return; }
 
-  const block = /\n?# \/compactV2：[^\n]*\n- insert:\n {4}- id: qq-compact-v2\n {6}name: '@local\/qq-compact-v2'\n {6}config:\n {8}retainTokens: \d+\n/;
+  const block = /\n?# \/compact-v2：[^\n]*\n- insert:\n {4}- id: qq-compact-v2\n {6}name: '@local\/qq-compact-v2'\n {6}config:\n {8}retainTokens: \d+\n/;
   if (!block.test(raw)) {
     log('⚠️ patch 里有 qq-compact-v2 但格式不匹配，请手工检查');
     return;
@@ -134,6 +134,6 @@ console.log('\n完成。');
 if (!DRY) {
   console.log('\n下一步：');
   console.log('  1. 重启 DSH（插件只在启动时加载 —— 这一步不能省）');
-  console.log('  2. 在 DSH 里敲 /compactV2 dry 先看范围');
-  console.log('\n注意：如果 /compactV2 还是不出现，先确认 DSH 的启动时间晚于本次安装。');
+  console.log('  2. 在 DSH 里敲 /compact-v2 dry 先看范围');
+  console.log('\n注意：如果 /compact-v2 还是不出现，先确认 DSH 的启动时间晚于本次安装。');
 }

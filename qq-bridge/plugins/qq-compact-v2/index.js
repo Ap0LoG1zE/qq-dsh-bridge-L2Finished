@@ -1,4 +1,18 @@
-// /compactV2 —— 按「保留尾部 N 万 token」压缩会话历史。
+// /compact-v2 —— 按「保留尾部 N 万 token」压缩会话历史。
+//
+// ── 命令名为什么是连字符而不是 compactV2 ──────────────────────────────────
+//
+// DSH 对命令名有严格正则（`@deepseek-ai/dsh-commands` 里的 COMMAND_NAME）：
+//
+//     const COMMAND_NAME = /^[a-z][a-z0-9_-]*$/u;
+//     function normalizeDefinition(definition) {
+//       if (!COMMAND_NAME.test(definition.name))
+//         throw new TypeError(`command name "${definition.name}" must match ${...}`);
+//
+// **只允许小写字母、数字、下划线、连字符。** 大写字母（例如 compactV2 的 V）
+// 会在 register 时直接抛 TypeError —— 症状是"命令根本不存在"，而且如果
+// 错误被 apply 的上下文吞掉，界面上一点提示都没有。
+// 所以命令名定为 `compact-v2`，输入时敲 `/compact-v2`。
 //
 // ── 为什么需要这个插件 ──────────────────────────────────────────────────────
 //
@@ -19,9 +33,9 @@
 //
 // ── 两种用法 ────────────────────────────────────────────────────────────────
 //
-//   /compactV2            按默认配置压（config.retainTokens，默认 20 万）
-//   /compactV2 dry        只算范围和校验，不实际压缩（安全预览）
-//   /compactV2 150000     指定保留 15 万 token
+//   /compact-v2            按默认配置压（config.retainTokens，默认 20 万）
+//   /compact-v2 dry        只算范围和校验，不实际压缩（安全预览）
+//   /compact-v2 150000     指定保留 15 万 token
 //
 // 建议第一次先用 `dry` 跑一遍，看清「要压哪些、留哪些、工具配对是否平衡」再真压。
 //
@@ -143,16 +157,18 @@ export function apply(ctx, config) {
   );
 
   ctx.commands.register({
-    name: 'compactV2',
-    description: `按「保留尾部 N 万 token」压缩历史（默认 ${Math.round(fallbackRetain / 1000)}k）。用法：/compactV2 [dry] [retainTokens]`,
+    // ⚠️ 必须是 /^[a-z][a-z0-9_-]*$/u 能匹配的名字（见文件头说明）。
+    // 之前写成 compactV2，大写 V 让 register 抛 TypeError，命令根本没注册上。
+    name: 'compact-v2',
+    description: `按「保留尾部 N 万 token」压缩历史（默认 ${Math.round(fallbackRetain / 1000)}k）。用法：/compact-v2 [dry] [retainTokens]`,
     handler: async (invocation) => {
       const agent = invocation?.agent;
       const signal = invocation?.signal;
       if (!agent) {
-        return { kind: 'error', text: 'compactV2：拿不到当前 agent，无法定位会话。' };
+        return { kind: 'error', text: 'compact-v2：拿不到当前 agent，无法定位会话。' };
       }
       if (signal?.aborted) {
-        return { kind: 'error', text: 'compactV2：请求已取消。' };
+        return { kind: 'error', text: 'compact-v2：请求已取消。' };
       }
 
       const { dry, retainTokens } = parseArgs(invocation.rawInput, fallbackRetain);
@@ -162,7 +178,7 @@ export function apply(ctx, config) {
       try {
         measurement = ctx.tokenMeter.measure(agent.session);
       } catch (error) {
-        return { kind: 'error', text: `compactV2：测量上下文失败 —— ${error?.message ?? error}` };
+        return { kind: 'error', text: `compact-v2：测量上下文失败 —— ${error?.message ?? error}` };
       }
       const nodes = measurement?.nodes ?? [];
       const totalTokens = Number(measurement?.totalTokens) || 0;
@@ -171,7 +187,7 @@ export function apply(ctx, config) {
       if (!range) {
         return {
           kind: 'success',
-          text: `compactV2：没有可压的区间。当前 ${nodes.length} 个节点、约 ${fmt(totalTokens)} token；`
+          text: `compact-v2：没有可压的区间。当前 ${nodes.length} 个节点、约 ${fmt(totalTokens)} token；`
             + `保留 ${fmt(retainTokens)} → 可压部分为空（历史还没长到值得压）。`,
         };
       }
@@ -187,7 +203,7 @@ export function apply(ctx, config) {
             const reason = !okBefore.ok ? okBefore.reason : okAfter.reason;
             return {
               kind: 'error',
-              text: `compactV2：切点会让工具调用与结果分离（${reason ?? 'unbalanced'}），已中止。`
+              text: `compact-v2：切点会让工具调用与结果分离（${reason ?? 'unbalanced'}），已中止。`
                 + '这是 DSH 的硬性约束，换一个保留量再试（差一点通常就能对齐）。',
             };
           }
@@ -211,7 +227,7 @@ export function apply(ctx, config) {
       if (dry) {
         return {
           kind: 'success',
-          text: `compactV2（dry-run，什么都没改）：\n  ${summary}`,
+          text: `compact-v2（dry-run，什么都没改）：\n  ${summary}`,
         };
       }
 
@@ -227,13 +243,13 @@ export function apply(ctx, config) {
         const shadowedTokens = Number(result?.shadowedTokenCount) || 0;
         return {
           kind: 'success',
-          text: `compactV2：压缩完成。压掉 ${shadowed} 个节点、约 ${fmt(shadowedTokens)} token；`
+          text: `compact-v2：压缩完成。压掉 ${shadowed} 个节点、约 ${fmt(shadowedTokens)} token；`
             + `尾部约 ${fmt(range.keptTokens)} token 原样保留。\n（压缩会改写历史前缀，下一次请求的 KV cache 会失效，属预期）`,
         };
       } catch (error) {
         return {
           kind: 'error',
-          text: `compactV2：压缩失败 —— ${error?.message ?? error}\n`
+          text: `compact-v2：压缩失败 —— ${error?.message ?? error}\n`
             + '（若提示 unbalanced/busy/changed，换个保留量或等这轮结束再试）',
         };
       }

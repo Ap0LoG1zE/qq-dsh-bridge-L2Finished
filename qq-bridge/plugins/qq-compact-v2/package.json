@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "提供 /compactV2 命令：按「保留尾部 N 万 token」压缩会话历史。绕开 DSH /compact 硬编码 retainTokens=0 的问题（那个会清空除最后一条外的全部历史）。",
+  "description": "提供 /compact-v2 命令：按「保留尾部 N 万 token」压缩会话历史。绕开 DSH /compact 硬编码 retainTokens=0 的问题（那个会清空除最后一条外的全部历史）。",
   "exports": {
     ".": "./index.js"
   },
