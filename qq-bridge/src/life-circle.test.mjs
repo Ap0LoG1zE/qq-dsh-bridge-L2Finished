@@ -23,7 +23,8 @@ import {
   normalizeCircle,
   circleExtras,
   describeCircle,
-  defaultCircle
+  defaultCircle,
+  desireRateOf
 } from './life-circle.js';
 
 const HOUR = 3600000;
@@ -337,4 +338,55 @@ test('离线阈值是 3 小时', () => {
 test('速率常量与注释一致', () => {
   assert.equal(DECAY_PER_HOUR.energy, 3.0);
   assert.equal(ENERGY_RECOVER_PER_HOUR, 8.0);
+});
+
+// ══ 第三项累积速率可配（2026-11-27）═════════════════════════════════════════
+//
+// 起因：操作者说「性欲多久才到一次 80，感觉有点慢」。
+// 实测 1.2/h 下，从被充分释放后的 20 涨回显示门槛 80 要 50 小时（2.1 天）——
+// 而 80 是唯一显示门槛，等于两天才可能看到一次。
+//
+
+// ══ 第三项累积速率可配（2026-11-27）═════════════════════════════════════════
+//
+// 起因：操作者说「性欲多久才到一次 80，感觉有点慢」。
+// 实测 1.2/h 下，从被充分释放后的 20 涨回显示门槛 80 要 50 小时（2.1 天）——
+// 而 80 是唯一显示门槛，等于两天才可能看到一次。
+//
+// 改成可配（life.desirePerHour），默认仍是 1.2。
+
+test('desireRateOf：默认 1.2，可配，越界夹紧', () => {
+  assert.equal(desireRateOf(undefined), 1.2, '没配就用默认');
+  assert.equal(desireRateOf(null), 1.2);
+  assert.equal(desireRateOf(''), 1.2);
+  assert.equal(desireRateOf(2), 2, '正常配置生效');
+  assert.equal(desireRateOf(2.5), 2.5);
+  assert.equal(desireRateOf(-5), 1.2, '负数回落默认（不能倒着涨）');
+  assert.equal(desireRateOf(0), 1.2, '0 也回落默认');
+  assert.equal(desireRateOf(999), 8, '超上限夹到 8（否则永远贴着 100）');
+  assert.equal(desireRateOf(0.01), 0.1, '低于下限夹到 0.1');
+});
+
+test('settleCircle：desirePerHour 真的改变涨幅', () => {
+  const now = Date.now();
+  const base = { energy: 80, desire: 50, asleep: false, asleepSince: 0, lastTickedAt: now - 5 * HOUR };
+  const slow = settleCircle(base, now, { desirePerHour: 1.2 });
+  const fast = settleCircle(base, now, { desirePerHour: 2 });
+  assert.ok(Math.abs(slow.desire - (50 + 1.2 * 5)) < 0.01, `1.2/h × 5h = +6（实际 ${slow.desire - 50}）`);
+  assert.ok(Math.abs(fast.desire - (50 + 2 * 5)) < 0.01, `2/h × 5h = +10（实际 ${fast.desire - 50}）`);
+});
+
+test('settleCircle：不传 desirePerHour 时行为与旧版一致（1.2/h）', () => {
+  const now = Date.now();
+  const base = { energy: 80, desire: 50, asleep: false, asleepSince: 0, lastTickedAt: now - 10 * HOUR };
+  const out = settleCircle(base, now, {});
+  assert.ok(Math.abs(out.desire - (50 + 1.2 * 10)) < 0.01,
+    '没传配置必须完全等于旧行为，否则所有老测试都会漂');
+});
+
+test('2/h 下：从被释放后的 20 涨回 80 约 30 小时（原来是 50）', () => {
+  const hours = (80 - 20) / desireRateOf(2);
+  assert.ok(hours > 29 && hours < 31, `应当 ~30 小时（实际 ${hours}）`);
+  // 对照：默认速率要 50 小时
+  assert.equal((80 - 20) / desireRateOf(undefined), 50);
 });

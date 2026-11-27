@@ -15605,7 +15605,11 @@ async function main() {
     const gapMs = Date.now() - (Number(circle?.lastTickedAt) || 0);
     return settleLifeCircleFn(circle, Date.now(), {
       gapMs,
-      offlineThresholdMs: lifeOfflineThresholdMs()
+      offlineThresholdMs: lifeOfflineThresholdMs(),
+      // ★ 2026-11-27：第三项的累积速率可配（`life.desirePerHour`）。
+      //   默认 1.2/h —— 从被释放后的 20 涨回显示门槛 80 要 50 小时，
+      //   操作者觉得慢，改成配置项按自己的节奏调。
+      desirePerHour: cfg.life?.desirePerHour
     });
   }
 

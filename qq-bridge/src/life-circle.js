@@ -65,8 +65,28 @@ export const DECAY_PER_HOUR = Object.freeze({
  * 1.2/h：从 0 起算约 4 天到顶。这个量级是刻意的 ——
  * 太快（比如 5/h）它会长期贴着 100，唤醒词里天天出现同一句；
  * 太慢（比如 0.3/h）一个正常作息下来根本到不了 80，功能等于没有。
+ *
+ * ★ 2026-11-27：改成**可配**（`life.desirePerHour`），默认仍是 1.2。
+ *
+ *   实测反馈「有点慢」：从被充分释放后的 20 涨回 80 要 50 小时（2.1 天）。
+ *   而 80 是唯一的显示门槛 —— 也就是说两天才可能看到她有这个状态一次。
+ *
+ *   这和上面那段话并不矛盾：1.2 是"从 0 到顶"的尺度（66 小时），
+ *   但真正决定观感的是"从释放后回到 80"，那一段短得多、也常见得多。
+ *   所以留成配置项，让操作者按自己的节奏调，而不是二选一。
  */
 export const DESIRE_PER_HOUR = 1.2;
+
+/** 允许的配置范围：改到 0 以下会变成"倒着涨"，改太大就永远贴着 100。 */
+export const DESIRE_PER_HOUR_MIN = 0.1;
+export const DESIRE_PER_HOUR_MAX = 8;
+
+/** 从配置里读出实际速率；没配/写坏就用默认。 */
+export function desireRateOf(configured) {
+  const v = Number(configured);
+  if (!Number.isFinite(v) || v <= 0) return DESIRE_PER_HOUR;
+  return Math.min(DESIRE_PER_HOUR_MAX, Math.max(DESIRE_PER_HOUR_MIN, v));
+}
 
 /**
  * 睡着 / 离线时的精力回升速率（每小时）。
@@ -210,7 +230,7 @@ export function settleCircle(circle, now = Date.now(), opts = {}) {
   const next = { ...cur, lastTickedAt: t };
   // yu wang是**反方向**的：随时间累积，被满足才回落。
   // 不分昼夜 —— 它没有可靠的昼夜规律，硬编一个只会变成假精度。
-  next.desire = clamp(cur.desire + DESIRE_PER_HOUR * hours);
+  next.desire = clamp(cur.desire + desireRateOf(opts.desirePerHour) * hours);
   // 精力是唯一分方向的：醒着掉，睡着（或离线）回。
   next.energy = clamp(
     cur.energy
