@@ -177,3 +177,49 @@ test('createWeatherCache：载荷坏掉不覆盖旧值', async () => {
   assert.equal(c.peek().text, good);
   assert.equal(c.lastError, 'bad-payload');
 });
+
+// ══ 天气冷启动（2026-11-27）═════════════════════════════════════════════════
+//
+// 操作者报「天气怎么没显示」。根因不是网络也不是配置：
+//   · config.life.weather / location 都在
+//   · open-meteo 能通（实测 685ms 返回）
+//   · 独立跑 createWeatherCache 也正常
+//
+// 真正的问题在**冷启动**：进程起来后缓存是空的，而 lifeWeatherCacheV2
+// 只在 "shouldRefresh() 为真" 时才异步补一次 —— 第一次 peek() 必然 null，
+// 那次请求就拿不到天气。更糟的是 refresh() 一进去就把 lastTryAt 写了，
+// 于是下一次要等满 30 分钟 TTL 才重试。
+//
+// 修法：加 warm()（启动时主动拉，不受节流），并且延后一拍调用
+// （weatherCacheRef 是 let，main() 在模块顶层就跑了，直接调是 TDZ）。
+
+test('weather warm()：不受 shouldRefresh 节流，冷启动也能立刻取到', async () => {
+  const { createWeatherCache } = await import('../src/life-weather.js');
+  let calls = 0;
+  const cache = createWeatherCache({
+    configOf: () => ({ lat: 23.13, lon: 113.26, timezone: 'Asia/Shanghai' }),
+    fetchJson: async () => {
+      calls += 1;
+      return {
+        current: { temperature_2m: 24, apparent_temperature: 25, weather_code: 0, is_day: 1 },
+        daily: { sunrise: ['2026-11-27T06:48'], sunset: ['2026-11-27T17:40'] }
+      };
+    }
+  });
+
+  // 冷启动：什么都没取过
+  assert.equal(cache.peek(), null, '一开始缓存必须是空的');
+  assert.equal(cache.shouldRefresh(), true, '从没试过 → 该刷');
+
+  // 先模拟一次"失败但占住了 lastTryAt"的情形（这正是线上发生的事）
+  const first = await cache.refresh();
+  assert.ok(first, '第一次刷新应当成功');
+  assert.equal(calls, 1);
+
+  // 关键：紧接着（TTL 内）再 warm，必须还能拿到值 —— 不能被节流挡住
+  const warmed = await cache.warm();
+  assert.ok(warmed, 'warm() 必须返回缓存值，不能因为节流返回 null');
+  assert.equal(calls, 2, 'warm() 应当真的打了一次接口（重置了 lastTryAt）');
+  assert.equal(warmed.text, '晴');
+  assert.equal(warmed.tempC, 24);
+});

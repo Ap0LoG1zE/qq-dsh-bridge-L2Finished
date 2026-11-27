@@ -269,6 +269,10 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     // ★ 2026-11-26：面板「主动机会」页的数据组装（含睡眠状态）。
     //   抽成函数之后可以单测，不用起 HTTP 服务造状态。
     buildProactiveSessionRow,
+    // 天气（2026-11-27）：预热与读取。用户报「天气怎么没显示」——
+    // 根因是冷启动后 peek() 必然 null，而只在"到点"时才异步补，
+    // 第一次访问永远拿不到。
+    warmLifeWeatherV2,
     // ★ 2026-11-26：压缩判定要能单测 —— 阈值/闲置/忙碌三道闸都容易改错，
     //   而压缩是不可逆的（误压一次就让她忘掉一段对话）。
     idleCompactDecisionV2,

@@ -154,9 +154,26 @@ export function createWeatherCache({ configOf, fetchJson, ttlMs = DEFAULT_TTL_MS
     return peek();
   }
 
+  /**
+   * 预热：启动时主动拉一次，**不受 shouldRefresh 节流**。
+   *
+   * ★ 2026-11-27 修：冷启动后第一次 `peek()` 必然是 null，而原来只有
+   * "peek 发现到点了才异步刷" 这一条路 —— 于是启动后第一次访问
+   * （面板 / 第一轮唤醒词）永远拿不到天气，得等下一次请求，
+   * 最坏要等满 30 分钟 TTL。表现就是「天气怎么没显示」。
+   *
+   * 先把 lastTryAt 归零再 refresh：refresh() 开头有
+   * `if (!shouldRefresh()) return peek();`，不清的话 warm() 会被自己挡住。
+   */
+  async function warm() {
+    lastTryAt = 0;
+    return refresh();
+  }
+
   return {
     peek,
     refresh,
+    warm,
     shouldRefresh,
     get lastError() { return lastError; }
   };

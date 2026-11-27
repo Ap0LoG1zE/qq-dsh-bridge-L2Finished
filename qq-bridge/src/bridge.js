@@ -2105,6 +2105,17 @@ async function main() {
   // 启动时自动探测一次并写回，从结构上消掉这个手工步骤。
   await followDshEndpoint(cfg);
 
+  // ★ 2026-11-27：天气预热。冷启动后缓存是空的，而 peek() 只在
+  // "到点了" 时异步补 —— 第一次访问必然空，要等 30 分钟 TTL。
+  // 表现就是操作者看到的「天气怎么没显示」。放在这里是因为它要网络，
+  // 不阻塞启动（不 await）。
+  // ⚠️ 必须延后一拍：main() 在模块顶层就被调用，而 weatherCacheRef 是
+  // 更靠下的 `let`（TDZ）。直接调会炸 "Cannot access before initialization"。
+  // 用 Promise.resolve().then 而不是 setImmediate —— 后者在测试 harness 的
+  // vm 沙箱里不存在（实测 ReferenceError: setImmediate is not defined）。
+  // 微任务同样会等到当前同步代码（含模块顶层）跑完。
+  void Promise.resolve().then(() => warmLifeWeatherV2());
+
 
   // ── 表情包体系（二代仿真）本地知识库 ────────────────────────────────────
   // 库文件损坏/读不动时**不能当成空库继续**：下面任何一次 saveStickerStoreSafe 都会把
@@ -15866,6 +15877,30 @@ async function main() {
       return weatherCacheRef.peek();
     } catch {
       return null;
+    }
+  }
+
+  /**
+   * 启动时预热天气（★ 2026-11-27）。
+   *
+   * 为什么需要单独一个入口：`lifeWeatherCacheV2` 只在"peek 到点了"时
+   * 异步去刷一次，而冷启动后缓存是空的 —— 于是**第一次访问必然拿不到**
+   * （面板显示空、当天第一轮唤醒词也没有天气），得等下一次请求；
+   * 而 `lastTryAt` 已经被这次尝试占住，最坏要等满 30 分钟 TTL 才会重试。
+   *
+   * 操作者看到的就是「天气怎么没显示」。
+   *
+   * 失败不影响启动：网络不好时保留空值，到点自己重试。
+   */
+  function warmLifeWeatherV2() {
+    try {
+      lifeWeatherCacheV2();                       // 先把 cache 实例建起来
+      if (!weatherCacheRef) return;
+      void weatherCacheRef.warm()
+        .then((w) => log(`[life] 天气预热${w ? '成功' : '未取到'}${w ? `：${w.text} ${w.tempC}°` : `（${weatherCacheRef.lastError || 'no data'}）`}`))
+        .catch((error) => log(`[life] 天气预热失败（已跳过）：${error?.message ?? error}`));
+    } catch (error) {
+      log(`[life] 天气预热异常（已跳过）：${error?.message ?? error}`);
     }
   }
 
