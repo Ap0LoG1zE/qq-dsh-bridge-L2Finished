@@ -235,6 +235,9 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     // 「额度 3 条的档软目标是 2 条」这类换算，以及「超过软目标只是拉长间隔，
     // 不是硬停」—— 硬停会让"软"这个字失去意义。
     proactiveSoftTarget,
+    // 去重集合（2026-11-26）：test-proactive-dedupe 要断言「滚动窗口」语义 ——
+    // 用过的理由过了 240 分钟（天气 1080）就该重新可用，而不是等跨天。
+    proactiveDedupeSetOf,
     daypartOfMinute, DAYPARTS, daypartGapOverride, proactiveDaypartCounts,
     bumpProactiveDaypartCount,
     // 额度换算（2026-11-23 四次修订）：额度不再是随机抽样，而是

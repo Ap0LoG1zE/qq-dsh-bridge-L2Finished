@@ -492,12 +492,11 @@ export function buildProactiveCandidates(ctx = {}) {
  * 这正是这次要修的问题。
  *
  * @param {object} ctx 同 buildProactiveCandidates
- * @returns {object[]} 最多 1 条
+ * @returns {object[]} 按优先级排好的**全部**可用理由（上层去重后取第一条）
  */
 export function ambientFallbackCandidates(ctx = {}) {
   const minute = Number(ctx.minuteOfDay);
   if (!Number.isFinite(minute)) return [];
-  const rand = typeof ctx.rand === 'function' ? ctx.rand : Math.random;
   const energy = Number(ctx.energy);
   const weather = String(ctx.weatherText || '');
   const hour = Math.floor(minute / 60);
@@ -575,14 +574,23 @@ export function ambientFallbackCandidates(ctx = {}) {
   }
 
   if (!pool.length) return [];
-  const pick = pool[Math.floor(Math.min(pool.length - 1, Math.max(0, rand() * pool.length)))];
-  return [{
+  // ★★ 2026-11-26 修：**返回整个池子，不在这里随机抽一条**。
+  //
+  //   原来这里 `Math.random()` 抽一条就返回 —— 也就是"随机"发生在**去重之前**。
+  //   于是：池子里明明有 3 条可使用，抽到的那条恰好今天用过 → 上层过滤后
+  //   变成 0 条 → 判成"没有理由"→ 不开口。11-26 19:07 / 20:07 / 21:07
+  //   连续三次 no-reason 就是这么来的（21:07 的池子里 `ambient-late-quiet`
+  //   明明是空的，却因为抽到了 `ambient-quiet-care` 而整轮作废）。
+  //
+  //   现在按优先级把**全部**可用理由交上去，由上层先做去重、再取第一条 ——
+  //   抽签变成"在当前真正可用的理由里挑"，而不是"先抽签再看能不能用"。
+  return pool.map((pick) => ({
     ...pick,
     action: 'message',
     priority: PRIORITY.RANDOM,
     // 窗口给一整天：兜底本来就是"任何时刻都能用"的
     window: { start: 0, end: 24 * 60 }
-  }];
+  }));
 }
 
 /** 给唤醒词用：返回候选的 motive。 */

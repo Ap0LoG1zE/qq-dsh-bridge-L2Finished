@@ -12332,8 +12332,17 @@ async function main() {
               awaitingReplySince: Number(rec.awaitingReplySince) || 0,
               routeSentCounts: rec.routeSentCounts && typeof rec.routeSentCounts === 'object' ? rec.routeSentCounts : {},
               quotaOfDay: rec.quotaOfDay ?? null,
+              // 去重记录现在是 `{ id, at }`（2026-11-26 改成滚动窗口），
+              // 落盘时只留最近一天的 —— 最长窗口 1080 分钟，再老也已经失效。
+              // 老格式（纯字符串 id）照样原样写出去，读回来时按"今天"兼容处理。
               sentCandidateIds: (Array.isArray(rec.sentCandidateIds) ? rec.sentCandidateIds : [])
-                .filter((id) => String(id).startsWith(today)),
+                .filter((entry) => {
+                  const id = typeof entry === 'string' ? entry : String(entry?.id || '');
+                  if (!id) return false;
+                  const at = typeof entry === 'object' && entry ? Number(entry.at) || 0 : 0;
+                  if (at > 0) return Date.now() - at < 24 * 3600 * 1000;
+                  return id.startsWith(today);
+                }),
               // 抖动缓存不落盘：它只是为了"面板刷新时数字别跳"，
               // 重启后重摇一次不影响任何行为，存了反而会让旧间隔一直粘着。
             };
@@ -19059,8 +19068,10 @@ async function main() {
         route: 'curiosity',
         reason: top.reason,
         candidate: top,
-        // 同一类理由一天只发一次：靠 id 前缀 + 当日记录去重。
-        dedupeId: `${todayKeyOf(now)}:${top.id}`
+        // ★ 2026-11-26 二次修：**不再拼日期前缀**。
+        //   去重现在是滚动窗口（普通 240 分钟 / 天气 1080 分钟），
+        //   多久之前用过只由时间戳决定。带上日期前缀会让跨午夜失效。
+        dedupeId: String(top.id)
       };
     }
 
@@ -19179,25 +19190,80 @@ async function main() {
         lastNightRestless: sleepHours > 0 && sleepHours < 6.5,
         weatherText
       });
-      // 当天用过的 id 前缀过滤掉
-      return all.filter((c) => !used.has(`${todayKeyOf(now)}:${c.id}`));
+      // ★ 2026-11-26 二次修：去重集合里存的已经是**裸 id**（去掉日期前缀），
+      //   这里也要用裸 id 去查 —— 否则永远不命中，等于去重整个失效。
+      return all.filter((c) => !used.has(String(c.id)));
     } catch (error) {
       log(`[proactive] 候选生成失败（已跳过）：${error?.message ?? error}`);
       return [];
     }
   }
 
-  /** 当天这个会话已经发过的候选 id（按会话存，跨重启保留）。 */
+  /**
+   * 这个会话**近期**用过的候选 id（按会话存，跨重启保留）。
+   *
+   * ★★ 2026-11-26 改：**从"按自然日"改成"按滚动时间窗"**（照原作者）。
+   *
+   * 原来是 `startsWith(今天日期)` —— 一条候选用过之后，到今晚零点前都不能再用。
+   * 后果很实（11-26 白天）：一天只有 6 种候选，发到第 5 条时
+   * `sentCandidateIds` 里已经躺着 5 个，剩下的池子基本抽不出可用的，
+   * 于是从 19:07 到 21:07 连续三次 `no-reason`，**四个多小时一次都不开口**。
+   *
+   * 原作者用的是滚动窗口（`_recent_proactive_topic_repeated`）：
+   *   · 普通话题 —— `proactive_dedup_sent_window_minutes`，默认 **240 分钟**
+   *   · 天气类   —— `proactive_dedup_weather_window_minutes`，默认 **1080 分钟**
+   * 过了窗口就能再说一次。语义是对的：说"外面在下雨"隔 4 小时可以，
+   * 隔 20 分钟不行；而"今天已经用过"这种按日历切的方式，晚上八点就被白天的
+   * 记录锁死，越到后面越说不出话。
+   *
+   * 记录格式升级成 `id` + `at`（时间戳）。老格式（`2026-11-26:xxx` 纯字符串）
+   * 兼容读：没有时间戳就按"今天"算，最多留一天，不会永久卡住。
+   */
   function proactiveDedupeSetOf(key) {
     try {
       const p = key ? proactiveStateOf(key) : null;
       if (!p) return new Set();
-      const arr = Array.isArray(p.sentCandidateIds) ? p.sentCandidateIds : [];
-      const today = todayKeyOf(Date.now());
-      return new Set(arr.filter((id) => String(id).startsWith(today)));
+      const now = Date.now();
+      const out = new Set();
+      for (const entry of (Array.isArray(p.sentCandidateIds) ? p.sentCandidateIds : [])) {
+        const raw = typeof entry === 'string' ? entry : String(entry?.id || '');
+        if (!raw) continue;
+        // ★★ 2026-11-26 二次修：**把日期前缀剥掉再比**。
+        //
+        //   第一次改成滚动窗口时漏了这一点：`dedupeId` 仍是
+        //   `${todayKeyOf(now)}:${candidate.id}`，而窗口判定按 `at` 时间戳走。
+        //   于是**跨午夜**就错：昨晚 22:00 用掉一条（存成 `11-26:xxx`），
+        //   今天 01:30 去查（拼成 `11-27:xxx`）—— 前缀不同，集合里查不到，
+        //   明明才过 3.5 小时（窗口 240 分钟）却判成"没用过"，会重复开口。
+        //   凌晨 0~4 点正是最容易主动说话、也最不该重复的时段。
+        //
+        //   去掉前缀之后，"多久之前用过"只由 `at` 决定，跟日历日期无关 ——
+        //   这才是滚动窗口该有的语义。
+        const id = bareCandidateIdOf(raw);
+        const at = typeof entry === 'object' && entry ? Number(entry.at) || 0 : 0;
+        // 没有时间戳的老记录：按"今天"判，跨天自动失效。
+        const usedAt = at > 0 ? at : (raw.startsWith(todayKeyOf(now)) ? now : 0);
+        if (!usedAt) continue;
+        const isWeather = /weather|gloomy|rain|sunny|sky/i.test(id);
+        const windowMs = (isWeather ? 1080 : 240) * 60 * 1000;
+        if (now - usedAt < windowMs) out.add(id);
+      }
+      return out;
     } catch {
       return new Set();
     }
+  }
+
+  /**
+   * 去掉候选 id 上的日期前缀：`2026-11-26:ambient-quiet-care` → `ambient-quiet-care`。
+   *
+   * 历史数据里存的是带前缀的（当时按自然日去重），新数据不带 ——
+   * 两类都要能比对上，否则升级那一刻旧记录就全"失忆"了。
+   */
+  function bareCandidateIdOf(id) {
+    const s = String(id || '');
+    const m = /^\d{4}-\d{2}-\d{2}:(.+)$/.exec(s);
+    return m ? m[1] : s;
   }
 
   /** 记下一条候选已用掉（按会话）。 */
@@ -19205,10 +19271,19 @@ async function main() {
     try {
       const p = key ? proactiveStateOf(key) : null;
       if (!p) return;
-      const today = todayKeyOf(Date.now());
+      const now = Date.now();
+      const today = todayKeyOf(now);
+      // 只留**最近一天**的记录：滚动窗口最长 1080 分钟（18 小时），
+      // 超过一天的记录无论如何都已经失效，留着只是撑大文件。
       const arr = (Array.isArray(p.sentCandidateIds) ? p.sentCandidateIds : [])
-        .filter((id) => String(id).startsWith(today));   // 只留当天的，自动跨天清空
-      if (!arr.includes(dedupeId)) arr.push(dedupeId);
+        .filter((entry) => {
+          const id = typeof entry === 'string' ? entry : String(entry?.id || '');
+          if (!id) return false;
+          const at = typeof entry === 'object' && entry ? Number(entry.at) || 0 : 0;
+          if (at > 0) return now - at < 24 * 3600 * 1000;
+          return id.startsWith(today);
+        });
+      arr.push({ id: dedupeId, at: now });
       p.sentCandidateIds = arr;
     } catch { /* 去重失败不影响发送 */ }
   }

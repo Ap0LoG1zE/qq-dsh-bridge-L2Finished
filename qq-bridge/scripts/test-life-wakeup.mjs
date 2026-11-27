@@ -1,4 +1,4 @@
-﻿// 睡眠唤醒规则（2026-11-26 最终设计）。
+// 睡眠唤醒规则（2026-11-26 最终设计）。
 //
 // ── 操作者原话（逐条对应）───────────────────────────────────────────────────
 //
@@ -94,7 +94,13 @@ test('已过晨唤点 + 精力**没满** → 继续睡（8 点检查但不叫）
 });
 
 test('没到晨唤点 + 精力满 → **不**醒（不能半夜自己爬起来）', async () => {
-  await withBridge({ morningWakeHour: 23 }, async (h) => {
+  // ⚠️ 2026-11-26 修：这条用例原本漏了一种情况 ——
+  //   `morningWakeHour: 23` 只保证"晨唤点在未来"，但**夜里还有规则②**
+  //   （非夜晚 + 精力满 → 随时起）。只要跑测试时不在免打扰时段内
+  //   （比如晚上 21 点），精力满就该按规则②起床，`false` 断言必然失败。
+  //   这正是实测撞到的：白天/傍晚跑全绿，21 点后跑必红。
+  //   所以要么把免打扰配成"覆盖当前时刻"，要么在免打扰之外跳过。
+  await withBridge({ morningWakeHour: 23, quietHours: { enabled: true, startHour: 0, endHour: 24 } }, async (h) => {
     const now = Date.now();
     const since = now - 2 * H;
     const d = new Date(since); d.setHours(23, 0, 0, 0);
@@ -102,7 +108,7 @@ test('没到晨唤点 + 精力满 → **不**醒（不能半夜自己爬起来�
     if (now >= d.getTime()) return;   // 恰好已过 23 点，跳过
     seedAsleep(h, { asleepSince: since, energy: 100 });
     assert.equal(h.maybeAutoWakeUpV2(), false,
-      '晨唤点还没到，精力再满也不该醒');
+      '晨唤点还没到、又还在夜里，精力再满也不该醒');
   });
 });
 
@@ -170,9 +176,17 @@ test('睡着 → 只排"掷噩梦"的 40 分钟检查，不是常规主动机会
 });
 
 test('睡着 → pickProactiveRouteV2 只放行噩梦', async () => {
-  await withBridge({}, async (h) => {
+  // ⚠️ 2026-11-26 修：这条也漏了同一个时段问题。
+  //   `seedAsleep(energy: 100)` 一进来就满足了**规则②**（非夜晚 + 精力满 → 随时起），
+  //   于是 `pickProactiveRouteV2` 开头那段 `isLifeAsleepNow()` 先把她叫醒了，
+  //   接着走的是**正常主动路径**（check_in），当然不是噩梦。
+  //   白天跑没事是因为……其实白天也会这样，只是当时没人注意到；
+  //   21 点这次是被稳定复现出来的。
+  //   要么把精力压到起不来（< threshold），要么把免打扰配成覆盖当前时刻 —— 两者都做，
+  //   让这条用例只测"睡着时路由的选择"，不夹带"什么时候该醒"。
+  await withBridge({ quietHours: { enabled: true, startHour: 0, endHour: 24 } }, async (h) => {
     const now = Date.now();
-    seedAsleep(h, { sinceHoursAgo: 3, energy: 100 });
+    seedAsleep(h, { sinceHoursAgo: 3, energy: 60 });
     h.proactiveStateOf(KEY).lastProactiveAt = now - 10 * H;
     const st = h.getSocialV2State(KEY);
     st.lastIncomingAt = now - 5 * H;
