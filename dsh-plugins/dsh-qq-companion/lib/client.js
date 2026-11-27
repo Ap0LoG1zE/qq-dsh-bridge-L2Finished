@@ -1512,7 +1512,7 @@ window.__ModuleLoader__.load({
       launchBtn.type = 'button'
       launchBtn.addEventListener('click', function () {
         launchBtn.disabled = true
-        launchBtn.textContent = '启动中…（等到桥接连上，最多 90 秒）'
+        launchBtn.textContent = '启动中…（会顺带注入配置的 QQ，等到桥接连上，最多 90 秒）'
         postJson(mState.feature.api + '/launch-snowluma', {}).then(function (res) {
           toast(res && res.ok ? (res.message || '已启动') : ((res && res.error) || '启动失败'))
           loadTab('status')

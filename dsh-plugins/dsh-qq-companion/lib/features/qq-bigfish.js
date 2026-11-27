@@ -15,6 +15,7 @@
  *    子对象（send/wait/wake…）会被整段替换，只发局部字段会清掉其余配置。
  */
 import fs from 'node:fs'
+import { snowlumaAutoInject } from '../snowluma-inject.js'
 import os from 'node:os'
 import path from 'node:path'
 import { execFile, spawn } from 'node:child_process'
@@ -1296,6 +1297,35 @@ async function handleLaunchSnowluma(req, res) {
 
   const ready = await waitForPorts([3000, 3001], 45000)
 
+  // ── 自动注入指定 QQ 号（★ 2026-11-27）────────────────────────────────────
+  //
+  // 操作者原来的流程：点「启动 SnowLuma」→ 打开 WebUI → 手动选 3346197751 注入。
+  // 后两步每次都是同样的操作，纯粹重复劳动。这里在端口就绪后直接做完。
+  //
+  // 三个前提，缺一个就安静跳过（不报错、也不影响启动结果）：
+  //   · config.snowluma.autoInjectUin     要注入哪个号
+  //   · config.snowluma.webuiPassword     WebUI 密码（在 .gitignore 里，不进仓库）
+  //   · WebUI 端口（默认 5099，可配 snowluma.webuiPort）
+  //
+  // 失败不算启动失败：账号注入只是省事的一步，SnowLuma 本身起来才是主目标。
+  let autoInject = null
+  const wantUin = String(env.cfg?.snowluma?.autoInjectUin || '').trim()
+  const webuiPassword = String(env.cfg?.snowluma?.webuiPassword || '')
+  if (ready && wantUin && webuiPassword) {
+    try {
+      autoInject = await snowlumaAutoInject({
+        port: Number(env.cfg?.snowluma?.webuiPort) || 5099,
+        password: webuiPassword,
+        uin: wantUin,
+      })
+    } catch (error) {
+      autoInject = { ok: false, error: String(error?.message ?? error) }
+    }
+  } else if (ready && wantUin && !webuiPassword) {
+    autoInject = { ok: false, skipped: true, error: '未配置 snowluma.webuiPassword，跳过自动注入' }
+  }
+
+
   // 端口就绪 ≠ 桥接已连上：桥接对 SnowLuma 用的是**指数退避**重连，
   // 反复失败后实测间隔可达 30 秒。所以这里继续轮询桥接状态，
   // 等到真正 connected 再返回 —— 否则用户会以为「启动了但没反应」。
@@ -1333,13 +1363,29 @@ async function handleLaunchSnowluma(req, res) {
     dshReady,
     launcher: launcher || null,
     endpointSync: finalSync,
-    message: !ready
-      ? 'SnowLuma 进程已启动，但 45 秒内没等到 3000/3001 监听。可能需要在 WebUI 里扫码登录，或它启动得比较慢 —— 点「打开 WebUI」看看。'
-      : connected
-        ? (dshReady === false
-          ? 'SnowLuma 已启动、桥接也已连上，但桥接还没连上 DSH —— 看一下「诊断」页。'
-          : 'SnowLuma 已启动，桥接也已连上 DSH 与 SnowLuma。')
-        : 'SnowLuma 在监听，但桥接还没连上 —— 它用的指数退避可能要再等一会儿，稍后刷新本页即可。',
+    autoInject,
+    message: (() => {
+      const base = !ready
+        ? 'SnowLuma 进程已启动，但 45 秒内没等到 3000/3001 监听。可能需要在 WebUI 里扫码登录，或它启动得比较慢 —— 点「打开 WebUI」看看。'
+        : connected
+          ? (dshReady === false
+            ? 'SnowLuma 已启动、桥接也已连上，但桥接还没连上 DSH —— 看一下「诊断」页。'
+            : 'SnowLuma 已启动，桥接也已连上 DSH 与 SnowLuma。')
+          : 'SnowLuma 在监听，但桥接还没连上 —— 它用的指数退避可能要再等一会儿，稍后刷新本页即可。'
+      // 账号注入的结果附在后面。成功就一句话带过，失败要说清原因 ——
+      // 否则操作者以为"点一下什么都做了"，实际没注入上，回头还要自己点。
+      if (!autoInject) return base
+      if (autoInject.ok && autoInject.injected) {
+        return base + (autoInject.already
+          ? `（QQ ${autoInject.uin} 之前就已注入）`
+          : `（已自动注入 QQ ${autoInject.uin}）`)
+      }
+      if (autoInject.ok && autoInject.found === false) {
+        return base + `（没找到 QQ ${autoInject.uin} 的进程 —— 先把那个号登录上，再点一次即可）`
+      }
+      if (autoInject.skipped) return base
+      return base + `（自动注入没成功：${autoInject.error || '未知原因'}）`
+    })(),
   })
 }
 
