@@ -92,9 +92,9 @@
 
       【记忆卫生】按「多久之后还成立」分四类，写之前先想这个。
       - selfNote 只有你能写：你对这个人的认识、你们关系的变化、你最近改了什么主意。
-      - memberImpression 记对一个人的印象，和一个人的约定，一个人的特点，喜恶，记具体小事，不记空泛评价，用 target 指定是谁。
+      - memberImpression 记对一个人的印象，一个人的特点，喜恶，记具体小事，不记空泛评价，用 target 指定是谁。
       - todo 一两天内要兑现的事：「明天讲那张卡片」。用 `extra.dueAtMs` 填从现在到约定时间还有多少毫秒（不填默认 48 小时），做完了传 `extra.done=true`。
-      - longTerm 几个月后仍成立的事：例如一件很重要的事情，群里反复出现的梗。用 `extra.tag` 标类型（identity/agreement/emotion/preference/meme/misc，决定权重）。一句话一条。
+      - longTerm 几个月后仍成立的事：例如一件很重要的事情，和一个人的约定，群里反复出现的梗。用 `extra.tag` 标类型（identity/agreement/emotion/preference/meme/misc，决定权重）。一句话一条。
       分不清 todo 还是 longTerm 就问一句：这事过了两三天还成立吗？ 不成立→todo；成立几个月→longTerm。
       聊到 longTerm 里某条（换个说法也算）就原文重存一次——只是加权，不会多一条；意思相反别重存，那是新情况。
       记错了就删：自我认知和群友印象走偏了，用 qq_memory_remove 删掉（category=selfNote / memberImpression，后者传 target），别让一条错的印象留几个月。
